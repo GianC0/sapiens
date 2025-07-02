@@ -58,14 +58,14 @@ SQLite storage remains but is unused.
 
 ## Risk controls
 
-| YAML key                 | Purpose                                           |    |                       |
-| ------------------------ | ------------------------------------------------- | -- | --------------------- |
-| `risk.drawdown_pct`      | Hard kill-switch vs. NAV peak (liquidate)         |    |                       |
-| `risk.trailing_stop_pct` | Per-position trailing stop (high-water/low-water) |    |                       |
-| `risk.target_vol_annual` | 𝜎-targeting (weights scaled by realised vol)     |    |                       |
-| `risk.max_weight_abs`    | Hard abs cap                                      | wᵢ | ≤ pct of NAV          |
-| `risk.max_weight_rel`    | Hard rel cap   max(                               | wᵢ | ) ≤ pct of gross exp. |
-| Liquidity caps           | ≤ `max_adv_pct` × ADV per rebalance               |    |                       |
+| YAML key                 | Purpose                                           |    
+| ------------------------ | ------------------------------------------------- | 
+| `risk.drawdown_pct`      | Hard kill-switch vs. NAV peak (liquidate)         | 
+| `risk.trailing_stop_pct` | Per-position trailing stop (high-water/low-water) |    
+| `risk.target_vol_annual` | 𝜎-targeting (weights scaled by realised vol)      | 
+| `risk.max_weight_abs`    | Hard abs cap  wᵢ  ≤ pct of NAV               |   
+| `risk.max_weight_rel`    | Hard rel cap   max( wᵢ ) ≤ pct of gross exp.      |
+| Liquidity caps           | ≤ `max_adv_pct` × ADV per rebalance               |
 
 ## Execution
 - Orders are split into execution.twap_slices child slices (TWAP).
