@@ -23,6 +23,7 @@ sbatch slurm/backtest.sbatch
 
 ## Project Layout
 
+```
 trading/                         ← project root
 ├── data/                        ← your raw *.csv files (including DGS10.csv)
 │   └── …                        (unchanged – loader stays CSV-only)
@@ -47,6 +48,7 @@ trading/                         ← project root
 ├── slurm/
 │   └── backtest.sbatch          # HPC template (array shards)
 └── README.md
+```
 
 ## Live trading 
 - Connectors for CCXT (crypto spot) and Interactive Brokers are initialised only when the engine mode is `LIVE`
