@@ -1,0 +1,113 @@
+# ===========================================================================
+#  U N I   —  master configuration file
+#  Every key has (i) a plain-English explanation and, where relevant,
+#  (ii) the exact name used in the academic paper or common industry jargon.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+#  Paths
+# ---------------------------------------------------------------------------
+data_dir:  data/            # Folder with per-ticker CSVs               (general)
+model_dir: models/UMI/      # Where checkpoints / logs are stored       (general)
+initial_cash: 100000        # portfolio initial cash                    (portfolio)
+currency: USD
+
+# ---------------------------------------------------------------------------
+#  Calendar – defines the walk-forward split
+# ---------------------------------------------------------------------------
+train_start:    2018-01-01  # First bar used for **Stage-1 factor learning**  (UMI paper §4.1)
+train_end:      2020-12-31  # Last bar of training set
+valid_end:      2021-06-30  # Final bar of validation set (early stopping / Optuna)
+backtest_start: 2021-07-01  # First bar the strategy trades (“live simulation”)
+backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years)
+
+# ---------------------------------------------------------------------------
+#  Universe / data granularity
+# ---------------------------------------------------------------------------
+freq: 1B                    # 1 business-day bars (Lean offset code)    (common)
+window_len: 60              # L : look-back window length (UMI paper)   (sliding-window features)
+pred_len:   1               # H : prediction horizon (next bar)         (one-step forecast)
+dynamic_universe_mult: 2    # Capacity multiplier for new tickers       (UMI Sec. 3.4 “dynamic universe”)
+
+# ---------------------------------------------------------------------------
+#  Training schedule & hyper-param search
+# ---------------------------------------------------------------------------
+training:
+  tune_hparams:   false      # Use Optuna Bayesian search                 
+  n_trials:       20        # #Optuna trials for each run
+  n_epochs:       20        # Full epochs on train+valid after tuning
+  batch_size:     64        # Mini-batch size for AdamW                 
+  training_mode:  sequential  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain) → Stage-1 + Stage-2
+  pretrain_epochs: 5        # Stage-1 warm-up epochs in hybrid mode
+  patience:       10        # Early-stop patience 
+  retrain_delta:  30        # Retrain every (30 * freq) bars
+
+# ---------------------------------------------------------------------------
+#  Default hyper-parameters (UMI paper, Table 2) – Optuna overwrites them
+# ---------------------------------------------------------------------------
+hparams:
+  lambda_ic:     0.5    # λ_IC   : independence loss weight             
+  lambda_sync:   1.0    # λ_sync : synchronous factor loss              
+  lambda_rankic: 0.1    # λ_rank : rank-IC regulariser                 
+  temperature:   0.07   # τ      : attention temperature 
+  sync_thr:      0.6    # θ_sync : threshold for stock synchrony        
+  lr_stage1:     0.001  # α₁     : learning-rate Stage-1 (AdamW)
+  lr_stage1_ft:  0.0001 # α₁^ft  : LR when fine-tuning Stage-1 in hybrid mode
+  lr_stage2:     0.0001 # α₂     : learning-rate Forecasting head
+
+# ---------------------------------------------------------------------------
+#  Warm-start fine-tune (optional quick pass after heavy fit)
+# ---------------------------------------------------------------------------
+warm_start:          true  # Enable warm-start                           (common in finance live rolls)
+warm_training_epochs: 5    # Light fine-tune epochs
+
+# ---------------------------------------------------------------------------
+#  Allocation targets
+# ---------------------------------------------------------------------------
+allocation:
+  gross_leverage: 2.0   # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
+  net_exposure:   0.0   # Σwᵢ ≈ 0 (market-neutral)
+
+selection:
+  top_k: 30            # sell the worst 30 and buy the best the 30 stocks 
+
+optimizer:
+  name: max_sharpe               # maximize sharpe ratio
+  lookback_days: 60              # history window to build the Σ matrix
+#  allow_short:  true             # set false if you ever run long-only
+
+
+# ---------------------------------------------------------------------------
+#  Trading frictions
+# ---------------------------------------------------------------------------
+costs:
+  fee_bps:    0.5   # One-way commission in basis-points of notional    (Tcost literature)
+  spread_bps: 1.0   # Half-spread slippage estimate 
+
+# ---------------------------------------------------------------------------
+#  Liquidity constraints
+# ---------------------------------------------------------------------------
+liquidity:
+  adv_lookback: 30     # Look-back window to compute Average Daily Volume (ADV)
+  max_adv_pct:  0.05   # Max trade size = 5 % ADV 
+
+# ---------------------------------------------------------------------------
+#  Execution parameters
+# ---------------------------------------------------------------------------
+execution:
+  twap_slices: 4   # Split parent order into N TWAP child orders        
+
+# ---------------------------------------------------------------------------
+#  Risk management overlays
+# ---------------------------------------------------------------------------
+risk:
+  trailing_stop_pct: 0.05      # 5 % trailing stop from HWM/LWM         
+  target_vol_annual: 0.15      # Volatility target (Hull, risk parity) 15 %
+  drawdown_pct:      0.15      # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
+  max_weight_abs:    0.03      # Max 3 % NAV per single position        (concentration limit)
+  max_weight_rel:    0.20      # Max 20 % of gross exposure in one name
+  beta_neutral:                # Optional index-beta hedge 
+    enabled: false
+    benchmark: SPY            # Proxy for market factor (S&P 500 ETF)
+    lookback_days: 60         # Regression window for beta estimation
+    beta_tol: 0.02            # Allow residual β in ±0.02 band
