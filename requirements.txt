@@ -1,4 +1,6 @@
-pyyaml==6.0.2
-nautilus_trader
-pandas==2.2.3
-
+PyYAML==6.0.2
+nautilus_trader==1.216.0
+numpy
+optuna
+pandas
+torch

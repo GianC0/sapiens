@@ -1,0 +1,6 @@
+fix the imports and logic:
+strategy
+run backtest
+dataloader
+
+fix the research notebook

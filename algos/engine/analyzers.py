@@ -17,4 +17,4 @@ class EquityCurveAnalyzer:
         self._rows.append({"ts": ts, "equity": value})
 
     def to_frame(self) -> pd.DataFrame:
-        return pd.DataFrame(self._rows).set_index("ts")
+        return pd.DataFrame(self._rows).set_index("ts").sort_index()

@@ -1,15 +1,12 @@
-# ===========================================================================
-#  U N I   —  master configuration file
-#  Every key has (i) a plain-English explanation and, where relevant,
-#  (ii) the exact name used in the academic paper or common industry jargon.
-# ===========================================================================
+# MODEL
+model_name: "UMI"
 
 # ---------------------------------------------------------------------------
 #  Paths
 # ---------------------------------------------------------------------------
-data_dir:  data/            # Folder with per-ticker CSVs               (general)
-model_dir: models/UMI/      # Where checkpoints / logs are stored       (general)
-initial_cash: 100000        # portfolio initial cash                    (portfolio)
+data_dir:  "data/stocks/"     # Folder with per-ticker stocks CSVs        (general)
+logs_dir: "logs/"             # Where checkpoints / logs are stored       (general)
+initial_cash: 20000           # portfolio initial cash                    (portfolio)
 currency: USD
 
 # ---------------------------------------------------------------------------
@@ -27,7 +24,7 @@ backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years)
 freq: 1B                    # 1 business-day bars (Lean offset code)    (common)
 window_len: 60              # L : look-back window length (UMI paper)   (sliding-window features)
 pred_len:   1               # H : prediction horizon (next bar)         (one-step forecast)
-dynamic_universe_mult: 2    # Capacity multiplier for new tickers       (UMI Sec. 3.4 “dynamic universe”)
+dynamic_universe_mult: 2    # Capacity multiplier for new tickers       
 
 # ---------------------------------------------------------------------------
 #  Training schedule & hyper-param search
@@ -46,14 +43,68 @@ training:
 #  Default hyper-parameters (UMI paper, Table 2) – Optuna overwrites them
 # ---------------------------------------------------------------------------
 hparams:
-  lambda_ic:     0.5    # λ_IC   : independence loss weight             
-  lambda_sync:   1.0    # λ_sync : synchronous factor loss              
-  lambda_rankic: 0.1    # λ_rank : rank-IC regulariser                 
-  temperature:   0.07   # τ      : attention temperature 
-  sync_thr:      0.6    # θ_sync : threshold for stock synchrony        
-  lr_stage1:     0.001  # α₁     : learning-rate Stage-1 (AdamW)
-  lr_stage1_ft:  0.0001 # α₁^ft  : LR when fine-tuning Stage-1 in hybrid mode
-  lr_stage2:     0.0001 # α₂     : learning-rate Forecasting head
+  # λ_IC   : independence loss weight
+  lambda_ic:         
+    default: 0.5
+    optuna:            
+      type: categorical
+      choices: [0, 0.25, 0.5, 0.75, 1]
+
+  # λ_sync : synchronous factor loss 
+  lambda_sync:
+    default: 1.0
+    optuna:
+      type: categorical
+      choices: [0, 0.5, 1, 1.5, 2]
+
+  # λ_rank : rank-IC regulariser
+  lambda_rankic:       
+    default: 0.1
+    optuna:
+      type: categorical
+      choices: [0, 0.05, 0.1, 0.15, 0.2]
+
+  # τ : attention temperature
+  temperature:
+    default: 0.07
+    optuna:
+      type: float
+      low: 0.03
+      high: 0.2
+  
+  # θ_sync : threshold for stock synchrony
+  sync_thr:
+    default: 0.6
+    optuna:
+      type: float
+      low: 0.5
+      high: 0.8
+
+  # α₁: learning-rate Stage-1 (AdamW)
+  lr_stage1:
+    default: 0.001
+    optuna:
+      type: log_float
+      low: 1e-4
+      high: 5e-3
+
+  # α₁^ft  : LR when fine-tuning Stage-1 in hybrid mode
+  lr_stage1_ft:
+    default: 0.0001
+    optuna:
+      type: log_float
+      low: 1e-5
+      high: 1e-3
+
+  # α₂: learning-rate Forecasting head
+  lr_stage2:
+    default: 0.0001
+    optuna:
+      type: log_float
+      low: 1e-5
+      high: 1e-3
+  # stays frozen withouyt specifying the optuna values for hp optimization
+  weight_decay: 0.0        
 
 # ---------------------------------------------------------------------------
 #  Warm-start fine-tune (optional quick pass after heavy fit)
@@ -75,6 +126,13 @@ optimizer:
   name: max_sharpe               # maximize sharpe ratio
   lookback_days: 60              # history window to build the Σ matrix
 #  allow_short:  true             # set false if you ever run long-only
+
+# ---------------------------------------------------------------------------
+#  Dataset n_bars loader
+# ---------------------------------------------------------------------------
+engine:
+  cache:
+    bar_capacity: 4096   # ≥ L + pred_len + some safety margin
 
 
 # ---------------------------------------------------------------------------

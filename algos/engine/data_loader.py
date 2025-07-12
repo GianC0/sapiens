@@ -2,74 +2,97 @@
 CsvBarLoader
 ============
 
-Reads OHLCV CSVs (plus optional “DGS10.csv”) and streams Nautilus Trader
-`BarData` into the engine.  The loader is *frequency-agnostic* and honours the
-`freq` string passed at construction (e.g. "1D", "15m", "2h", …).
+Streams BOTH
+    • `Bar`                 – open, high, low, close, volume
+    • `FeatureBarData`      – *all* numeric columns present in the CSV
 
-Special rules
--------------
-* A file named **DGS10.csv** is treated as 10-year US Treasury yields, *never*
-  added to the tradeable universe.  The series is forward-filled onto the same
-  business-day grid and published as `YieldCurveData`.
-* All other CSVs become tradeable instruments; numeric columns automatically
-  become features for UMIModel.
-
-Usage
------
-loader = CsvBarLoader(
-data_dir=Path("data"),
-freq="15m",
-tz="UTC",
-)
-engine.add_data_source(loader)
-
+into Nautilus Trader’s engine / cache.  The model will later read those
+feature objects; if they are missing (e.g. user supplied only OHLCV files),
+the adapter automatically falls back to the plain Bar fields.
 """
-
-
 from __future__ import annotations
-
-import pandas as pd
-import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Iterator
+from typing import Dict, Iterator, List, Optional
 
-from nautilus_trader.data import Bar, BarType
-from nautilus_trader.common.clock import LiveClock, SimulationClock
-from nautilus_trader.common.data import DataCatalog
+import numpy as np
+import pandas as pd
+from nautilus_trader.model import Bar, BarType
+#from nautilus_trader.model import Data  # base class for custom data
 
 
+# ------------------------------------------------------------------ #
+# Custom data class
+# ------------------------------------------------------------------ #
+class FeatureBarData(Bar):
+    """
+    Carries the *entire* numeric feature vector for one instrument at one
+    timestamp.  Stored in the cache so that the model can rebuild the same
+    tensor it saw during training.
+    """
+
+    __slots__ = ("_instrument", "_ts_epoch_ns", "_features")
+
+    def __init__(self, instrument: str, ts_epoch_ns: int, features: np.ndarray):
+        super().__init__()
+        self._instrument  = instrument
+        self._ts_epoch_ns = ts_epoch_ns
+        self._features    = features          # 1-D numpy array
+
+    # -- properties required by Nautilus ---------------------------------
+    @property
+    def instrument(self):
+        return self._instrument
+
+    @property
+    def ts_epoch_ns(self) -> int:
+        return self._ts_epoch_ns
+
+    # -- convenience -----------------------------------------------------
+    @property
+    def features(self) -> np.ndarray:
+        return self._features
+
+
+# ------------------------------------------------------------------ #
+# Loader
+# ------------------------------------------------------------------ #
 class CsvBarLoader:
     def __init__(
         self,
-        data_dir: Path,
+        root: Path,
         freq: str,
         tz: str = "UTC",
         universe: Optional[List[str]] = None,
     ):
-        self._dir = Path(data_dir).expanduser().resolve()
-        if not self._dir.is_dir():
-            raise FileNotFoundError(self._dir)
+        self._root = Path(root).expanduser().resolve()
+        if not self._root.is_dir():
+            raise FileNotFoundError(self._root)
 
-        self.freq = freq
-        self.tz = tz
-        self._bar_type = BarType.from_string(freq.upper())
+        self.freq     = freq
+        self.tz       = tz
+        self.bar_type = BarType.from_string(freq.upper())
+
+        stock_dir = self._root / "stocks"
+        bond_dir  = self._root / "bonds"
+        self._stock_files = sorted(stock_dir.glob("*.csv"))
+        self._rf_file     = bond_dir / "DGS10.csv"
 
         self._universe = (
             universe
             if universe is not None
-            else sorted(
-                p.stem.upper()
-                for p in self._dir.glob("*.csv")
-                if p.stem.upper() != "DGS10"
-            )
+            else [p.stem.upper() for p in self._stock_files]
         )
 
-        self._yield_series: Optional[pd.Series] = None
-        self._frames: Dict[str, pd.DataFrame] = {}
-        self._load_all()
+        # parse CSVs once to numeric frames
+        self._frames: Dict[str, pd.DataFrame] = {
+            p.stem.upper(): self._parse_stock_csv(p) for p in self._stock_files
+        }
+        self._yield_series: Optional[pd.Series] = (
+            self._parse_rf_csv(self._rf_file) if self._rf_file.exists() else None
+        )
 
     # ------------------------------------------------------------------ #
-    # public
+    # public ----------------------------------------------------------------
     # ------------------------------------------------------------------ #
     @property
     def universe(self) -> List[str]:
@@ -79,95 +102,85 @@ class CsvBarLoader:
     def rf_series(self) -> Optional[pd.Series]:
         return self._yield_series
 
-    def data_catalog(self) -> DataCatalog:
-        cat = DataCatalog()
-        for sym in self._universe:
-            cat.add_instrument(sym)  # String ID is fine
-        return cat
-
     def bar_iterator(self) -> Iterator[Bar]:
-        """Yields `Bar` objects globally sorted by timestamp ascending."""
-        # Build multi-asset index
-        idx = pd.Index(sorted({ts for f in self._frames.values() for ts in f.index}))
-        idx = idx.tz_localize(self.tz)
+        """
+        Yield **two** events per symbol/time-stamp:
+            1. FeatureBarData   (all numeric columns)
+            2. Bar              (OHLCV only)
 
-        for ts in idx:
+        They share the VERY SAME ts_epoch_ns so the cache keeps them aligned.
+        """
+        all_ts = sorted({ts for f in self._frames.values() for ts in f.index})
+
+        for ts in all_ts:
+            epoch_ns = int(ts.tz_localize(self.tz).value)
+
             for sym in self._universe:
                 df = self._frames[sym]
                 if ts not in df.index:
-                    continue                   # missing bar – universe padding
-                row = df.loc[ts]
+                    continue        # missing bar – universe padding
+
+                row            = df.loc[ts]
+                numeric_vector = row.values.astype(np.float32)
+
+                # ---- 1) full-feature object -------------------------
+                yield FeatureBarData(
+                    instrument=sym,
+                    ts_epoch_ns=epoch_ns,
+                    features=numeric_vector,
+                )
+
+                # ---- 2) traditional Bar -----------------------------
+                # Missing columns default to 0.0
+                def _get(col): return float(row[col]) if col in row else 0.0
                 yield Bar(
                     instrument=sym,
-                    bar_type=self._bar_type,
-                    ts_epoch_ns=int(ts.value),
-                    open=float(row["Open"]),
-                    high=float(row["High"]),
-                    low=float(row["Low"]),
-                    close=float(row["Close"]),
-                    volume=float(row["Volume"]),
+                    bar_type=self.bar_type,
+                    ts_epoch_ns=epoch_ns,
+                    open=_get("Open"),
+                    high=_get("High"),
+                    low=_get("Low"),
+                    close=_get("Adj Close") if "Adj Close" in row else _get("Close"),
+                    volume=_get("Volume"),
                 )
 
     # ------------------------------------------------------------------ #
-    # internal helpers
+    # parsing helpers
     # ------------------------------------------------------------------ #
-    def _load_all(self):
-        for csv in self._dir.glob("*.csv"):
-            name = csv.stem.upper()
-            if name == "DGS10":
-                self._yield_series = self._load_rf(csv)
-                continue
-            self._frames[name] = self._load_ohlcv(csv)
-
-    def _load_ohlcv(self, path: Path) -> pd.DataFrame:
+    def _parse_stock_csv(self, path: Path) -> pd.DataFrame:
         df = pd.read_csv(path)
-
-        if "Date" not in df.columns:
-            raise ValueError(f"{path} missing Date column")
-
         df["Date"] = pd.to_datetime(df["Date"], utc=True)
         df.set_index("Date", inplace=True)
         df.sort_index(inplace=True)
 
-        # If Adj Close exists, rename to Close
-        lower = df.columns.str.lower()
-        if "adj close" in lower or "adj_close" in lower:
-            df.rename(
-                columns=lambda c: "Close"
-                if c.lower() in ["adj close", "adj_close"]
-                else c,
-                inplace=True,
-            )
+        # -- adjusted close --------------------------------------------
+        cols_lc = {c.lower(): c for c in df.columns}
+        if "adj close" in cols_lc:
+            df.rename(columns={cols_lc["adj close"]: "Adj Close"}, inplace=True)
+        else:
+            df = self._compute_adj_close(df)
 
-        # Otherwise build one from dividends/splits if present
-        elif {"dividends", "stock splits"}.issubset(lower):
-            df = self._compute_adjusted_close(df)
-            df.rename(columns={"Adj Close": "Close"}, inplace=True)
-
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        if "Close" not in numeric_cols:
-            raise ValueError(f"{path} missing Close price")
-
-        return df[numeric_cols]
+        return df.select_dtypes(include=[np.number])   # keep ALL numeric columns
 
     @staticmethod
-    def _compute_adjusted_close(df: pd.DataFrame) -> pd.DataFrame:
+    def _compute_adj_close(df: pd.DataFrame) -> pd.DataFrame:
         df = df.sort_index().copy()
-        adj_factor = 1.0
-        factors = []
+        factors = np.ones(len(df))
+        div  = df.get("Dividends", pd.Series(0.0, index=df.index)).fillna(0.0)
+        splt = df.get("Stock Splits", pd.Series(0.0, index=df.index)).fillna(0.0)
+
+        factor = 1.0
         for i in range(len(df) - 1, -1, -1):
-            c, div, split = df.iloc[i][["Close", "Dividends", "Stock Splits"]]
-            if split and split != 0:
-                adj_factor /= 1.0 + split
-            if div and div != 0:
-                adj_factor *= (c - div) / c
-            factors.append(adj_factor)
-        df["Adj Close"] = df["Close"] * list(reversed(factors))
+            c = df.iloc[i]["Close"]
+            factor *= (1.0 - div.iat[i] / c) / (1.0 + splt.iat[i])
+            factors[i] = factor
+        df["Adj Close"] = df["Close"] * factors
         return df
 
-    def _load_rf(self, path: Path) -> pd.Series:
+    @staticmethod
+    def _parse_rf_csv(path: Path) -> pd.Series:
         rf = pd.read_csv(path, parse_dates=["observation_date"])
         rf.rename(columns={"observation_date": "Date"}, inplace=True)
         rf.set_index("Date", inplace=True)
         rf["DGS10"] = pd.to_numeric(rf["DGS10"], errors="coerce") / 100.0
-        return rf["DGS10"].asfreq("B").fillna(method="ffill")
+        return rf["DGS10"].asfreq("B").ffill()

@@ -356,7 +356,7 @@ class ForecastingLearning(nn.Module):
             if active_mask is not None:
                 mask = active_mask.float()                         # (B,I)
                 out = out * mask
-                tgt_masked = target * mask
+                #tgt_masked = target * mask
             mse   = F.mse_loss(out, target)
             rank_loss = 1 - rank_ic(out, target)
             loss = mse + self.lambda_rankic * rank_loss

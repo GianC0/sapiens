@@ -1,286 +1,288 @@
 """
-UMIStrategy
-===========
+Generic long/short strategy for Nautilus Trader.
 
-Nautilus Trader strategy wrapper around the PyTorch-based UMIModel.
-Implements:
-
-* Dynamic universe (slots padded out to `dynamic_universe_mult` × active stocks)
-* Risk overlays (drawdown kill-switch, trailing stops, vol targeting, etc.)
-* Per-frequency retrain logic (delta measured in *bars*)
-* Parallel order dispatch (async gather, size `execution.parallel_orders`)
-* Live routing:   – CCXT exchanges (spot); Interactive Brokers (stock/ETF)
-                  – connectors only initialised when `engine.mode == "LIVE"`
+* Consumes ANY model that follows interfaces.MarketModel
+* Data feed provided by CsvBarLoader (FeatureBarData + Bar)
+* Risk controls: draw-down, trailing stops, ADV cap, fee/slippage models
 """
 from __future__ import annotations
-import math
+
 import asyncio
-from datetime import datetime, timedelta
-from types import SimpleNamespace
+import importlib
+import math
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import yaml
-
-from nautilus_trader.model.strategy import Strategy
+from nautilus_trader.common.component import Clock
+from nautilus_trader.trading.strategy import Strategy
+from nautilus_trader.execution import Trade
 from nautilus_trader.model.events import BarEvent, TradeEvent
-from nautilus_trader.common.clock import Clock
-from nautilus_trader.execution.trade import Trade
-from nautilus_trader.persistence.catalog import Catalog
 
-from algos.engine.data_loader import CsvBarLoader
+
+# ----- project imports -----------------------------------------------------
+from ..models.interfaces import MarketModel
+from engine.data_loader import CsvBarLoader
+from ..models.utils.cache_adapter import cache_to_dict
+
+#  risk / execution helpers (same modules you used before)
 from algos.engine.execution import CommissionModelBps, SlippageModelBps
 from algos.engine.optimizer import MaxSharpeRatioOptimizer
 from algos.engine.analyzers import EquityCurveAnalyzer
-from algos.engine.utils import beta
-from algos.models.umi import UMIModel
 
 
-class UMIStrategy(Strategy):
+# ========================================================================== #
+# Strategy
+# ========================================================================== #
+class GenericLongShortStrategy(Strategy):
+    """
+    Long/short equity strategy, model-agnostic & frequency-agnostic.
+
+    YAML keys used
+    --------------
+    model_name:          umi | my_gpt_model | …
+    freq:                "1D" | "15m" | …
+    data_dir:            root folder with stocks/  bonds/
+    window_len, pred_len
+    training:            {n_epochs,…}
+    selection.top_k      (long+short per side)
+    costs.fee_bps, costs.spread_bps
+    execution.twap_slices, execution.parallel_orders
+    liquidity.adv_lookback, liquidity.max_adv_pct
+    risk.trailing_stop_pct, risk.drawdown_pct,
+         risk.max_weight_abs, risk.max_weight_rel, risk.target_vol_annual
+    optimizer.name:      max_sharpe | none
+    """
+
     # ------------------------------------------------------------------ #
-    # lifecycle
-    # ------------------------------------------------------------------ #
-    def __init__(self, clock: Clock, catalog: Catalog, cfg_path: Path):
-        super().__init__("UMI_STRAT", clock, catalog)
+    def __init__(self, clock: Clock, catalog, cfg_path: Path):
+        super().__init__("GENERIC_LS", clock, catalog)
+
         self.cfg = yaml.safe_load(Path(cfg_path).read_text())
-        self.freq = self.cfg["freq"]
 
-        # --- loader ---------------------------------------------------
+        # 1) ---------------- data loader ------------------------------
         self.loader = CsvBarLoader(
-            data_dir=Path(self.cfg["data_dir"]),
-            freq=self.freq,
+            root=Path(self.cfg["data_dir"]),
+            freq=self.cfg["freq"],
         )
         self.universe: List[str] = self.loader.universe
-        self.rf_series = self.loader.rf_series
-        
-        # -------------- retrain schedule (bars → real timedelta) ------
-        bars_delta = int(self.cfg["training"]["retrain_delta"])
-        bar_offset = pd.tseries.frequencies.to_offset(self.freq)
-        self.retrain_delta = bars_delta * bar_offset
+        self._bar_type = self.loader.bar_type
 
-        # --- model ----------------------------------------------------
-        first_df = next(iter(self.loader._frames.values()))
-        F = len(first_df.columns)
-        close_idx = first_df.columns.get_indexer(["Close"])[0]
+        # 2) ---------------- model (dynamic import) -------------------
+        self.model: MarketModel = self._build_model()
 
-        self.model = UMIModel(
-            freq=self.freq,
-            feature_dim=F,
-            window_len=self.cfg["window_len"],
-            pred_len=self.cfg["pred_len"],
-            end_train=self.cfg["train_end"],
-            end_valid=self.cfg["valid_end"],
-            bt_end=self.cfg["backtest_end"],
-            retrain_delta= self.retrain_delta,
-            dynamic_universe_mult=self.cfg["dynamic_universe_mult"],
-            tune_hparams=self.cfg["training"]["tune_hparams"],
-            n_trials=self.cfg["training"]["n_trials"],
-            n_epochs=self.cfg["training"]["n_epochs"],
-            batch_size=self.cfg["training"]["batch_size"],
-            training_mode=self.cfg["training"]["training_mode"],
-            pretrain_epochs=self.cfg["training"]["pretrain_epochs"],
-            patience=self.cfg["training"]["patience"],
-            close_idx=close_idx,
-            model_dir=Path(self.cfg["model_dir"]),
-            data_dir=Path(self.cfg["data_dir"]),
-            warm_start=self.cfg["warm_start"],
-            warm_training_epochs=self.cfg["warm_training_epochs"],
-            clock_fn=lambda: pd.Timestamp(self.clock.now(), tz="UTC"),
-            **self.cfg.get("hparams", {}),
+        # 3) ---------------- optimiser --------------------------------
+        opt_name = str(self.cfg.get("optimizer", {}).get("name", "max_sharpe")).lower()
+        rf = (
+            float(self.loader.rf_series.iloc[-1])
+            if self.loader.rf_series is not None
+            else 0.0
         )
-        self._data_buf = self.loader._frames  # live reference
-        self.model.fit(self._data_buf)
+        self.optimizer = MaxSharpeRatioOptimizer(risk_free=rf) if opt_name == "max_sharpe" else None
 
-        # --- optimiser & risk helpers --------------------------------
-        risk_free = float(self.rf_series.iloc[-1]) if self.rf_series is not None else 0.0
-        opt_name = self.cfg.get("optimizer", {}).get("name", "max_sharpe").lower()
-        if opt_name == "max_sharpe":
-            self.optimizer = MaxSharpeRatioOptimizer(risk_free=risk_free)
-        else:
-            raise NotImplementedError(f"optimizer.name={opt_name} not yet available")
-        self.selector_k = self.cfg["selection"]["top_k"]
+        self.selector_k = int(self.cfg["selection"]["top_k"])
+
+        # 4) ---------------- risk helpers -----------------------------
+        self.trailing_stop_pct = float(self.cfg["risk"]["trailing_stop_pct"])
+        self.drawdown_pct = float(self.cfg["risk"]["drawdown_pct"])
+        self.max_w_abs = float(self.cfg["risk"]["max_weight_abs"])
+        self.max_w_rel = float(self.cfg["risk"]["max_weight_rel"])
+        self.target_vol = float(self.cfg["risk"]["target_vol_annual"])
         self.trailing_stops: Dict[str, float] = {}
+        self.realised_returns: List[float] = []
+        self.equity_peak_value: float = 0.0
         self.equity_analyzer = EquityCurveAnalyzer()
 
-        # --- execution helpers ---------------------------------------
-        self.fee_model = CommissionModelBps(self.cfg["costs"]["fee_bps"])
-        self.slip_model = SlippageModelBps(self.cfg["costs"]["spread_bps"])
+        # 5) ---------------- execution --------------------------------
+        self.fee_model = CommissionModelBps(float(self.cfg["costs"]["fee_bps"]))
+        self.slip_model = SlippageModelBps(float(self.cfg["costs"]["spread_bps"]))
         self.twap_slices = max(1, int(self.cfg["execution"]["twap_slices"]))
         self.parallel_orders = max(1, int(self.cfg["execution"]["parallel_orders"]))
+        self.adv_lookback = int(self.cfg["liquidity"]["adv_lookback"])
+        self.max_adv_pct = float(self.cfg["liquidity"]["max_adv_pct"])
 
-        self.drawdown_pct = self.cfg["risk"]["drawdown_pct"]
-        self.trailing_stop_pct = self.cfg["risk"]["trailing_stop_pct"]
-        self.max_w_abs = self.cfg["risk"]["max_weight_abs"]
-        self.max_w_rel = self.cfg["risk"]["max_weight_rel"]
-        self.target_vol = self.cfg["risk"]["target_vol_annual"]
-        self.realised_returns: List[float] = []
-        self.equity_peak_value = 0.0
-
-        # --- state ----------------------------------------------------
-        self.prev_prices: Dict[str, float] = {}
-        self.prev_qty: Dict[str, int] = {}
-
-    # ------------------------------------------------------------------ #
+    # ================================================================= #
     # Nautilus event handlers
-    # ------------------------------------------------------------------ #
+    # ================================================================= #
     async def on_start(self):
-        # Subscribe to universe symbols as Bar data
+        """Subscribe to bars for every symbol."""
         for sym in self.universe:
-            self.subscribe_bars(sym, self.loader._bar_type)
+            self.subscribe_bars(sym, self._bar_type)
 
     async def on_bar(self, event: BarEvent):
-        ts = datetime.utcfromtimestamp(event.ts_epoch_ns * 1e-9)
+        ts = event.ts_event.to_pydatetime()
         sym = event.instrument
         bar = event.bar
 
-        # Update rolling frame
-        self._data_buf[sym].loc[ts] = [
-            bar.open, bar.high, bar.low, bar.close, bar.volume
-        ]
-        # Trim to last L+pred bars
-        maxlen = self.cfg["window_len"] + self.cfg["pred_len"] + 1
-        self._data_buf[sym] = self._data_buf[sym].iloc[-maxlen:]
+        # ------------ trailing-stop maintenance ----------------------
+        await self._run_trailing_stops(sym, bar.close)
 
-        # Record equity
+        # ------------ equity / draw-down log ------------------------
         nav = self.portfolio.account_value
         self.equity_peak_value = max(self.equity_peak_value, nav)
         self.equity_analyzer.on_equity(ts, nav)
+        if nav < self.equity_peak_value * (1 - self.drawdown_pct):
+            await self._liquidate_all()
+            return
 
-        # Trailing stop logic
-        await self._run_trailing_stops(sym, bar.close)
+        # ------------ run rebalance once per bar time-stamp ---------
+        if sym != self.universe[0]:
+            return                                                     # wait for pivot symbol
 
-        # Once per *bar* (not per symbol) pick a pivot symbol
-        if sym == self.universe[0]:
-            await self._rebalance(ts)
+        snap = cache_to_dict(
+            self.cache,
+            tickers=self.universe,
+            lookback=self.model.L + self.model.pred_len + 1,
+        )
 
-        # Model maintenance
-        self.model.update(self._data_buf)
-
-    async def on_trade(self, event: TradeEvent):
-        trade: Trade = event.trade
-        # Store fills if needed for analytics
-        self.prev_qty[trade.instrument] = trade.position_size
-
-    # ------------------------------------------------------------------ #
-    # internal
-    # ------------------------------------------------------------------ #
-    async def _rebalance(self, ts: datetime):
-        preds = self.model.predict(self._data_buf)
+        preds = self.model.predict(snap)
         if not preds:
             return
 
-        # μ and Σ
-        universe = list(preds.keys())
-        mu = np.array([preds[tkr] for tkr in universe])
+        # === weights =================================================
+        weights = self._compute_target_weights(preds)
 
-        lookback = self.cfg["optimizer"]["lookback_days"]
-        returns = pd.DataFrame({
-            t: self._data_buf[t]["Close"].pct_change().dropna().iloc[-lookback:]
-            for t in universe
-        }).dropna()
-        if returns.empty:
-            return
-        cov = returns.cov().values
-
-        raw_w = self.optimizer.optimize(mu, cov)
-        weights = dict(zip(universe, raw_w))
-
-        # keep only top / bottom k
-        ranked = sorted(weights.items(), key=lambda x: x[1])
-        shorts = [t for t, _ in ranked[: self.selector_k]]
-        longs  = [t for t, _ in ranked[-self.selector_k :]]
-        for t in list(weights):
-            if t not in longs and t not in shorts:
-                weights[t] = 0.0
-
-        # gross / net scaling and Cap position weights
-        gross_target = self.cfg["allocation"]["gross_leverage"]
-        w = pd.Series(weights, dtype=float)
-        abs_cap = self.cfg["risk"]["max_weight_abs"]
-        rel_cap = self.cfg["risk"]["max_weight_rel"]
-        w = w.clip(-abs_cap, abs_cap)
-        if w.abs().sum() > gross_target * rel_cap:
-            w *= (gross_target * rel_cap) / w.abs().sum()
-        weights = w.to_dict()
-
-        # Volatility targeting
-        if self.realised_returns:
-            realised = np.std(self.realised_returns) * math.sqrt(252)
-            if realised > 0:
-                scale = min(1.5, self.target_vol / realised)
-                weights = {k: v * scale for k, v in weights.items()}
-
+        # === place orders ============================================
         await self._dispatch_orders(weights, ts)
 
-        # Store realised return for next bar
-        prev_nav = self.prev_prices.get("__NAV__", nav := self.portfolio.account_value)
-        daily_ret = (nav - prev_nav) / prev_nav if prev_nav else 0.0
-        self.realised_returns.append(daily_ret)
-        if len(self.realised_returns) > 60:
-            self.realised_returns.pop(0)
-        self.prev_prices["__NAV__"] = nav
+        # === realised return bookkeeping ============================
+        prev_nav = self.state.get("prev_nav", nav)
+        if prev_nav:
+            self.realised_returns.append((nav - prev_nav) / prev_nav)
+            if len(self.realised_returns) > 60:
+                self.realised_returns.pop(0)
+        self.state["prev_nav"] = nav
 
-    async def _dispatch_orders(self, target_weights: Dict[str, float], ts: datetime):
+        # === model upkeep ===========================================
+        self.model.update(snap)
+
+    async def on_trade(self, event: TradeEvent):
+        trade: Trade = event.trade
+        self.state[f"qty_{trade.instrument}"] = trade.position_size
+
+    # ================================================================= #
+    # internal helpers
+    # ================================================================= #
+    # ----- model factory ----------------------------------------------
+    def _build_model(self) -> MarketModel:
+        name = str(self.cfg["model_name"]).lower()
+        mod = importlib.import_module(f"models.{name}")
+        ModelCls = getattr(mod, "Model", None) or getattr(mod, f"{name.upper()}Model")
+        if ModelCls is None:
+            raise ImportError(f"models.{name} must export a Model class")
+        first_df = next(iter(self.loader._frames.values()))
+        model: MarketModel = ModelCls(
+            freq=self.cfg["freq"],
+            feature_dim=len(first_df.columns),
+            window_len=self.cfg["window_len"],
+            pred_len=self.cfg["pred_len"],
+            bar_type=self._bar_type,
+            end_train=self.cfg["train_end"],
+            end_valid=self.cfg["valid_end"],
+            **self.cfg.get("hparams", {}),
+        )
+        model.fit(self.loader._frames, n_epochs=self.cfg["training"]["n_epochs"])
+        return model
+
+    # ----- weight optimiser ------------------------------------------
+    def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
+        mu = np.array([preds[s] for s in self.universe])
+        if self.optimizer is None:
+            w = pd.Series(mu, index=self.universe)
+        else:
+            lookback = int(self.cfg["optimizer"].get("lookback_days", 60))
+            returns = pd.DataFrame({
+                s: self.cache.bars(self._bar_type, limit=lookback, instrument=s)
+                .to_pandas()["close"].pct_change()
+                for s in self.universe
+            }).dropna()
+            cov = returns.cov().values if not returns.empty else np.diag(np.ones_like(mu))
+            w_vec = self.optimizer.optimize(mu, cov)
+            w = pd.Series(w_vec, index=self.universe)
+
+        # ------- keep only top / bottom k ----------------------------
+        shorts = w.nsmallest(self.selector_k)
+        longs  = w.nlargest(self.selector_k)
+        w = pd.concat([shorts, longs]).reindex(self.universe).fillna(0.0)
+
+        # ------- cap position weights --------------------------------
+        w = w.clip(-self.max_w_abs, self.max_w_abs)
+        if w.abs().sum() > self.max_w_rel:
+            w *= self.max_w_rel / w.abs().sum()
+
+        # ------- vol targeting ---------------------------------------
+        if self.realised_returns:
+            realised_vol = np.std(self.realised_returns) * math.sqrt(252)
+            if realised_vol > 0:
+                scale = min(1.5, self.target_vol / realised_vol)
+                w *= scale
+        return w.to_dict()
+
+    # ----- execution --------------------------------------------------
+    async def _dispatch_orders(self, target_w: Dict[str, float], ts: datetime):
         nav = self.portfolio.account_value
-        coros = []
+        coros: List[asyncio.Task] = []
 
-        for sym, target_w in target_weights.items():
-            price = self._data_buf[sym].iloc[-1]["Close"]
+        for sym, target_w in target_w.items():
+            price = self.cache.bar(sym, self._bar_type, index=0).close
             if price == 0:
                 continue
             target_qty = int((target_w * nav) / price)
             delta = target_qty - self.portfolio.position_size(sym)
-            # ---------------- liquidity / position-size caps ----------
-            # 1) absolute NAV cap (already enforced in weights)
-            # 2) volume cap   – keep ≤ max_adv_pct of ADV
-            adv_series = self._data_buf[sym]["Volume"].iloc[
-                -self.cfg["liquidity"]["adv_lookback"] :
-            ]
-            adv = adv_series.mean() if not adv_series.empty else 0
-            max_trade = int(adv * self.cfg["liquidity"]["max_adv_pct"])
+
+            # -------- ADV cap ----------------------------------------
+            bars = self.cache.bars(self._bar_type, instrument=sym, limit=self.adv_lookback)
+            volumes = [b.volume for b in bars] or [0.0]
+            max_trade = int(np.mean(volumes) * self.max_adv_pct)
             if max_trade:
                 delta = int(math.copysign(min(abs(delta), max_trade), delta))
             if delta == 0:
                 continue
-            coros.append(self._twap(sym, delta))
 
-        # Parallel execution limited by config
-        chunks = [
-            coros[i : i + self.parallel_orders]
-            for i in range(0, len(coros), self.parallel_orders)
-        ]
-        for batch in chunks:
+            # -------- TWAP slicing -----------------------------------
+            slice_qty = int(delta / self.twap_slices)
+            for i in range(self.twap_slices - 1):
+                coros.append(self._async_mkt(sym, slice_qty))
+            remainder = delta - slice_qty * (self.twap_slices - 1)
+            coros.append(self._async_mkt(sym, remainder))
+
+        # parallel_batches
+        for batch in [coros[i:i + self.parallel_orders] for i in range(0, len(coros), self.parallel_orders)]:
             await asyncio.gather(*batch)
 
-    async def _twap(self, sym: str, qty: int):
-        if self.twap_slices <= 1:
+    async def _async_mkt(self, sym: str, qty: int):
+        if qty:
             self.market_order(sym, qty)
-            return
-        slice_qty = int(qty / self.twap_slices)
-        remainder = qty - slice_qty * (self.twap_slices - 1)
-        for i in range(self.twap_slices):
-            q = slice_qty if i < self.twap_slices - 1 else remainder
-            if q != 0:
-                self.market_order(sym, q)
-            await asyncio.sleep(0)  # yield
 
+    # ----- trailing stops --------------------------------------------
     async def _run_trailing_stops(self, sym: str, price: float):
         pos = self.portfolio.position_size(sym)
         if pos == 0:
+            self.trailing_stops.pop(sym, None)
             return
-        if pos > 0:  # long
+
+        if pos > 0:                       # long
             high = self.trailing_stops.get(sym, price)
-            high = max(high, price)
-            self.trailing_stops[sym] = high
-            if price <= high * (1 - self.trailing_stop_pct):
-                await self._twap(sym, -pos)
+            if price > high:
+                self.trailing_stops[sym] = price
+            elif price <= high * (1 - self.trailing_stop_pct):
+                await self._async_mkt(sym, -pos)
                 self.trailing_stops.pop(sym, None)
-        else:  # short
+        else:                             # short
             low = self.trailing_stops.get(sym, price)
-            low = min(low, price)
-            self.trailing_stops[sym] = low
-            if price >= low * (1 + self.trailing_stop_pct):
-                await self._twap(sym, -pos)
+            if price < low:
+                self.trailing_stops[sym] = price
+            elif price >= low * (1 + self.trailing_stop_pct):
+                await self._async_mkt(sym, -pos)
                 self.trailing_stops.pop(sym, None)
+
+    # ----- emergency liquidate ---------------------------------------
+    async def _liquidate_all(self):
+        for sym in self.universe:
+            qty = self.portfolio.position_size(sym)
+            if qty != 0:
+                await self._async_mkt(sym, -qty)
+        self.trailing_stops.clear()
