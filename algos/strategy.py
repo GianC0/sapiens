@@ -17,21 +17,23 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import yaml
+
 from nautilus_trader.common.component import Clock
 from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.execution import Trade
-from nautilus_trader.model.events import BarEvent, TradeEvent
-
+from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.orders import MarketOrder
+from nautilus_trader.model.enums import OrderSide
 
 # ----- project imports -----------------------------------------------------
-from ..models.interfaces import MarketModel
-from engine.data_loader import CsvBarLoader
-from ..models.utils.cache_adapter import cache_to_dict
+from .models.interfaces import MarketModel
+from .engine.data_loader import CsvBarLoader, FeatureBarData
+from ..models.utils import cache_to_dict
 
 #  risk / execution helpers (same modules you used before)
-from algos.engine.execution import CommissionModelBps, SlippageModelBps
-from algos.engine.optimizer import MaxSharpeRatioOptimizer
-from algos.engine.analyzers import EquityCurveAnalyzer
+from .engine.execution import CommissionModelBps, SlippageModelBps
+from .engine.optimizer import MaxSharpeRatioOptimizer
+from .engine.analyzers import EquityCurveAnalyzer
 
 
 # ========================================================================== #
@@ -58,10 +60,10 @@ class GenericLongShortStrategy(Strategy):
     """
 
     # ------------------------------------------------------------------ #
-    def __init__(self, clock: Clock, catalog, cfg_path: Path):
-        super().__init__("GENERIC_LS", clock, catalog)
+    def __init__(self, config: dict):  
+        super().__init__()  
 
-        self.cfg = yaml.safe_load(Path(cfg_path).read_text())
+        self.cfg = config
 
         # 1) ---------------- data loader ------------------------------
         self.loader = CsvBarLoader(
@@ -107,38 +109,33 @@ class GenericLongShortStrategy(Strategy):
     # ================================================================= #
     # Nautilus event handlers
     # ================================================================= #
-    async def on_start(self):
+    def on_start(self):  # CHANGED: Removed async
         """Subscribe to bars for every symbol."""
         for sym in self.universe:
-            self.subscribe_bars(sym, self._bar_type)
+            self.subscribe_bars(self._bar_type, sym)  
 
-    async def on_bar(self, event: BarEvent):
-        ts = event.ts_event.to_pydatetime()
-        sym = event.instrument
-        bar = event.bar
-
+    def on_bar(self, bar: Bar):  
+        ts = bar.ts_event
+        sym = bar.instrument_id.symbol
+        
         # ------------ trailing-stop maintenance ----------------------
-        await self._run_trailing_stops(sym, bar.close)
+        self._run_trailing_stops(sym, bar.close)  
 
         # ------------ equity / draw-down log ------------------------
-        nav = self.portfolio.account_value
+        # CHANGED: Updated portfolio access methods
+        nav = self.portfolio.net_liquidation
         self.equity_peak_value = max(self.equity_peak_value, nav)
         self.equity_analyzer.on_equity(ts, nav)
         if nav < self.equity_peak_value * (1 - self.drawdown_pct):
-            await self._liquidate_all()
+            self._liquidate_all()  
             return
 
         # ------------ run rebalance once per bar time-stamp ---------
         if sym != self.universe[0]:
-            return                                                     # wait for pivot symbol
+            return                                                     
 
-        snap = cache_to_dict(
-            self.cache,
-            tickers=self.universe,
-            lookback=self.model.L + self.model.pred_len + 1,
-        )
-
-        preds = self.model.predict(snap)
+        # CHANGED: Pass cache directly to model predict
+        preds = self.model.predict(self.cache)
         if not preds:
             return
 
@@ -146,22 +143,27 @@ class GenericLongShortStrategy(Strategy):
         weights = self._compute_target_weights(preds)
 
         # === place orders ============================================
-        await self._dispatch_orders(weights, ts)
+        self._dispatch_orders(weights, ts)  # CHANGED: Removed await
 
         # === realised return bookkeeping ============================
-        prev_nav = self.state.get("prev_nav", nav)
+        # CHANGED: Fixed state access
+        prev_nav = getattr(self, '_prev_nav', nav)
         if prev_nav:
             self.realised_returns.append((nav - prev_nav) / prev_nav)
             if len(self.realised_returns) > 60:
                 self.realised_returns.pop(0)
-        self.state["prev_nav"] = nav
+        self._prev_nav = nav
 
         # === model upkeep ===========================================
-        self.model.update(snap)
+        self.model.update(self.cache)
 
-    async def on_trade(self, event: TradeEvent):
-        trade: Trade = event.trade
-        self.state[f"qty_{trade.instrument}"] = trade.position_size
+    def on_order_filled(self, event: OrderFilled): 
+        """Update position tracking on fills."""
+        
+        order = event.order
+        position = self.portfolio.position(order.instrument_id)
+        if position:
+            self._position_qty[order.instrument_id.symbol] = position.quantity
 
     # ================================================================= #
     # internal helpers
@@ -173,7 +175,10 @@ class GenericLongShortStrategy(Strategy):
         ModelCls = getattr(mod, "Model", None) or getattr(mod, f"{name.upper()}Model")
         if ModelCls is None:
             raise ImportError(f"models.{name} must export a Model class")
+        
+        
         first_df = next(iter(self.loader._frames.values()))
+        
         model: MarketModel = ModelCls(
             freq=self.cfg["freq"],
             feature_dim=len(first_df.columns),
@@ -194,11 +199,18 @@ class GenericLongShortStrategy(Strategy):
             w = pd.Series(mu, index=self.universe)
         else:
             lookback = int(self.cfg["optimizer"].get("lookback_days", 60))
-            returns = pd.DataFrame({
-                s: self.cache.bars(self._bar_type, limit=lookback, instrument=s)
-                .to_pandas()["close"].pct_change()
-                for s in self.universe
-            }).dropna()
+            
+            returns = pd.DataFrame()
+            for s in self.universe:
+                bars = []
+                for bar in self.cache.bars(self._bar_type):
+                    if bar.instrument_id.symbol == s:
+                        bars.append(bar)
+                if len(bars) >= 2:
+                    closes = [b.close for b in bars[-lookback:]]
+                    ret = pd.Series(closes).pct_change().dropna()
+                    returns[s] = ret
+            
             cov = returns.cov().values if not returns.empty else np.diag(np.ones_like(mu))
             w_vec = self.optimizer.optimize(mu, cov)
             w = pd.Series(w_vec, index=self.universe)
@@ -222,20 +234,36 @@ class GenericLongShortStrategy(Strategy):
         return w.to_dict()
 
     # ----- execution --------------------------------------------------
-    async def _dispatch_orders(self, target_w: Dict[str, float], ts: datetime):
-        nav = self.portfolio.account_value
-        coros: List[asyncio.Task] = []
-
-        for sym, target_w in target_w.items():
-            price = self.cache.bar(sym, self._bar_type, index=0).close
-            if price == 0:
+    def _dispatch_orders(self, target_w: Dict[str, float], ts: datetime):  # CHANGED: Removed async
+        nav = self.portfolio.net_liquidation
+        
+        for sym, target_weight in target_w.items():
+            # CHANGED: Fixed bar and position access
+            instrument_id = self.instruments[sym]
+            bar = None
+            for b in self.cache.bars(self._bar_type):
+                if b.instrument_id == instrument_id:
+                    bar = b
+                    break
+            
+            if not bar or bar.close == 0:
                 continue
-            target_qty = int((target_w * nav) / price)
-            delta = target_qty - self.portfolio.position_size(sym)
+                
+            price = bar.close
+            target_qty = int((target_weight * nav) / price)
+            
+            # CHANGED: Fixed position access
+            position = self.portfolio.position(instrument_id)
+            current_qty = position.quantity if position else 0
+            delta = target_qty - current_qty
 
             # -------- ADV cap ----------------------------------------
-            bars = self.cache.bars(self._bar_type, instrument=sym, limit=self.adv_lookback)
-            volumes = [b.volume for b in bars] or [0.0]
+            volumes = []
+            for b in self.cache.bars(self._bar_type):
+                if b.instrument_id == instrument_id:
+                    volumes.append(b.volume)
+            volumes = volumes[-self.adv_lookback:] if volumes else [0.0]
+            
             max_trade = int(np.mean(volumes) * self.max_adv_pct)
             if max_trade:
                 delta = int(math.copysign(min(abs(delta), max_trade), delta))
@@ -245,21 +273,28 @@ class GenericLongShortStrategy(Strategy):
             # -------- TWAP slicing -----------------------------------
             slice_qty = int(delta / self.twap_slices)
             for i in range(self.twap_slices - 1):
-                coros.append(self._async_mkt(sym, slice_qty))
+                self._submit_market_order(instrument_id, slice_qty)
             remainder = delta - slice_qty * (self.twap_slices - 1)
-            coros.append(self._async_mkt(sym, remainder))
+            self._submit_market_order(instrument_id, remainder)
 
-        # parallel_batches
-        for batch in [coros[i:i + self.parallel_orders] for i in range(0, len(coros), self.parallel_orders)]:
-            await asyncio.gather(*batch)
-
-    async def _async_mkt(self, sym: str, qty: int):
-        if qty:
-            self.market_order(sym, qty)
+    def _submit_market_order(self, instrument_id, qty: int):  # CHANGED: New method
+        if qty == 0:
+            return
+        # CHANGED: Create and submit order using Nautilus API
+        order_side = OrderSide.BUY if qty > 0 else OrderSide.SELL
+        order = self.order_factory.market(
+            instrument_id=instrument_id,
+            order_side=order_side,
+            quantity=abs(qty),
+        )
+        self.submit_order(order)
 
     # ----- trailing stops --------------------------------------------
-    async def _run_trailing_stops(self, sym: str, price: float):
-        pos = self.portfolio.position_size(sym)
+    def _run_trailing_stops(self, sym: str, price: float):  # CHANGED: Removed async
+        instrument_id = self.instruments[sym]
+        position = self.portfolio.position(instrument_id)
+        pos = position.quantity if position else 0
+        
         if pos == 0:
             self.trailing_stops.pop(sym, None)
             return
@@ -269,20 +304,22 @@ class GenericLongShortStrategy(Strategy):
             if price > high:
                 self.trailing_stops[sym] = price
             elif price <= high * (1 - self.trailing_stop_pct):
-                await self._async_mkt(sym, -pos)
+                self._submit_market_order(instrument_id, -pos)
                 self.trailing_stops.pop(sym, None)
         else:                             # short
             low = self.trailing_stops.get(sym, price)
             if price < low:
                 self.trailing_stops[sym] = price
             elif price >= low * (1 + self.trailing_stop_pct):
-                await self._async_mkt(sym, -pos)
+                self._submit_market_order(instrument_id, -pos)
                 self.trailing_stops.pop(sym, None)
 
     # ----- emergency liquidate ---------------------------------------
-    async def _liquidate_all(self):
+    def _liquidate_all(self):  # CHANGED: Removed async
         for sym in self.universe:
-            qty = self.portfolio.position_size(sym)
+            instrument_id = self.instruments[sym]
+            position = self.portfolio.position(instrument_id)
+            qty = position.quantity if position else 0
             if qty != 0:
-                await self._async_mkt(sym, -qty)
+                self._submit_market_order(instrument_id, -qty)
         self.trailing_stops.clear()

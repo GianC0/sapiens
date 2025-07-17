@@ -16,36 +16,41 @@ from typing import Dict, Iterator, List, Optional
 
 import numpy as np
 import pandas as pd
-from nautilus_trader.model import Bar, BarType
+from nautilus_trader.model.data import Bar, BarType
 #from nautilus_trader.model import Data  # base class for custom data
 
 
 # ------------------------------------------------------------------ #
 # Custom data class
 # ------------------------------------------------------------------ #
-class FeatureBarData(Bar):
+class FeatureBarData(Data):
     """
     Carries the *entire* numeric feature vector for one instrument at one
     timestamp.  Stored in the cache so that the model can rebuild the same
     tensor it saw during training.
     """
 
-    __slots__ = ("_instrument", "_ts_epoch_ns", "_features")
+    __slots__ = ("_instrument", "_ts_event", "_ts_init", "_features")
 
-    def __init__(self, instrument: str, ts_epoch_ns: int, features: np.ndarray):
-        super().__init__()
-        self._instrument  = instrument
-        self._ts_epoch_ns = ts_epoch_ns
-        self._features    = features          # 1-D numpy array
+    def __init__(self, instrument: str, ts_event: int, ts_init: int, features: np.ndarray):
+        # CHANGED: Call Data.__init__ with proper timestamp parameters
+        self._ts_event = ts_event
+        self._ts_init = ts_init
+        self._instrument = instrument
+        self._features = features          # 1-D numpy array
 
     # -- properties required by Nautilus ---------------------------------
     @property
-    def instrument(self):
+    def instrument_id(self):
         return self._instrument
 
     @property
-    def ts_epoch_ns(self) -> int:
-        return self._ts_epoch_ns
+    def ts_event(self) -> int:
+        return self._ts_event
+
+    @property
+    def ts_init(self) -> int:
+        return self._ts_init
 
     # -- convenience -----------------------------------------------------
     @property
@@ -108,12 +113,13 @@ class CsvBarLoader:
             1. FeatureBarData   (all numeric columns)
             2. Bar              (OHLCV only)
 
-        They share the VERY SAME ts_epoch_ns so the cache keeps them aligned.
+        They share the VERY SAME ts_event so the cache keeps them aligned.
         """
         all_ts = sorted({ts for f in self._frames.values() for ts in f.index})
 
         for ts in all_ts:
             epoch_ns = int(ts.tz_localize(self.tz).value)
+            ts_init = epoch_ns  # Use same as event time for simplicity
 
             for sym in self._universe:
                 df = self._frames[sym]
@@ -126,24 +132,26 @@ class CsvBarLoader:
                 # ---- 1) full-feature object -------------------------
                 yield FeatureBarData(
                     instrument=sym,
-                    ts_epoch_ns=epoch_ns,
+                    ts_event=epoch_ns,
+                    ts_init=ts_init,
                     features=numeric_vector,
                 )
 
                 # ---- 2) traditional Bar -----------------------------
                 # Missing columns default to 0.0
                 def _get(col): return float(row[col]) if col in row else 0.0
+                # Fixed Bar constructor parameters
                 yield Bar(
-                    instrument=sym,
                     bar_type=self.bar_type,
-                    ts_epoch_ns=epoch_ns,
+                    instrument_id=sym,
                     open=_get("Open"),
                     high=_get("High"),
                     low=_get("Low"),
                     close=_get("Adj Close") if "Adj Close" in row else _get("Close"),
                     volume=_get("Volume"),
+                    ts_event=epoch_ns,
+                    ts_init=ts_init,
                 )
-
     # ------------------------------------------------------------------ #
     # parsing helpers
     # ------------------------------------------------------------------ #

@@ -12,29 +12,22 @@
 
 import os, math, json, shutil, datetime as dt
 from pathlib import Path
-from tkinter import N
 from typing import Dict, Optional, Any, Callable, Union
 from nautilus_trader.cache.cache import Cache
-from ..utils import cache_to_dict
-from ..interfaces import DataSource
 from concurrent.futures import ThreadPoolExecutor
-from learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
+from utils import cache_to_dict
+from interfaces import DataSource
+from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, IterableDataset
-from utils.yaml_config import load_cfg
+import yaml
 import numpy as np
 import random
 
 
 
-
-# ───────────────────────────────────────────────────────────
-#  NEW ─ configuration loaded from yaml file
-# ───────────────────────────────────────────────────────────
-
-cfg = load_cfg()
 
 # --------------------------------------------------------------------------- #
 # 1. Dataset that yields sliding windows ready for the factor blocks          #

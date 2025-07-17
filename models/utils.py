@@ -32,29 +32,59 @@ def cache_to_dict(
 
     Notes
     -----
-    * Missing symbols are silently skipped – the caller decides what to do.
+    * This function now looks for FeatureBarData objects first,
+      falling back to regular Bar objects if features aren't available.
     * Volume comes from `bar.volume` which is 0 for FX pairs but present
       for stocks/crypto; no extra checks needed downstream.
     """
-    out: Dict[str, pd.DataFrame] = {}
-
-    # The cache stores *all* symbols in a single ring per BarType.
-    # We have to filter by `bar.instrument.symbol` to build per-ticker frames.
+    out = {}
     for sym in tickers:
-        rows = []
-        ts_index = []
-
-        for bar in cache.bars(bar_type, limit=lookback):
-            if bar.instrument.symbol != sym:
-                continue
-            rows.append([bar.open, bar.high, bar.low, bar.close, bar.volume])
-            ts_index.append(bar.ts_event.to_pydatetime())  # UTC datetime
-
-        if rows:  # skip empty symbols
-            df = pd.DataFrame(
-                rows,
-                index=pd.DatetimeIndex(ts_index, tz="UTC"),
-            )
-            out[sym] = df
-
+        # CHANGED: Try to get FeatureBarData first
+        feature_data = []
+        bars_data = []
+        
+        # Get all data objects for this symbol
+        for obj in cache.data():
+            if hasattr(obj, 'instrument_id') and obj.instrument_id.symbol == sym:
+                if isinstance(obj, FeatureBarData):
+                    feature_data.append(obj)
+                    
+        # If we have feature data, use it to build the full DataFrame
+        if feature_data:
+            feature_data = sorted(feature_data, key=lambda x: x.ts_event)[-lookback:]
+            
+            # Build DataFrame from features
+            rows = []
+            for fd in feature_data:
+                rows.append(fd.features)
+                
+            if rows:
+                df = pd.DataFrame(
+                    rows,
+                    index=pd.DatetimeIndex(
+                        [pd.Timestamp(fd.ts_event, unit='ns', tz='UTC') for fd in feature_data]
+                    )
+                )
+                out[sym] = df
+        else:
+            # Fallback to regular bars if no feature data
+            bars = []
+            for bar in cache.bars(bar_type):
+                if bar.instrument_id.symbol == sym:
+                    bars.append(bar)
+                    
+            bars = sorted(bars, key=lambda x: x.ts_event)[-lookback:]
+            
+            if bars:
+                df = pd.DataFrame({
+                    'Open': [b.open for b in bars],
+                    'High': [b.high for b in bars],
+                    'Low': [b.low for b in bars],
+                    'Close': [b.close for b in bars],
+                    'Volume': [b.volume for b in bars],
+                }, index=pd.DatetimeIndex(
+                    [pd.Timestamp(b.ts_event, unit='ns', tz='UTC') for b in bars]
+                ))
+                out[sym] = df
+                
     return out
