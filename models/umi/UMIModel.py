@@ -100,6 +100,7 @@ class UMIModel(nn.Module):
         self.close_idx = close_idx                                                                  # usually "close" is at index 3 in the dataframes
         
         # training parameters
+        self._is_initialized = False
         self.batch_size     = batch_size                                                            # batch size for training
         self.patience = patience                                                                    # early stopping patience epochs for any training stage
         self.hp = self._default_hparams()                                                           # hyper-parameters
@@ -160,74 +161,94 @@ class UMIModel(nn.Module):
         print(f"[initialize] Complete. Best validation: {best_val:.6f}")
 
     # ---------------- fit -------------------------------------------- #
-    def fit(self, data_dict: DataSource , warm_start: bool, n_epochs: int):
+    def fit(self, data: DataSource , warm_start: bool = True):
         """
         One-off training (train + valid).
         """
-        assert isinstance(data_dict, Cache)
-        data_dict = cache_to_dict(
-            data_dict,
-            tickers=self._universe or sorted(data_dict.symbols()),  # preserves slot order
-            lookback=self.L + self.pred_len + 1,
-            bar_type=self.bar_type,
-        )
-        # keep slot order fixed for the rest of the model’s life
-        if not self._universe:
-            self._universe = sorted(data_dict)          # first call only
 
-        # build loaders
-        panel, active, idx, self._universe = _build_panel(data_dict, universe=self._universe)   # panel.shape: (T,I,F)
-        self.I_active = panel.size(1)                 # real stocks today
-        self.I = max(self.I_active + 1, math.ceil(self.I_active * (1.0 + self.universe_mult)))   # padded size for dynamic universe
+        if !warm_start:
+            # Update training windows to latest data
+            assert isinstance(data, Cache)
+            # Get latest timestamp from cache
+            latest_ts = None
+            for bar in data.bars(self.bar_type):
+                if latest_ts is None or bar.ts_event > latest_ts:
+                    latest_ts = bar.ts_event
+            
+            if latest_ts:
+                latest = pd.Timestamp(latest_ts, unit='ns', tz='UTC')
+                # Shift windows forward
+                train_period = self.end_valid - self.end_train
+                self.end_valid = latest
+                self.end_train = self.end_valid - train_period
+                print(f"[fit] Updated windows - train_end: {self.end_train}, valid_end: {self.end_valid}")
+    
+            # Reinitialize with new windows
+            self._is_initialized = False
+            self.initialize(data)
+            return
 
-        # ───── pad zeros for inactive “slots” ─────
-        pad = self.I - self.I_active
-        if pad:  # always true
-            zeros = torch.zeros(panel.size(0), pad, panel.size(2))
-            panel = torch.cat([panel, zeros], dim=1)        # (T, I, F)
-            active_pad  = torch.zeros(pad, active.size(1), dtype=torch.bool)
-            active  = torch.cat([active, active_pad], dim=0)        # (I,T)     mask that counts for delisted stocks AND padding for dynamic universe
+        # Check if architecture needs updating after insertion. TODO: does not account for insertion and delisting at the same time
+        if panel.size(1) > self.I_active:
+            print(f"[fit] Universe expanded, need to reinitialize...")
+            self.fit(data, initialize=True)
+            return
 
-        # boolean mask (1 = live stock, 0 = empty slot)
-        self.register_buffer("_active_mask", torch.cat([torch.ones(self.I_active), torch.zeros(pad)]).bool())
+        # Regular warm-start training
+        print(f"[fit] Warm-start training...")
 
-        self._build_submodules() # build sub-modules with I
+        # Build panel
+        panel, active, idx = self._build_panel(data, lookback=None)   # panel.shape: (T,I,F)
+
+
+
+        best_path = self.model_dir / "best.pt"
+        if best_path.exists():
+            print(f"[fit] Loading weights from {best_path}")
+            try:
+                self.load_state_dict(torch.load(best_path, map_location='cpu'))
+            except Exception as e:
+                print(f"[fit] Failed to load weights: {e}, training from scratch")
+        else:
+            raise Exception("Could not find best.pt warmed-up model in ", model_dir)
+
+        # Update training windows for walk-forward
+        current_time = self._clock()
+        if self._last_fit_time:
+            time_shift = current_time - self._last_fit_time
+            self.end_train = self.end_train + time_shift
+            self.end_valid = self.end_valid + time_shift
 
         train_mask = idx <= self.end_train
         valid_mask = (idx > self.end_train) & (idx <= self.end_valid)
-
-        ds_train = SlidingWindowDataset(panel[train_mask], active[:, train_mask], self.L, self.pred_len, close_idx=self.close_idx)
-        ds_valid = SlidingWindowDataset(panel[valid_mask], active[:, valid_mask] ,self.L, self.pred_len, close_idx=self.close_idx)
-
-
+        
+        ds_train = SlidingWindowDataset(
+            panel[train_mask], active[:, train_mask],
+            self.L, self.pred_len, close_idx=self.close_idx
+        )
+        ds_valid = SlidingWindowDataset(
+            panel[valid_mask], active[:, valid_mask],
+            self.L, self.pred_len, close_idx=self.close_idx
+        )
+        
+        # Create loaders
         loader_train = DataLoader(ds_train, batch_size=self.batch_size, shuffle=True)
         loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
-
-        # ------------------------- final training on train+valid------------------------------
-        self._build_submodules()
-
-        if warm_start:
-            # find the newest "best.pt" for the same freq
-            ckpts = sorted(
-                (self.model_dir.parent).rglob("best.pt"),
-                key=os.path.getmtime
-            )
-            if ckpts:
-                print(f"[warm-start] resuming from {ckpts[-1]}")
-                self.load_state_dict(torch.load(ckpts[-1], map_location='cpu'))
-
-        _ = self._train(loader_train, loader_valid, n_epochs=n_epochs)
-
-        # save the model and hyper-parameters
-        torch.save(self.state_dict(), self.model_dir / "best.pt")
         
+        # Train
+        best_val = self._train(loader_train, loader_valid, self.warm_training_epochs)
+        
+        # Save state
+        torch.save(self.state_dict(), self.model_dir / "best.pt")
+
         # save training logs
         pd.DataFrame(self._epoch_logs).to_csv(self.model_dir / "train_losses.csv",index=False)
-
         if self._global_epoch == 0:
             self._dump_model_metadata() # save model metadata
 
-        self._last_fit_time = self._clock()
+        self._last_fit_time = current_time
+        
+        print(f"[fit] Complete. Best validation: {best_val:.6f}")       
 
     # ------------------------------------------------------------------ #
     # update : decide if retrain_delta elapsed → refit on latest data    #
