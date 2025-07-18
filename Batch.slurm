@@ -11,6 +11,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --output=/scratch/project_2013416/sapiens/logs_%A_%a.out
 ## maybe useful when compiling module use /appl/opt/nvhpc/modulefiles
+## more docs at https://docs.csc.fi/computing/compiling-mahti/
 module load pytorch
 source /scratch/project_2013416/Lean/UMI/.venv/bin/activate
 srun python optuna_objective.py --exp_id ${SLURM_ARRAY_TASK_ID}
