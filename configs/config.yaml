@@ -21,10 +21,10 @@ backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years)
 # ---------------------------------------------------------------------------
 #  Universe / data granularity
 # ---------------------------------------------------------------------------
-freq: 1B                    # 1 business-day bars (Lean offset code)    (common)
-window_len: 60              # L : look-back window length (UMI paper)   (sliding-window features)
-pred_len:   1               # H : prediction horizon (next bar)         (one-step forecast)
-dynamic_universe_mult: 2    # Capacity multiplier for new tickers       
+freq: 1B                      # 1 business-day bars (Lean offset code)    (common)
+window_len: 60                # L : look-back window length (UMI paper)   (sliding-window features)
+pred_len:   1                 # H : prediction horizon (next bar)         (one-step forecast)
+dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+univers_mult (in this case ↑20%)       
 
 # ---------------------------------------------------------------------------
 #  Training schedule & hyper-param search

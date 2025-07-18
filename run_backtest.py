@@ -102,6 +102,10 @@ def main():
             engine_id="001",
             run_id="001",
         ),
+        cache=CacheConfig(
+        tick_capacity=10_000,  # Store last 10,000 ticks per instrument
+        bar_capacity=5_000,    # Store last 5,000 bars per bar type
+        ),
     )
 
     # --- Load data into engine ---------------------------------------

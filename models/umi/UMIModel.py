@@ -4,7 +4,7 @@
 #
 # NOTE
 # ----
-# • Relies on the low-level blocks already defined earlier in main.py
+# • Relies on the low-level blocks
 #   (StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning)
 # 
 #
@@ -15,109 +15,18 @@ from pathlib import Path
 from typing import Dict, Optional, Any, Callable, Union
 from nautilus_trader.cache.cache import Cache
 from concurrent.futures import ThreadPoolExecutor
-from utils import cache_to_dict
-from interfaces import DataSource
+from ..utils import cache_to_dict, SlidingWindowDataset
 from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, IterableDataset
-import yaml
+from torch.utils.data import DataLoader
 import numpy as np
-import random
 
-
-
+     
 
 # --------------------------------------------------------------------------- #
-# 1. Dataset that yields sliding windows ready for the factor blocks          #
-# --------------------------------------------------------------------------- #
-# class SlidingWindowDataset(Dataset):
-#     """
-#     Yields tuples:
-#       prices_seq : (L+1, I)
-#       feat_seq   : (L+1, I, F)
-#       target     : (I, 1)   -- next-bar return (t = L)  [optional]
-#     """
-#     def __init__(
-#         self,
-#         panel: torch.Tensor,      # (T, I, F) F includes "close" at close_idx position
-#         active: torch.Tensor,     # (I, T) bool mask for active stocks
-#         window_len: int,
-#         pred_len: int,
-#         close_idx: int = 3,  # usually "close" is at index 3
-#         with_target: bool = True,
-#     ):
-#         self.active = active  
-#         self.panel = panel
-#         self.L = window_len
-#         self.pred = pred_len
-#         self.close_idx = close_idx
-#         self.with_target = with_target
-
-#     def __len__(self):
-#         return self.panel.size(0) - self.L - self.pred + 1
-
-#     def __getitem__(self, idx):
-#         seq = self.panel[idx : idx + self.L + 1]             # (L+1,I,F)
-#         prices = seq[..., self.close_idx]                    # (L+1,I)
-#         a = self.active[:, idx + self.L]             # (I) activity at t = L  
-
-#         if self.with_target:
-#             tgt_close = self.panel[idx + self.L : idx + self.L + self.pred,
-#                                     :, self.close_idx]       # (pred,I)
-#             ret = (tgt_close[-1] - tgt_close[0]) / (tgt_close[0] + 1e-8)
-#             ret = ret.unsqueeze(-1)                          # (I,1)
-#             return prices, seq, ret, a
-#         return prices, seq, a
-
-# --------------------------------------------------------------------------- #
-# 2. Utility : build a panel tensor from the {stockID: dataframe} dict        #
-# --------------------------------------------------------------------------- #
-def build_panel(data_dict: Dict[str, "pd.DataFrame"],
-                *,                       # ← force keyword use
-                universe: Optional[list[str]] = None,    # universe of stocks to include
-                ) -> torch.Tensor:
-    """
-    Returns tensor of shape (T, I, F) sorted by timestamp ascending &
-    stocks alphabetically.
-    Returns
-    tensor : (T, I, F)
-    active : (I_active, T)  bool mask for active stocks
-    idx    : DatetimeIndex (UTC)
-    """
-
-    keys = universe if universe is not None else sorted(data_dict)
-    
-    # --- harmonise indices -------------------------------------------------
-    for k, df in data_dict.items():
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.set_index("Date", inplace=True)
-        df.index = pd.to_datetime(df.index, utc=True)  
-
-    feature_cols = data_dict[keys[0]].columns          # all numeric + tech-indicators
-    long = pd.concat([df[feature_cols].assign(stock=k) for k, df in data_dict.items()])
-
-    # ---------- proper pivot ---------------------------------------------- #
-    df_pivot = long.pivot_table(
-        values=feature_cols,      # every feature
-        index=long.index,         #
-        columns="stock"
-    ).sort_index()
-
-    #  re-index columns ⇢ fill missing tickers with NaN so slots
-    if universe is not None:
-        df_pivot = df_pivot.reindex( pd.MultiIndex.from_product([feature_cols, keys]), axis=1 )
-
-    T, F, I = len(df_pivot), len(feature_cols), len(keys)
-    values = torch.tensor(df_pivot.values, dtype=torch.float32)
-    tensor = values.reshape(T, F, I).permute(0,2,1) # (T,I,F)
-    active = torch.isfinite(tensor).all(-1).transpose(0,1) # (I,T)
-
-    return tensor, active, df_pivot.index       
-
-# --------------------------------------------------------------------------- #
-# 3. Main model                                                               #
+# Main model                                                               #
 # --------------------------------------------------------------------------- #
 class UMIModel(nn.Module):
     """
@@ -134,16 +43,14 @@ class UMIModel(nn.Module):
         pred_len: int,
         end_train: str,
         end_valid: str,
-        bt_end: Optional[str] = None,
-        end_test: Optional[str] = None,
         clock_fn: Optional[Callable[[], "pd.Timestamp"]] = None,
         retrain_delta: pd.DateOffset = pd.DateOffset(days=30),
         dynamic_universe_mult: float | int = 2,
         n_epochs: int = 20,
         batch_size: int = 64,
         training_mode: str="sequential",    # hybrid/sequential:
-                                        # hybrid -> stage1 factors for few epochs, then stage2 altogether
-                                        # sequential -> stage1 first until early stopping, then stage2
+                                            # hybrid -> stage1 factors for few epochs, then stage2 altogether
+                                            # sequential -> stage1 first until early stopping, then stage2
         pretrain_epochs:int=5,
         patience:int=10,       
         close_idx: int = 3,  # usually "close" is at index 3       
@@ -158,51 +65,352 @@ class UMIModel(nn.Module):
 
         
         # hw parameters
-        self._clock: Callable[[], "pd.Timestamp"] = clock_fn or pd.Timestamp.utcnow               # default clock function for live / back-test
-        self._device        = torch.device("cuda" if torch.cuda.is_available() else "cpu")        # device for training
+        self._clock: Callable[[], "pd.Timestamp"] = clock_fn or pd.Timestamp.utcnow                # default clock function for live / back-test
+        self._device        = torch.device("cuda" if torch.cuda.is_available() else "cpu")         # device for training
         
         # time parameters
-        self.freq           = freq                                                           # e.g. "1d", "15m", "1h"
-        self.bar_type    = bar_type                                                          # bar type derived from freq
-        self.pred_len    = pred_len                                                          # number of bars to predict
-        self.retrain_delta  = retrain_delta                                                  # time delta for retraining 
-        self.end_train      = pd.to_datetime(end_train, utc=True)                            # end of training date
-        self.end_valid      = pd.to_datetime(end_valid, utc=True)                            # end of validation date
-        self.end_test       = pd.to_datetime(end_test,  utc=True) if end_test else None      # end of test date (optional)
-        self.bt_end         = pd.to_datetime(bt_end, utc=True)                               # end of back-test date (optional)
-        self._last_fit_time = None                                                           # last time fit() was called
+        self.freq           = freq                                                                 # e.g. "1d", "15m", "1h"
+        self.bar_type    = bar_type                                                                # bar type derived from freq
+        self.pred_len    = pred_len                                                                # number of bars to predict
+        self.retrain_delta  = retrain_delta                                                        # time delta for retraining 
+        self.end_train      = pd.to_datetime(end_train, utc=True)                                  # end of training date
+        self.end_valid      = pd.to_datetime(end_valid, utc=True)                                  # end of validation date
+        self.bt_end         = pd.to_datetime(bt_end, utc=True)                                     # end of back-test date (optional)
+        self._last_fit_time = None                                                                 # last time fit() was called
         
 
         # model parameters
-        self.F              = feature_dim                                                # number of features per stock
-        self.L              = window_len                                                 # length of the sliding window (L+1 bars)
-        self.n_epochs       = n_epochs                                                   # number of epochs for training
-        self.pretrain_epochs = pretrain_epochs                                           # epochs for Stage-1 pre-training (hybrid mode)
-        self.training_mode = training_mode                                               # "hybrid" or "sequential"
-        self.data_dir       = data_dir                                                   # directory where the data is stored
-        ts    = self._clock().strftime("%Y-%m-%dT%H-%M-%S")                              # timestamp to use for model directory
+        self.F              = feature_dim                                                          # number of features per stock
+        self.L              = window_len                                                           # length of the sliding window (L+1 bars)
+        self.n_epochs       = n_epochs                                                             # number of epochs for training
+        self.pretrain_epochs = pretrain_epochs                                                     # epochs for Stage-1 pre-training (hybrid mode)
+        self.training_mode = training_mode                                                         # "hybrid" or "sequential"
+        self.data_dir       = data_dir                                                             # directory where the data is stored
+        ts    = self._clock().strftime("%Y-%m-%dT%H-%M-%S")                                        # timestamp to use for model directory
         hp_id =   f"lamic{hparams.get('lambda_ic',0):.3f}_"\
                 + f"lamsync{hparams.get('lambda_sync',0):.3f}_"\
                 + f"lamrankic{hparams.get('lambda_rankic',0):.3f}"\
                 + f"syncthres{hparams.get('sync_thr',0):.3f}"
-        self.model_dir = (model_dir / freq / f"{ts}_{hp_id}").resolve()                  # model directory with timestamp and hparams
+        self.model_dir = (model_dir / freq / f"{ts}_{hp_id}").resolve()                             # model directory with timestamp and hparams
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
         # stock universe
-        self._universe: list[str] = []                              # stable “slot → ticker” mapping
-        self.universe_mult = max(1, int(dynamic_universe_mult))     # over-allocation factor for dynamic universe
-        self.close_idx = close_idx                                  # usually "close" is at index 3 in the dataframes
+        self._universe: list[str] = []                                                              # stable “slot → ticker” mapping
+        self.universe_mult = max(1, int(dynamic_universe_mult))                                     # over-allocation factor for dynamic universe
+        self.close_idx = close_idx                                                                  # usually "close" is at index 3 in the dataframes
         
         # training parameters
-        self.batch_size     = batch_size                            # batch size for training
-        self.patience = patience                                    # early stopping patience epochs for any training stage
-        self.hp = self._default_hparams()                           # hyper-parameters
-        self.hp.update(hparams)                                     # updated with those defined in the yaml config
-        self.warm_start          = warm_start                       # warm start when stock is deleted or retrain delta elapsed
+        self.batch_size     = batch_size                                                            # batch size for training
+        self.patience = patience                                                                    # early stopping patience epochs for any training stage
+        self.hp = self._default_hparams()                                                           # hyper-parameters
+        self.hp.update(hparams)                                                                     # updated with those defined in the yaml config
+        self.warm_start          = warm_start                                                       # warm start when stock is deleted or retrain delta elapsed
         self.warm_training_epochs = warm_training_epochs if warm_start is not None else self.n_epochs
-        self._global_epoch = 0                                      # global epoch counter for stats
+        self._global_epoch = 0                                                                      # global epoch counter for stats
 
 
+    def initialize(self, data: Cache, **kwargs) -> None:
+
+        assert self._is_initialized == False
+        """
+        Initial training on historical data.
+         
+        - This is the entry point for first training
+        - No walk-forward logic
+        - Sets up universe and trains from scratch
+        """
+        print(f"[{self.__class__.__name__}] Initializing model...")
+        
+        # Build panel and setup
+        panel, active, idx, self._universe = self._build_panel(data, lookback=0)
+        self.I_active = panel.size(1)                                                        # real stocks today
+        self.I = max(self.I_active + 1, math.ceil(self.I_active * (1.0 + self.universe_mult)))   # padded size for dynamic universe
+
+        # Register active mask
+        pad = self.I - self.I_active
+        self.register_buffer("_active_mask",torch.cat([torch.ones(self.I_active), torch.zeros(pad)]).bool())
+        
+        # Build submodules (learners)
+        self._build_submodules()
+
+        # Create train/valid split
+        train_mask = idx <= self.end_train
+        valid_mask = (idx > self.end_train) & (idx <= self.end_valid)
+        
+        ds_train = SlidingWindowDataset(panel[train_mask], active[:, train_mask], self.L, self.pred_len, close_idx=self.close_idx)
+        ds_valid = SlidingWindowDataset(panel[valid_mask], active[:, valid_mask] ,self.L, self.pred_len, close_idx=self.close_idx)
+        loader_train = DataLoader(ds_train, batch_size=self.batch_size, shuffle=True)
+        loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
+       
+        # Train from scratch
+        print(f"[initialize] Training for {self.n_epochs} epochs...")
+        best_val = self._train(loader_train, loader_valid, self.n_epochs)
+        
+        # Save initial state
+        torch.save(self.state_dict(), self.model_dir / "initial.pt")
+        torch.save(self.state_dict(), self.model_dir / "best.pt")
+        
+        # Mark as initialized
+        self._is_initialized = True
+        self._last_fit_time = self._clock()
+        
+        # Dump metadata
+        self._dump_model_metadata()
+        
+        print(f"[initialize] Complete. Best validation: {best_val:.6f}")
+
+    # ---------------- fit -------------------------------------------- #
+    def fit(self, data_dict: DataSource , warm_start: bool, n_epochs: int):
+        """
+        One-off training (train + valid).
+        """
+        assert isinstance(data_dict, Cache)
+        data_dict = cache_to_dict(
+            data_dict,
+            tickers=self._universe or sorted(data_dict.symbols()),  # preserves slot order
+            lookback=self.L + self.pred_len + 1,
+            bar_type=self.bar_type,
+        )
+        # keep slot order fixed for the rest of the model’s life
+        if not self._universe:
+            self._universe = sorted(data_dict)          # first call only
+
+        # build loaders
+        panel, active, idx, self._universe = _build_panel(data_dict, universe=self._universe)   # panel.shape: (T,I,F)
+        self.I_active = panel.size(1)                 # real stocks today
+        self.I = max(self.I_active + 1, math.ceil(self.I_active * (1.0 + self.universe_mult)))   # padded size for dynamic universe
+
+        # ───── pad zeros for inactive “slots” ─────
+        pad = self.I - self.I_active
+        if pad:  # always true
+            zeros = torch.zeros(panel.size(0), pad, panel.size(2))
+            panel = torch.cat([panel, zeros], dim=1)        # (T, I, F)
+            active_pad  = torch.zeros(pad, active.size(1), dtype=torch.bool)
+            active  = torch.cat([active, active_pad], dim=0)        # (I,T)     mask that counts for delisted stocks AND padding for dynamic universe
+
+        # boolean mask (1 = live stock, 0 = empty slot)
+        self.register_buffer("_active_mask", torch.cat([torch.ones(self.I_active), torch.zeros(pad)]).bool())
+
+        self._build_submodules() # build sub-modules with I
+
+        train_mask = idx <= self.end_train
+        valid_mask = (idx > self.end_train) & (idx <= self.end_valid)
+
+        ds_train = SlidingWindowDataset(panel[train_mask], active[:, train_mask], self.L, self.pred_len, close_idx=self.close_idx)
+        ds_valid = SlidingWindowDataset(panel[valid_mask], active[:, valid_mask] ,self.L, self.pred_len, close_idx=self.close_idx)
+
+
+        loader_train = DataLoader(ds_train, batch_size=self.batch_size, shuffle=True)
+        loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
+
+        # ------------------------- final training on train+valid------------------------------
+        self._build_submodules()
+
+        if warm_start:
+            # find the newest "best.pt" for the same freq
+            ckpts = sorted(
+                (self.model_dir.parent).rglob("best.pt"),
+                key=os.path.getmtime
+            )
+            if ckpts:
+                print(f"[warm-start] resuming from {ckpts[-1]}")
+                self.load_state_dict(torch.load(ckpts[-1], map_location='cpu'))
+
+        _ = self._train(loader_train, loader_valid, n_epochs=n_epochs)
+
+        # save the model and hyper-parameters
+        torch.save(self.state_dict(), self.model_dir / "best.pt")
+        
+        # save training logs
+        pd.DataFrame(self._epoch_logs).to_csv(self.model_dir / "train_losses.csv",index=False)
+
+        if self._global_epoch == 0:
+            self._dump_model_metadata() # save model metadata
+
+        self._last_fit_time = self._clock()
+
+    # ------------------------------------------------------------------ #
+    # update : decide if retrain_delta elapsed → refit on latest data    #
+    # ------------------------------------------------------------------ #
+    def update(self, data_dict: DataSource ):
+        if self._last_fit_time is None:
+            raise RuntimeError("Call fit() before update().")
+        
+        assert isinstance(data_dict, Cache)
+        data_dict = cache_to_dict(
+            data_dict,
+            tickers=self._universe or sorted(data_dict.symbols()),  # preserves slot order
+            lookback=self.L + self.pred_len + 1,
+            bar_type=self.bar_type,
+        )
+
+        now = self._clock()        # <── the only place we read “time”
+
+        # ---------- build fresh activity mask at NOW ------------------
+
+        #  Add new tickers to the first free slots
+        for k in sorted(data_dict):
+            if k not in self._universe:
+                if len(self._universe) < self.I:        # capacity check
+                    self._universe.append(k)            # reserve slot
+                    self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
+                    return
+                else:
+                    self._universe.append(k)              # give the new stock a slot
+                    print(f"[info] universe full. Retraining …")
+                    self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
+                    return                                # early exit; retrain done
+
+        _, active, idx = _build_panel(data_dict, universe=self._universe)
+        new_mask = active[:, -1]                       # (I_active_now) mask for stocks that are live NOW
+        latest = idx[-1]
+        self.end_valid = latest
+        self.end_train = self.end_valid - pd.DateOffset(months=6)
+        pad = self.I - new_mask.size(0)
+        if pad:
+            new_mask = torch.cat([new_mask, torch.zeros(pad, dtype=torch.bool)])
+
+        # ---------- detect newly-delisted stocks ----------------------
+        was_live = self._active_mask[: new_mask.size(0)]
+        just_delisted = (was_live & (~new_mask)).any().item()   # True if at least one stock has disappeared since the last update, False otherwise.
+
+        # always store most-recent mask for later calls
+        with torch.no_grad():
+            self._active_mask.copy_(new_mask)
+
+        # ---------- decide whether to retrain -------------------------
+        time_elapsed = now >= self._last_fit_time + self.retrain_delta
+        if time_elapsed or just_delisted:
+            reason = "time window" if time_elapsed else "delisting event"
+            print(f"Retraining triggered : {reason}.")
+            self.fit(data_dict, warm_start=self.warm_start, n_epochs=self.warm_training_epochs)
+
+    # ------------------------------------------------------------------ #
+    # predict : one inference step                                       #
+    # ------------------------------------------------------------------ #
+    def predict(self, data_dict: DataSource,  _retry: bool = False) -> Dict[str, float]:
+
+        assert isinstance(data_dict, Cache)
+        data_dict = cache_to_dict(
+            data_dict,
+            tickers=self._universe or sorted(data_dict.symbols()),  # preserves slot order
+            lookback=self.L + self.pred_len + 1,
+            bar_type=self.bar_type,
+        )
+        panel, active, idx = _build_panel(data_dict, universe=self._universe)   # (T,I_active,F) , (I_active,T)
+        assert panel.size(0) >= self.L + 1, "need L+1 bars for inference"
+
+        prices_seq = panel[-self.L-1:, :, self.close_idx]    # (L+1,I)
+        feat_seq   = panel[-self.L-1:]                       # (L+1,I,F)
+        prices_seq = prices_seq.to(self._device)
+        feat_seq   = feat_seq.to(self._device)
+
+        # ---- build 1-D mask for the *current* bar (t = L) -------------
+        active_mask = active[:, -1]                          # (I_active) at last time step
+        pad = self.I - active_mask.size(0)
+        if pad>=0:                                              # keep same length as in training
+            active_mask = torch.cat([active_mask, torch.zeros(pad, dtype=torch.bool)])
+        else:
+            if _retry:
+                raise RuntimeError("Universe capacity still insufficient after one retrain.")
+            print("[warn] universe overflow – growing capacity and retraining once.")
+            # 2) full re-fit on the larger I
+            self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs )
+            # 3) recurse – now pad will be ≥ 0
+            return self.predict(data_dict, _retry=True)
+
+        active_mask = active_mask.to(self._device).unsqueeze(0)  # → (1, I)
+
+        with torch.no_grad():
+            u_seq, r_t, m_t, _ , _ = self._stage1_forward(prices_seq.unsqueeze(0), feat_seq.unsqueeze(0), active_mask=active_mask )
+            preds, _, _ = self._stage2_forward(feat_seq.unsqueeze(0), u_seq, r_t, m_t, target=None, active_mask=active_mask)
+            preds = preds[:, :self.I_active]
+        # return as dict {stock: prediction}
+        keys = sorted(data_dict.keys())
+        return {k: float(preds[0, i].cpu()) for i, k in enumerate(keys)}
+
+    # ------------------------------------------------------------------ #
+    # state-dict helpers (single-process save/load)                       #
+    # ------------------------------------------------------------------ #
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "I": self.I,
+            "F": self.F,
+            "L": self.L,
+            "stock_factor":  self.stock_factor.state_dict(),
+            "market_factor": self.market_factor.state_dict(),
+            "forecaster":    self.forecaster.state_dict(),
+            "hparams": self.hp,
+        }
+
+    def load_state_dict(self, sd: Dict[str, Any]):
+        self.I, self.F, self.L = sd["I"], sd["F"], sd["L"]
+        self.hp.update(sd["hparams"])
+        self._build_submodules()
+        self.stock_factor.load_state_dict(sd["stock_factor"])
+        self.market_factor.load_state_dict(sd["market_factor"])
+        self.forecaster.load_state_dict(sd["forecaster"])
+        assert self.I == sd["I"] and self.F == sd["F"]
+
+
+
+    # --------------------------------------------------------------------------- #
+    #  Utility : build a panel tensor from the {stockID: dataframe} dict        #
+    # --------------------------------------------------------------------------- #
+    def _build_panel(data: Cache, lookback: int) -> torch.Tensor:
+        """
+        Returns training data tensor of shape (T, I, F) sorted by timestamp ascending &
+        stocks alphabetically.
+        Returns
+        tensor : (T, I, F)
+        active : (I, T)  bool mask for active stocks
+        idx    : DatetimeIndex (UTC)
+        """
+
+        # Convert data source
+        assert isinstance(data, Cache)
+        data_dict = cache_to_dict(
+            data,
+            tickers=sorted(data.instruments()),
+            lookback=lookback,  # Get all available data
+            bar_type=self.bar_type,
+        )
+        
+        # Set universe
+        universe = sorted(data_dict.keys())
+        print(f"[initialize] Universe: {len(self._universe)} stocks")
+        
+
+        keys = universe if universe is not None else sorted(data_dict)
+        
+        # --- harmonise indices -------------------------------------------------
+        for k, df in data_dict.items():
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.set_index("Date", inplace=True)
+            df.index = pd.to_datetime(df.index, utc=True)  
+
+        feature_cols = data_dict[keys[0]].columns          # all numeric + tech-indicators
+        long = pd.concat([df[feature_cols].assign(stock=k) for k, df in data_dict.items()])
+
+        # ---------- proper pivot ---------------------------------------------- #
+        df_pivot = long.pivot_table(
+            values=feature_cols,      # every feature
+            index=long.index,         #
+            columns="stock"
+        ).sort_index()
+
+        #  re-index columns ⇢ fill missing tickers with NaN so slots
+        if universe is not None:
+            df_pivot = df_pivot.reindex( pd.MultiIndex.from_product([feature_cols, keys]), axis=1 )
+
+        T, F, I = len(df_pivot), len(feature_cols), len(keys)
+        values = torch.tensor(df_pivot.values, dtype=torch.float32)
+        tensor = values.reshape(T, F, I).permute(0,2,1) # (T,I,F)
+        active = torch.isfinite(tensor).all(-1).transpose(0,1) # (I,T)
+
+        return tensor, active, df_pivot.index, universe  
+
+    
     # ---------------- hyper-param defaults and suggest function--------------------------- #
     def _default_hparams(self) -> Dict[str, Any]:
         return dict(
@@ -241,6 +449,8 @@ class UMIModel(nn.Module):
             pred_len=self.pred_len,
             lambda_rankic=self.hp["lambda_rankic"],
         ).to(self._device)
+        
+        return
 
     def _log_epoch(self, l_s, l_m, l_p, *, val_pred=None):
         row = dict(epoch=self._global_epoch, loss_stock=l_s, loss_market=l_m,
@@ -467,10 +677,6 @@ class UMIModel(nn.Module):
                 sum_s   / n_batches,
                 sum_m   / n_batches,
                 sum_pred / n_batches)
-
-
-
-
     # ---------------- stage1 / stage2 wrappers ----------------------- #
     def _stage1_forward(self, prices_seq, feat_seq, active_mask):
         """Run stock-level & market-level factor learning *concurrently*."""
@@ -508,202 +714,6 @@ class UMIModel(nn.Module):
             feat_seq, u_seq, r_t, m_t, stockIDs, target, active_mask
         )
 
-    # ---------------- fit -------------------------------------------- #
-    def fit(self, data_dict: DataSource , warm_start: bool, n_epochs: int):
-        """
-        One-off training (train + valid).
-        """
-        assert isinstance(data_dict, Cache)
-        data_dict = cache_to_dict(
-            data_dict,
-            tickers=self._universe or sorted(data_dict.symbols()),  # preserves slot order
-            lookback=self.L + self.pred_len + 1,
-            bar_type=self.bar_type,
-        )
-        # keep slot order fixed for the rest of the model’s life
-        if not self._universe:
-            self._universe = sorted(data_dict)          # first call only
-
-        # build loaders
-        panel, active, idx = build_panel(data_dict, universe=self._universe)   # panel.shape: (T,I,F)
-        self.I_active = panel.size(1)                 # real stocks today
-        self.I = self.I_active * self.universe_mult   # padded size for dynamic universe
-
-        # ───── pad zeros for inactive “slots” ─────
-        pad = self.I - self.I_active
-        if pad:  # always true
-            zeros = torch.zeros(panel.size(0), pad, panel.size(2))
-            panel = torch.cat([panel, zeros], dim=1)        # (T, I, F)
-            active_pad  = torch.zeros(pad, active.size(1), dtype=torch.bool)
-            active  = torch.cat([active, active_pad], dim=0)        # (I,T)     mask that counts for delisted stocks AND padding for dynamic universe
-
-        # boolean mask (1 = live stock, 0 = empty slot)
-        self.register_buffer("_active_mask", torch.cat([torch.ones(self.I_active), torch.zeros(pad)]).bool())
-
-        self._build_submodules() # build sub-modules with I
-
-        train_mask = idx <= self.end_train
-        valid_mask = (idx > self.end_train) & (idx <= self.end_valid)
-        test_mask  = (idx > self.end_valid) & (self.end_test is not None) & (idx <= self.end_test)
-
-        ds_train = SlidingWindowDataset(panel[train_mask], active[:, train_mask], self.L, self.pred_len, close_idx=self.close_idx)
-        ds_valid = SlidingWindowDataset(panel[valid_mask], active[:, valid_mask] ,self.L, self.pred_len, close_idx=self.close_idx)
-
-
-        loader_train = DataLoader(ds_train, batch_size=self.batch_size, shuffle=True)
-        loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
-
-        # ------------------------- final training on train+valid------------------------------
-        self._build_submodules()
-
-        if warm_start:
-            # find the newest "best.pt" for the same freq
-            ckpts = sorted(
-                (self.model_dir.parent).rglob("best.pt"),
-                key=os.path.getmtime
-            )
-            if ckpts:
-                print(f"[warm-start] resuming from {ckpts[-1]}")
-                self.load_state_dict(torch.load(ckpts[-1], map_location='cpu'))
-
-        _ = self._train(loader_train, loader_valid, n_epochs=n_epochs)
-
-        # save the model and hyper-parameters
-        torch.save(self.state_dict(), self.model_dir / "best.pt")
-        
-        # save training logs
-        pd.DataFrame(self._epoch_logs).to_csv(self.model_dir / "train_losses.csv",index=False)
-
-        if self._global_epoch == 0:
-            self._dump_model_metadata() # save model metadata
-
-        self._last_fit_time = self._clock()
-
-    # ------------------------------------------------------------------ #
-    # update : decide if retrain_delta elapsed → refit on latest data    #
-    # ------------------------------------------------------------------ #
-    def update(self, data_dict: DataSource ):
-        if self._last_fit_time is None:
-            raise RuntimeError("Call fit() before update().")
-        
-        assert isinstance(data_dict, Cache)
-        data_dict = cache_to_dict(
-            data_dict,
-            tickers=self._universe or sorted(data_dict.symbols()),  # preserves slot order
-            lookback=self.L + self.pred_len + 1,
-            bar_type=self.bar_type,
-        )
-
-        now = self._clock()        # <── the only place we read “time”
-
-        # ---------- build fresh activity mask at NOW ------------------
-
-        #  Add new tickers to the first free slots
-        for k in sorted(data_dict):
-            if k not in self._universe:
-                if len(self._universe) < self.I:        # capacity check
-                    self._universe.append(k)            # reserve slot
-                    self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
-                    return
-                else:
-                    self._universe.append(k)              # give the new stock a slot
-                    print(f"[info] universe full. Retraining …")
-                    self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
-                    return                                # early exit; retrain done
-
-        _, active, idx = build_panel(data_dict, universe=self._universe)
-        new_mask = active[:, -1]                       # (I_active_now) mask for stocks that are live NOW
-        latest = idx[-1]
-        if self.end_test is not None:
-            self.end_valid = min(latest, self.end_test)
-        else:
-            self.end_valid = latest
-            self.end_train = self.end_valid - pd.DateOffset(months=6)
-        pad = self.I - new_mask.size(0)
-        if pad:
-            new_mask = torch.cat([new_mask, torch.zeros(pad, dtype=torch.bool)])
-
-        # ---------- detect newly-delisted stocks ----------------------
-        was_live = self._active_mask[: new_mask.size(0)]
-        just_delisted = (was_live & (~new_mask)).any().item()   # True if at least one stock has disappeared since the last update, False otherwise.
-
-        # always store most-recent mask for later calls
-        with torch.no_grad():
-            self._active_mask.copy_(new_mask)
-
-        # ---------- decide whether to retrain -------------------------
-        time_elapsed = now >= self._last_fit_time + self.retrain_delta
-        if time_elapsed or just_delisted:
-            reason = "time window" if time_elapsed else "delisting event"
-            print(f"Retraining triggered : {reason}.")
-            self.fit(data_dict, warm_start=self.warm_start, n_epochs=self.warm_training_epochs)
-
-    # ------------------------------------------------------------------ #
-    # predict : one inference step                                       #
-    # ------------------------------------------------------------------ #
-    def predict(self, data_dict: DataSource,  _retry: bool = False) -> Dict[str, float]:
-
-        assert isinstance(data_dict, Cache)
-        data_dict = cache_to_dict(
-            data_dict,
-            tickers=self._universe or sorted(data_dict.symbols()),  # preserves slot order
-            lookback=self.L + self.pred_len + 1,
-            bar_type=self.bar_type,
-        )
-        panel, active, idx = build_panel(data_dict, universe=self._universe)   # (T,I_active,F) , (I_active,T)
-        assert panel.size(0) >= self.L + 1, "need L+1 bars for inference"
-
-        prices_seq = panel[-self.L-1:, :, self.close_idx]    # (L+1,I)
-        feat_seq   = panel[-self.L-1:]                       # (L+1,I,F)
-        prices_seq = prices_seq.to(self._device)
-        feat_seq   = feat_seq.to(self._device)
-
-        # ---- build 1-D mask for the *current* bar (t = L) -------------
-        active_mask = active[:, -1]                          # (I_active) at last time step
-        pad = self.I - active_mask.size(0)
-        if pad>=0:                                              # keep same length as in training
-            active_mask = torch.cat([active_mask, torch.zeros(pad, dtype=torch.bool)])
-        else:
-            if _retry:
-                raise RuntimeError("Universe capacity still insufficient after one retrain.")
-            print("[warn] universe overflow – growing capacity and retraining once.")
-            # 2) full re-fit on the larger I
-            self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs )
-            # 3) recurse – now pad will be ≥ 0
-            return self.predict(data_dict, _retry=True)
-
-        active_mask = active_mask.to(self._device).unsqueeze(0)  # → (1, I)
-
-        with torch.no_grad():
-            u_seq, r_t, m_t, _ , _ = self._stage1_forward(prices_seq.unsqueeze(0), feat_seq.unsqueeze(0), active_mask=active_mask )
-            preds, _, _ = self._stage2_forward(feat_seq.unsqueeze(0), u_seq, r_t, m_t, target=None, active_mask=active_mask)
-            preds = preds[:, :self.I_active]
-        # return as dict {stock: prediction}
-        keys = sorted(data_dict.keys())
-        return {k: float(preds[0, i].cpu()) for i, k in enumerate(keys)}
-
-    # ------------------------------------------------------------------ #
-    # state-dict helpers (single-process save/load)                       #
-    # ------------------------------------------------------------------ #
-    def state_dict(self) -> Dict[str, Any]:
-        return {
-            "I": self.I,
-            "F": self.F,
-            "L": self.L,
-            "stock_factor":  self.stock_factor.state_dict(),
-            "market_factor": self.market_factor.state_dict(),
-            "forecaster":    self.forecaster.state_dict(),
-            "hparams": self.hp,
-        }
-
-    def load_state_dict(self, sd: Dict[str, Any]):
-        self.I, self.F, self.L = sd["I"], sd["F"], sd["L"]
-        self.hp.update(sd["hparams"])
-        self._build_submodules()
-        self.stock_factor.load_state_dict(sd["stock_factor"])
-        self.market_factor.load_state_dict(sd["market_factor"])
-        self.forecaster.load_state_dict(sd["forecaster"])
-        assert self.I == sd["I"] and self.F == sd["F"]
 
 
 # ------------------------------------------------------------------ #
@@ -891,3 +901,4 @@ class UMIModel(nn.Module):
 #     truth_df.to_csv(out_dir / "bt_truth_close.csv")
 
 #     print("DONE")
+
