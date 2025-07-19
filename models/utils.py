@@ -8,6 +8,7 @@ import pandas as pd
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.model.data.bar import BarType   # public NT API
 import torch
+from algos.engine.data_loader import FeatureBarData
 
 def cache_to_dict(
     cache: Cache,
@@ -39,7 +40,7 @@ def cache_to_dict(
     """
     out = {}
     for sym in tickers:
-        # CHANGED: Try to get FeatureBarData first
+        
         feature_data = []
         bars_data = []
         

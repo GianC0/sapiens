@@ -16,7 +16,7 @@ from typing import Dict, Iterator, List, Optional
 
 import numpy as np
 import pandas as pd
-from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.data import Bar, BarType, Data
 #from nautilus_trader.model import Data  # base class for custom data
 
 

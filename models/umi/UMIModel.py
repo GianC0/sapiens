@@ -20,8 +20,9 @@ from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, Forec
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
+from nautilus_trader.model.data import BarType, BarSpecification
 
      
 
@@ -39,7 +40,7 @@ class UMIModel(nn.Module):
         freq: str,
         feature_dim: int,
         window_len: int,
-        bar_type,
+        bar_spec: BarSpecification,         # class nautilus trading BarSpecification: includes frequency (count and letter) and PriceType=LAST
         pred_len: int,
         end_train: str,
         end_valid: str,
@@ -70,12 +71,11 @@ class UMIModel(nn.Module):
         
         # time parameters
         self.freq           = freq                                                                 # e.g. "1d", "15m", "1h"
-        self.bar_type    = bar_type                                                                # bar type derived from freq
+        self.bar_spec    = bar_spec                                                                # bar type derived from freq
         self.pred_len    = pred_len                                                                # number of bars to predict
         self.retrain_delta  = retrain_delta                                                        # time delta for retraining 
         self.end_train      = pd.to_datetime(end_train, utc=True)                                  # end of training date
-        self.end_valid      = pd.to_datetime(end_valid, utc=True)                                  # end of validation date
-        self.bt_end         = pd.to_datetime(bt_end, utc=True)                                     # end of back-test date (optional)
+        self.end_valid      = pd.to_datetime(end_valid, utc=True)                                  # end of validation date                                   # end of back-test date (optional)
         self._last_fit_time = None                                                                 # last time fit() was called
         
 
@@ -111,15 +111,15 @@ class UMIModel(nn.Module):
 
 
     def initialize(self, data: Cache, **kwargs) -> None:
-
-        assert self._is_initialized == False
         """
         Initial training on historical data.
-         
         - This is the entry point for first training
         - No walk-forward logic
         - Sets up universe and trains from scratch
         """
+
+        assert self._is_initialized == False
+
         print(f"[{self.__class__.__name__}] Initializing model...")
         
         # Build panel and setup
@@ -161,12 +161,12 @@ class UMIModel(nn.Module):
         print(f"[initialize] Complete. Best validation: {best_val:.6f}")
 
     # ---------------- fit -------------------------------------------- #
-    def fit(self, data: DataSource , warm_start: bool = True):
+    def fit(self, data: Cache , warm_start: bool = True):
         """
         One-off training (train + valid).
         """
 
-        if !warm_start:
+        if not warm_start:
             # Update training windows to latest data
             assert isinstance(data, Cache)
             # Get latest timestamp from cache
@@ -188,20 +188,19 @@ class UMIModel(nn.Module):
             self.initialize(data)
             return
 
-        # Check if architecture needs updating after insertion. TODO: does not account for insertion and delisting at the same time
-        if panel.size(1) > self.I_active:
-            print(f"[fit] Universe expanded, need to reinitialize...")
-            self.fit(data, initialize=True)
-            return
-
         # Regular warm-start training
         print(f"[fit] Warm-start training...")
 
         # Build panel
-        panel, active, idx = self._build_panel(data, lookback=None)   # panel.shape: (T,I,F)
+        panel, active, idx, _ = self._build_panel(data=data, lookback=0)   # panel.shape: (T,I,F)
 
 
-
+        # Check if architecture needs updating after insertion. TODO: does not account for insertion and delisting at the same time
+        if panel.size(1) > self.I_active:
+            print(f"[fit] Universe expanded, need to reinitialize...")
+            self.fit(data, warm_start=False)
+            return
+        
         best_path = self.model_dir / "best.pt"
         if best_path.exists():
             print(f"[fit] Loading weights from {best_path}")
@@ -210,7 +209,7 @@ class UMIModel(nn.Module):
             except Exception as e:
                 print(f"[fit] Failed to load weights: {e}, training from scratch")
         else:
-            raise Exception("Could not find best.pt warmed-up model in ", model_dir)
+            raise Exception("Could not find best.pt warmed-up model in ", self.model_dir)
 
         # Update training windows for walk-forward
         current_time = self._clock()
@@ -253,40 +252,54 @@ class UMIModel(nn.Module):
     # ------------------------------------------------------------------ #
     # update : decide if retrain_delta elapsed → refit on latest data    #
     # ------------------------------------------------------------------ #
-    def update(self, data_dict: DataSource ):
-        if self._last_fit_time is None:
-            raise RuntimeError("Call fit() before update().")
+    def update(self, data: Cache ):
+
+        if not self._is_initialized:
+            print("[update] Model not initialized, skipping update")
+            return
+
+        now = self._clock()
+
+        # Get current universe from data
+        current_symbols = set(str(inst) for inst in data.instruments())
         
-        assert isinstance(data_dict, Cache)
-        data_dict = cache_to_dict(
-            data_dict,
-            tickers=self._universe or sorted(data_dict.symbols()),  # preserves slot order
-            lookback=self.L + self.pred_len + 1,
-            bar_type=self.bar_type,
-        )
+        # Check for new stocks
+        new_stocks = current_symbols - set(self._universe)
+        print(f"[update] New stocks detected: {new_stocks}")
 
-        now = self._clock()        # <── the only place we read “time”
+        # Calculate minimum required data points
+        
+        min_windows = (self.L + self.pred_len + 1) * self.warm_training_epochs
+        diversity_need = self.batch_size * 3  # At least 3 mini-batches per epoch
+        required_bars = max(min_windows, diversity_need)  # minimum n of bars to consider stock for trading
+        panel, active, _ , universe = self._build_panel( data=data, lookback=0)
+        
+        new_stocks_to_add = set([]) 
+        for stock in new_stocks:
+            latest_hist = int(active[ universe.index(stock) ][-required_bars].sum())
+            if latest_hist == required_bars:   #check if there is enough history for each new stock
+                new_stocks_to_add.add(stock)
+                # Check if we can add to existing capacity
+            else: # remove stock from universe and panel, set active max to False for that index
+                msk = torch.arange(panel.size(1)) != universe.index(stock)
+                panel = panel[:, msk, :] # removed from panel
+                active[]
 
-        # ---------- build fresh activity mask at NOW ------------------
-
-        #  Add new tickers to the first free slots
-        for k in sorted(data_dict):
-            if k not in self._universe:
-                if len(self._universe) < self.I:        # capacity check
-                    self._universe.append(k)            # reserve slot
-                    self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
+                
+                universe.remove(stock)
+        if len(self._universe) + len(new_stocks) <= self.I:
+                    # Add to universe and retrain
+                    self._universe.extend(sorted(new_stocks))
+                    print(f"[update] Added {len(new_stocks)} stocks, triggering warm-start retrain")
+                    self.fit(data, warm_start=True)
                     return
-                else:
-                    self._universe.append(k)              # give the new stock a slot
-                    print(f"[info] universe full. Retraining …")
-                    self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
-                    return                                # early exit; retrain done
-
-        _, active, idx = _build_panel(data_dict, universe=self._universe)
-        new_mask = active[:, -1]                       # (I_active_now) mask for stocks that are live NOW
-        latest = idx[-1]
-        self.end_valid = latest
-        self.end_train = self.end_valid - pd.DateOffset(months=6)
+        else:
+            # Need full reinitialization
+            print("[update] Universe capacity exceeded, triggering full reinitialization")
+            self._universe.extend(sorted(new_stocks))
+            self.fit(data, warm_start=False)
+            return   
+        new_mask = active[:, -1]                       # (I, 1) mask for stocks that are live NOW
         pad = self.I - new_mask.size(0)
         if pad:
             new_mask = torch.cat([new_mask, torch.zeros(pad, dtype=torch.bool)])
@@ -304,7 +317,7 @@ class UMIModel(nn.Module):
         if time_elapsed or just_delisted:
             reason = "time window" if time_elapsed else "delisting event"
             print(f"Retraining triggered : {reason}.")
-            self.fit(data_dict, warm_start=self.warm_start, n_epochs=self.warm_training_epochs)
+            self.fit(data, warm_start=self.warm_start)
 
     # ------------------------------------------------------------------ #
     # predict : one inference step                                       #
@@ -378,7 +391,7 @@ class UMIModel(nn.Module):
     # --------------------------------------------------------------------------- #
     #  Utility : build a panel tensor from the {stockID: dataframe} dict        #
     # --------------------------------------------------------------------------- #
-    def _build_panel(data: Cache, lookback: int) -> torch.Tensor:
+    def _build_panel(self, data: Cache, lookback: int):
         """
         Returns training data tensor of shape (T, I, F) sorted by timestamp ascending &
         stocks alphabetically.
@@ -393,7 +406,7 @@ class UMIModel(nn.Module):
         data_dict = cache_to_dict(
             data,
             tickers=sorted(data.instruments()),
-            lookback=lookback,  # Get all available data
+            lookback=lookback,  # Get all available data if lookback=0
             bar_type=self.bar_type,
         )
         
@@ -401,16 +414,13 @@ class UMIModel(nn.Module):
         universe = sorted(data_dict.keys())
         print(f"[initialize] Universe: {len(self._universe)} stocks")
         
-
-        keys = universe if universe is not None else sorted(data_dict)
-        
         # --- harmonise indices -------------------------------------------------
         for k, df in data_dict.items():
             if not isinstance(df.index, pd.DatetimeIndex):
                 df.set_index("Date", inplace=True)
             df.index = pd.to_datetime(df.index, utc=True)  
 
-        feature_cols = data_dict[keys[0]].columns          # all numeric + tech-indicators
+        feature_cols = data_dict[universe[0]].columns          # OHLCV + tech-indicators
         long = pd.concat([df[feature_cols].assign(stock=k) for k, df in data_dict.items()])
 
         # ---------- proper pivot ---------------------------------------------- #
@@ -422,9 +432,9 @@ class UMIModel(nn.Module):
 
         #  re-index columns ⇢ fill missing tickers with NaN so slots
         if universe is not None:
-            df_pivot = df_pivot.reindex( pd.MultiIndex.from_product([feature_cols, keys]), axis=1 )
+            df_pivot = df_pivot.reindex( pd.MultiIndex.from_product([feature_cols, universe]), axis=1 )
 
-        T, F, I = len(df_pivot), len(feature_cols), len(keys)
+        T, F, I = len(df_pivot), len(feature_cols), len(universe)
         values = torch.tensor(df_pivot.values, dtype=torch.float32)
         tensor = values.reshape(T, F, I).permute(0,2,1) # (T,I,F)
         active = torch.isfinite(tensor).all(-1).transpose(0,1) # (I,T)
