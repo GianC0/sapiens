@@ -28,7 +28,7 @@ from nautilus_trader.model.enums import OrderSide
 # ----- project imports -----------------------------------------------------
 from .models.interfaces import MarketModel
 from .engine.data_loader import CsvBarLoader, FeatureBarData
-from ..models.utils import cache_to_dict
+from ..models.utils import cache_to_dict, freq2pandas
 
 #  risk / execution helpers (same modules you used before)
 from .engine.execution import CommissionModelBps, SlippageModelBps
@@ -39,7 +39,7 @@ from .engine.analyzers import EquityCurveAnalyzer
 # ========================================================================== #
 # Strategy
 # ========================================================================== #
-class GenericLongShortStrategy(Strategy):
+class BacktestLongShortStrategy(Strategy):
     """
     Long/short equity strategy, model-agnostic & frequency-agnostic.
 
@@ -59,62 +59,83 @@ class GenericLongShortStrategy(Strategy):
     optimizer.name:      max_sharpe | none
     """
 
+
     # ------------------------------------------------------------------ #
     def __init__(self, config: dict):  
         super().__init__()  
 
         self.cfg = config
 
-        # 1) ---------------- data loader ------------------------------
+        # ---------------- data loader ------------------------------
         self.loader = CsvBarLoader(
             root=Path(self.cfg["data_dir"]),
             freq=self.cfg["freq"],
         )
-        self.universe: List[str] = self.loader.universe
-        self._bar_type = self.loader.bar_type
+        # self.universe: List[str] = self.loader.universe
+        # self._bar_type = self.loader.bar_type
 
-        # 2) ---------------- model (dynamic import) -------------------
-        self.model: MarketModel = self._build_model()
 
-        # 3) ---------------- optimiser --------------------------------
-        opt_name = str(self.cfg.get("optimizer", {}).get("name", "max_sharpe")).lower()
-        rf = (
-            float(self.loader.rf_series.iloc[-1])
-            if self.loader.rf_series is not None
-            else 0.0
-        )
-        self.optimizer = MaxSharpeRatioOptimizer(risk_free=rf) if opt_name == "max_sharpe" else None
+        # # 3) ---------------- optimiser --------------------------------
+        # opt_name = str(self.cfg.get("optimizer", {}).get("name", "max_sharpe")).lower()
+        # rf = (
+        #     float(self.loader.rf_series.iloc[-1])
+        #     if self.loader.rf_series is not None
+        #     else 0.0
+        # )
+        # self.optimizer = MaxSharpeRatioOptimizer(risk_free=rf) if opt_name == "max_sharpe" else None
 
-        self.selector_k = int(self.cfg["selection"]["top_k"])
+        # self.selector_k = int(self.cfg["selection"]["top_k"])
 
-        # 4) ---------------- risk helpers -----------------------------
-        self.trailing_stop_pct = float(self.cfg["risk"]["trailing_stop_pct"])
-        self.drawdown_pct = float(self.cfg["risk"]["drawdown_pct"])
-        self.max_w_abs = float(self.cfg["risk"]["max_weight_abs"])
-        self.max_w_rel = float(self.cfg["risk"]["max_weight_rel"])
-        self.target_vol = float(self.cfg["risk"]["target_vol_annual"])
-        self.trailing_stops: Dict[str, float] = {}
-        self.realised_returns: List[float] = []
-        self.equity_peak_value: float = 0.0
-        self.equity_analyzer = EquityCurveAnalyzer()
+        # # 4) ---------------- risk helpers -----------------------------
+        # self.trailing_stop_pct = float(self.cfg["risk"]["trailing_stop_pct"])
+        # self.drawdown_pct = float(self.cfg["risk"]["drawdown_pct"])
+        # self.max_w_abs = float(self.cfg["risk"]["max_weight_abs"])
+        # self.max_w_rel = float(self.cfg["risk"]["max_weight_rel"])
+        # self.target_vol = float(self.cfg["risk"]["target_vol_annual"])
+        # self.trailing_stops: Dict[str, float] = {}
+        # self.realised_returns: List[float] = []
+        # self.equity_peak_value: float = 0.0
+        # self.equity_analyzer = EquityCurveAnalyzer()
 
-        # 5) ---------------- execution --------------------------------
-        self.fee_model = CommissionModelBps(float(self.cfg["costs"]["fee_bps"]))
-        self.slip_model = SlippageModelBps(float(self.cfg["costs"]["spread_bps"]))
-        self.twap_slices = max(1, int(self.cfg["execution"]["twap_slices"]))
-        self.parallel_orders = max(1, int(self.cfg["execution"]["parallel_orders"]))
-        self.adv_lookback = int(self.cfg["liquidity"]["adv_lookback"])
-        self.max_adv_pct = float(self.cfg["liquidity"]["max_adv_pct"])
+        # # 5) ---------------- execution --------------------------------
+        # self.fee_model = CommissionModelBps(float(self.cfg["costs"]["fee_bps"]))
+        # self.slip_model = SlippageModelBps(float(self.cfg["costs"]["spread_bps"]))
+        # self.twap_slices = max(1, int(self.cfg["execution"]["twap_slices"]))
+        # self.parallel_orders = max(1, int(self.cfg["execution"]["parallel_orders"]))
+        # self.adv_lookback = int(self.cfg["liquidity"]["adv_lookback"])
+        # self.max_adv_pct = float(self.cfg["liquidity"]["max_adv_pct"])
 
     # ================================================================= #
     # Nautilus event handlers
     # ================================================================= #
-    def on_start(self):  # CHANGED: Removed async
+    def on_start(self): 
         """Subscribe to bars for every symbol."""
+        self.TIMER_NAME = "every_common_csv_bar"
+        TIMER_INTERVAL = freq2pdoffset(self.cfg["freq"])
+        self.clock.set_timer(
+            name=self.TIMER_NAME,  # Custom timer name
+            interval=self.TIMER_INTERVAL,  # Timer interval
+            callback=self.on_timer,  # Custom callback function invoked on timer
+        )
+
+        # INITIAL MODEL TRAINING STEPS
+        # setup train dataset, with start/end date
+        # setup whether hp tuning or not
+        # setup universe and ensure enough history for each stock and let universe be 
+        # model.initialize()
+        # 
+
         for sym in self.universe:
             self.subscribe_bars(self._bar_type, sym)  
 
+    def on_timer(self, event: TimeEvent):
+        if event.name == self.TIMER_NAME:
+            # the logic should be the following:
+            # build the latest universe set and compare it to the previous
+            # checks for stocks events (new or delisted) and retrain_delta and if nothing happens directly calls predict() method of the model (which should happen only if holdout period in bars is passed (otherwise do not do anything), and this variable is in the config.yaml); if retrain delta is passed without stocks event, it calls update() which runs a warm start fit() on the new training window and then the strategy calls predict(); if stock event happens then the strategy calls update() and then predict(). update() should manage the following: if delisting then just use the model active mask to cut off those stocks (so that future preds and training loss are not computed for these. the model is ready to predict after that) but if new stocks are added it checks for universe availability and enough history in the Cache for those new stocks and then calls an initialization. ensure that the most up to date mask is always set by update (or by initialize only at the start) so that the other functions use always the most up to date mask.
+
     def on_bar(self, bar: Bar):  
+        # assuming on_timer happens before then on_bars are called first,
         ts = bar.ts_event
         sym = bar.instrument_id.symbol
         

@@ -39,6 +39,14 @@ training:
   patience:       10        # Early-stop patience 
   retrain_delta:  30        # Retrain every (30 * freq) bars
 
+
+# ---------------------------------------------------------------------------
+#  Warm-start fine-tune (optional quick pass after heavy fit)
+# ---------------------------------------------------------------------------
+warm_start:          true  # Enable warm-start                           (common in finance live rolls)
+warm_training_epochs: 5    # Light fine-tune epochs
+
+
 # ---------------------------------------------------------------------------
 #  Default hyper-parameters (UMI paper, Table 2) – Optuna overwrites them
 # ---------------------------------------------------------------------------
@@ -107,12 +115,6 @@ hparams:
   weight_decay: 0.0        
 
 # ---------------------------------------------------------------------------
-#  Warm-start fine-tune (optional quick pass after heavy fit)
-# ---------------------------------------------------------------------------
-warm_start:          true  # Enable warm-start                           (common in finance live rolls)
-warm_training_epochs: 5    # Light fine-tune epochs
-
-# ---------------------------------------------------------------------------
 #  Allocation targets
 # ---------------------------------------------------------------------------
 allocation:
@@ -139,8 +141,9 @@ engine:
 #  Trading frictions
 # ---------------------------------------------------------------------------
 costs:
-  fee_bps:    0.5   # One-way commission in basis-points of notional    (Tcost literature)
-  spread_bps: 1.0   # Half-spread slippage estimate 
+  fee_bps:    0.5          # One-way commission in basis-points of notional    (Tcost literature)
+  prob_slippage: 0.2       # Simulates the probability of experiencing price slippage when executing market orders. When triggered, moves fill price one tick against your order direction
+  prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
 
 # ---------------------------------------------------------------------------
 #  Liquidity constraints

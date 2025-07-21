@@ -10,15 +10,17 @@ import pandas as pd
 
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.data import BacktestDataConfig
+from nautilus_trader.backtest.models import FillModel
 from nautilus_trader.config import BacktestRunConfig, BacktestEngineConfig
-from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.identifiers import Venue
+from nautilus_trader.model import Bar
 
 
-from algos.strategy import GenericLongShortStrategy
+from algos.strategy import BacktestLongShortStrategy
 from algos.engine.hparam_tuner import OptunaHparamsTuner, split_hparam_cfg
 from algos.engine.data_loader import CsvBarLoader
 from models.umi import UMIModel
+from model.utils import freq2barspec
 
 
 def main():
@@ -57,8 +59,8 @@ def main():
             retrain_delta = pd.DateOffset(days=cfg["training"]["retrain_delta"]),
             dynamic_universe_mult = cfg["dynamic_universe_mult"],
             data_dir    = Path(cfg["data_dir"]),
-            clock_fn    = clock_fn,  # CHANGED: Added clock function
-            bar_type    = loader.bar_type,  # CHANGED: Added bar_type
+            clock_fn    = clock_fn,  # TODO: Added clock function
+            bar_spec    = , freq2barspec(cfg["freq"]) # TODO: doublecheck if necessary
             **defaults,
         )
 
@@ -84,7 +86,7 @@ def main():
     start = pd.Timestamp(cfg["backtest_start"], tz="UTC")
     end = pd.Timestamp(cfg["backtest_end"], tz="UTC")
     
-    # CHANGED: Updated Nautilus Trader configuration
+    
     engine = BacktestEngine(
         config=BacktestEngineConfig(
             strategies=[GenericLongShortStrategy(config=cfg)],
@@ -92,27 +94,39 @@ def main():
         data_configs=[
             BacktestDataConfig(
                 catalog_path=":memory:",
+                data_cls= Bar
                 start_time=start,
                 end_time=end,
-                instrument_ids=[],  # Will be populated by strategy
+                bar_spec=freq2barspec(cfg["freq"])
             )
         ],
-        venues=[Venue("SIM")],
+        venues=[Venue(
+            name="SIM",
+            book_type="L1_MBP"     # bars are inluded in L1 market-by-price
+            account_type="CASH",
+            base_currency=cfg["currency"],
+            starting_balances=str(cfg["initial_cash"])+" "+str(cfg["currency"]),
+            bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices
+            )],
         run_config=BacktestRunConfig(
             engine_id="001",
             run_id="001",
         ),
         cache=CacheConfig(
-        tick_capacity=10_000,  # Store last 10,000 ticks per instrument
-        bar_capacity=5_000,    # Store last 5,000 bars per bar type
+        #tick_capacity=10_000,  # Store last 10,000 ticks per instrument
+        bar_capacity=cfg["engine"]["cache"]["bar_capacity"],    # Store last 5,000 bars per bar type: 5000 days ~ 13.5 years
         ),
+        fill_model=FillModel(
+            prob_fill_on_limit=0.2,    # Chance a limit order fills when price matches (applied to bars/trades/quotes + L1/L2/L3 order book)
+            prob_slippage=0.5,         # Chance of 1-tick slippage (applied to bars/trades/quotes + L1 order book only)
+            random_seed=None,          # Optional: Set for reproducible results
+        )
     )
 
     # --- Load data into engine ---------------------------------------
-    # CHANGED: Load data using the loader
-    loader = CsvBarLoader(Path(cfg["data_dir"]), freq=cfg["freq"])
-    for bar in loader.bar_iterator():
-        engine.add_data(bar)
+    # loader = CsvBarLoader(Path(cfg["data_dir"]), freq=cfg["freq"])
+    # for bar in loader.bar_iterator():
+    #     engine.add_data(bar)
 
     # --- run ----------------------------------------------------------
     print("[run_backtest] starting")
