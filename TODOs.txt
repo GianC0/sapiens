@@ -4,4 +4,4 @@ strategy
 run backtest
 dataloader
 
-fix the research notebook
+fix the research notebook or change with tensorboard

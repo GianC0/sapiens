@@ -44,9 +44,7 @@ def cache_to_dict(
     """
     out = {}
     for sym in tickers:
-        # CHANGED: Try to get FeatureBarData first
         feature_data = []
-        bars_data = []
         
         # Get all data objects for this symbol
         for obj in cache.data():
@@ -74,9 +72,9 @@ def cache_to_dict(
         else:
             # Fallback to regular bars if no feature data
             bars = []
-            for bar in cache.bars(bar_type):
-                if bar.instrument_id.symbol == sym:
-                    bars.append(bar)
+            for b in cache.bars(bar_type):
+                if b.instrument_id.symbol == sym:
+                    bars.append(b)
                     
             bars = sorted(bars, key=lambda x: x.ts_event)[-lookback:]
             

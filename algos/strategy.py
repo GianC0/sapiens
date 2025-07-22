@@ -28,7 +28,7 @@ from nautilus_trader.model.enums import OrderSide
 # ----- project imports -----------------------------------------------------
 from .models.interfaces import MarketModel
 from .engine.data_loader import CsvBarLoader, FeatureBarData
-from ..models.utils import cache_to_dict, freq2pandas
+from ..models.utils import cache_to_dict, freq2pandas, freq2barspec
 
 #  risk / execution helpers (same modules you used before)
 from .engine.execution import CommissionModelBps, SlippageModelBps
@@ -68,12 +68,14 @@ class BacktestLongShortStrategy(Strategy):
 
         # ---------------- data loader ------------------------------
         self.loader = CsvBarLoader(
-            root=Path(self.cfg["data_dir"]),
-            freq=self.cfg["freq"],
+            cfg=self.cfg,
         )
-        # self.universe: List[str] = self.loader.universe
-        # self._bar_type = self.loader.bar_type
 
+        self.bar_spec = freq2barspec(self.cfg["freq"])
+        # self.universe: List[str] = self.loader.universe
+
+
+        #TODO: to add ["strategy"] as first dimension
 
         # # 3) ---------------- optimiser --------------------------------
         # opt_name = str(self.cfg.get("optimizer", {}).get("name", "max_sharpe")).lower()
@@ -109,31 +111,106 @@ class BacktestLongShortStrategy(Strategy):
     # Nautilus event handlers
     # ================================================================= #
     def on_start(self): 
-        """Subscribe to bars for every symbol."""
-        self.TIMER_NAME = "every_common_csv_bar"
-        TIMER_INTERVAL = freq2pdoffset(self.cfg["freq"])
+        """Initialize strategy."""
+
+        # assert now + freq2pdoffset(self.cfg["holdout"] < now + pred_len 
+
         self.clock.set_timer(
-            name=self.TIMER_NAME,  # Custom timer name
-            interval=self.TIMER_INTERVAL,  # Timer interval
-            callback=self.on_timer,  # Custom callback function invoked on timer
+            name="update_timer",  
+            interval=freq2pdoffset(self.cfg["freq"]),  # Timer interval
+            callback=self.on_update,  # Custom callback function invoked on timer
+        )
+
+        self.clock.set_timer(
+            name="holdout_timer",  
+            interval=freq2pdoffset(self.cfg["holdout"]),  # Timer interval
+            callback=self.on_holdout,  # Custom callback function invoked on timer
+        )
+
+        self.clock.set_timer(
+            name="retrain_timer",  
+            interval=freq2pdoffset(self.cfg["retrain_delta"]),  # Timer interval
+            callback=self.on_retrain,  # Custom callback function invoked on timer
         )
 
         # INITIAL MODEL TRAINING STEPS
         # setup train dataset, with start/end date
-        # setup whether hp tuning or not
-        # setup universe and ensure enough history for each stock and let universe be 
+        loader     = CsvBarLoader(cfg=cfg, venue_name="SIM")
+        data_dict  = loader._frames
+        ### SETUP HPARAMS TUNING
+        # pulls defaults and hparams search space from cfg file
+        defaults, search_space = split_hparam_cfg(cfg["hparams"])
+        if cfg["training"]["tune_hparams"]:
+            print("[HPO] Optuna search started …")
+
+
+
+            # CHANGED: Create clock function to pass to model
+            def clock_fn():
+                return pd.Timestamp.utcnow()
+
+            fixed = dict(
+                freq        = cfg["freq"],
+                feature_dim = len(next(iter(data_dict.values())).columns),
+                window_len  = cfg["window_len"],
+                pred_len    = cfg["pred_len"],
+                end_train   = cfg["train_end"],
+                end_valid   = cfg["valid_end"],
+                batch_size  = cfg["training"]["batch_size"],
+                retrain_delta = pd.DateOffset(days=cfg["training"]["retrain_delta"]),
+                dynamic_universe_mult = cfg["dynamic_universe_mult"],
+                data_dir    = Path(cfg["data_dir"]),
+                bar_spec    = freq2barspec(cfg["freq"]) # TODO: doublecheck if necessary
+                **defaults,
+            )
+
+            tuner = OptunaHparamsTuner(   # TODO: check training logic and if can rigthly start to trade
+                model_name  = cfg["model_name"],
+                logs_dir    = Path(cfg.get("logs_dir", "logs")),
+                model_cls   = UMIModel,
+                train_dict  = data_dict,
+                search_space= search_space,
+                defaults    = defaults, 
+                fixed_kwargs= fixed,
+                fit_kwargs  = dict(n_epochs=cfg["training"]["n_epochs"]),
+                study_name  = f"{model_name}_hpo",  
+                n_trials    = cfg["training"]["n_trials"],
+            )
+            best = tuner.optimize()
+            cfg["hparams"] = {**defaults, **best["params"]}
+            print(f"Optuna tuning complete. Best hparams: {best["params"]}")
+        else:
+            cfg["hparams"] = defaults
+        
+        # setup universe and ensure enough history for each stock and let universe be universe_mult*n_instruments
         # model.initialize()
-        # 
+        # set self.now or similar
 
         for sym in self.universe:
             self.subscribe_bars(self._bar_type, sym)  
 
-    def on_timer(self, event: TimeEvent):
-        if event.name == self.TIMER_NAME:
+    def on_update(self, event: TimeEvent):
+        if event.name == "update_timer":
             # the logic should be the following:
-            # build the latest universe set and compare it to the previous
+            # update prediction for the next pred_len = now + holdout - holdout_start
             # checks for stocks events (new or delisted) and retrain_delta and if nothing happens directly calls predict() method of the model (which should happen only if holdout period in bars is passed (otherwise do not do anything), and this variable is in the config.yaml); if retrain delta is passed without stocks event, it calls update() which runs a warm start fit() on the new training window and then the strategy calls predict(); if stock event happens then the strategy calls update() and then predict(). update() should manage the following: if delisting then just use the model active mask to cut off those stocks (so that future preds and training loss are not computed for these. the model is ready to predict after that) but if new stocks are added it checks for universe availability and enough history in the Cache for those new stocks and then calls an initialization. ensure that the most up to date mask is always set by update (or by initialize only at the start) so that the other functions use always the most up to date mask.
 
+    def on_holdout(self, event: TimeEvent):
+        if event.name == "holdout_timer":
+            # new prediction up until re-optimize portfolio
+
+    def on_retrain(self, event: TimeEvent):
+        elif event.name == "retrain_timer":
+    
+            
+
+    # ================================================================= #
+    # DATA handlers
+    # ================================================================= #
+    def on_instrument(self, instrument: Instrument) -> None:
+    def on_instrument_status(self, data: InstrumentStatus) -> None:
+    def on_instrument_close(self, data: InstrumentClose) -> None:
+    def on_historical_data(self, data: Data) -> None:
     def on_bar(self, bar: Bar):  
         # assuming on_timer happens before then on_bars are called first,
         ts = bar.ts_event
@@ -178,13 +255,28 @@ class BacktestLongShortStrategy(Strategy):
         # === model upkeep ===========================================
         self.model.update(self.cache)
 
+
+    # ================================================================= #
+    # ORDER MANAGEMENT
+    # ================================================================= #
+
     def on_order_filled(self, event: OrderFilled): 
         """Update position tracking on fills."""
         
         order = event.order
         position = self.portfolio.position(order.instrument_id)
         if position:
-            self._position_qty[order.instrument_id.symbol] = position.quantity
+            self._position_qty[order.instrument_id.symbol.value] = position.quantity
+
+
+    # ================================================================= #
+    # POSITION MANAGEMENT
+    # ================================================================= #
+
+    # ================================================================= #
+    # ACCOUNT & PORTFOLIO 
+    # ================================================================= #
+
 
     # ================================================================= #
     # internal helpers
@@ -192,10 +284,10 @@ class BacktestLongShortStrategy(Strategy):
     # ----- model factory ----------------------------------------------
     def _build_model(self) -> MarketModel:
         name = str(self.cfg["model_name"]).lower()
-        mod = importlib.import_module(f"models.{name}")
+        mod = importlib.import_module(f"models.{name}.{name}")
         ModelCls = getattr(mod, "Model", None) or getattr(mod, f"{name.upper()}Model")
         if ModelCls is None:
-            raise ImportError(f"models.{name} must export a Model class")
+            raise ImportError(f"models.{name}.{name} must export a Model class")
         
         
         first_df = next(iter(self.loader._frames.values()))

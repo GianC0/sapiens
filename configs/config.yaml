@@ -1,5 +1,5 @@
 # MODEL
-model_name: "UMI"
+model_name: "UMIModel"
 
 # ---------------------------------------------------------------------------
 #  Paths
@@ -21,7 +21,7 @@ backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years)
 # ---------------------------------------------------------------------------
 #  Universe / data granularity
 # ---------------------------------------------------------------------------
-freq: 1B                      # 1 business-day bars (Lean offset code)    (common)
+freq: 1B                      # 1 business-day bars ( offset )
 window_len: 60                # L : look-back window length (UMI paper)   (sliding-window features)
 pred_len:   1                 # H : prediction horizon (next bar)         (one-step forecast)
 dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+univers_mult (in this case ↑20%)       
@@ -30,21 +30,17 @@ dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+u
 #  Training schedule & hyper-param search
 # ---------------------------------------------------------------------------
 training:
-  tune_hparams:   false      # Use Optuna Bayesian search                 
-  n_trials:       20        # #Optuna trials for each run
-  n_epochs:       20        # Full epochs on train+valid after tuning
-  batch_size:     64        # Mini-batch size for AdamW                 
+  tune_hparams:   false       # Use Optuna Bayesian search                 
+  n_trials:       20          # #Optuna trials for each run
+  n_epochs:       20          # Full epochs on train+valid after tuning
+  batch_size:     64          # Mini-batch size for AdamW                 
   training_mode:  sequential  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain) → Stage-1 + Stage-2
-  pretrain_epochs: 5        # Stage-1 warm-up epochs in hybrid mode
-  patience:       10        # Early-stop patience 
-  retrain_delta:  30        # Retrain every (30 * freq) bars
+  pretrain_epochs: 5          # Stage-1 warm-up epochs in hybrid mode
+  patience:       10          # Early-stop patience 
+  warm_start:          true   # Enable warm-start                           (common in finance live rolls)
+  warm_training_epochs: 5     # Light fine-tune epochs
+  retrain_delta:  30B          # Retrain every (30 * freq) bars
 
-
-# ---------------------------------------------------------------------------
-#  Warm-start fine-tune (optional quick pass after heavy fit)
-# ---------------------------------------------------------------------------
-warm_start:          true  # Enable warm-start                           (common in finance live rolls)
-warm_training_epochs: 5    # Light fine-tune epochs
 
 
 # ---------------------------------------------------------------------------
@@ -117,58 +113,64 @@ hparams:
 # ---------------------------------------------------------------------------
 #  Allocation targets
 # ---------------------------------------------------------------------------
-allocation:
-  gross_leverage: 2.0   # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
-  net_exposure:   0.0   # Σwᵢ ≈ 0 (market-neutral)
 
-selection:
-  top_k: 30            # sell the worst 30 and buy the best the 30 stocks 
+strategy:
+  holdout: 1B              # holdout period in days. NOTE: ensure pred_len < holdout
+  allocation:
+    gross_leverage: 2.0   # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
+    net_exposure:   0.0   # Σwᵢ ≈ 0 (market-neutral)
 
-optimizer:
-  name: max_sharpe               # maximize sharpe ratio
-  lookback_days: 60              # history window to build the Σ matrix
-#  allow_short:  true             # set false if you ever run long-only
+  selection:
+    top_k: 30            # sell the worst 30 and buy the best the 30 stocks 
 
-# ---------------------------------------------------------------------------
-#  Dataset n_bars loader
-# ---------------------------------------------------------------------------
-engine:
-  cache:
-    bar_capacity: 4096   # ≥ L + pred_len + some safety margin
+  optimizer:
+    name: max_sharpe               # maximize sharpe ratio
+    lookback_days: 60              # history window to build the Σ matrix
+  #  allow_short:  true             # set false if you ever run long-only
+
+  # ---------------------------------------------------------------------------
+  #  Dataset n_bars loader
+  # ---------------------------------------------------------------------------
+  engine:
+    cache:
+      bar_capacity: 4096   # ≥ L + pred_len + some safety margin
 
 
-# ---------------------------------------------------------------------------
-#  Trading frictions
-# ---------------------------------------------------------------------------
-costs:
-  fee_bps:    0.5          # One-way commission in basis-points of notional    (Tcost literature)
-  prob_slippage: 0.2       # Simulates the probability of experiencing price slippage when executing market orders. When triggered, moves fill price one tick against your order direction
-  prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
+  # ---------------------------------------------------------------------------
+  #  Trading frictions
+  # ---------------------------------------------------------------------------
+  costs:
+    fee_bps:    0.5          # One-way commission in basis-points of notional    (Tcost literature)
+    prob_slippage: 0.2       # Simulates the probability of experiencing price slippage when executing market orders. When triggered, moves fill price one tick against your order direction
+    prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
 
-# ---------------------------------------------------------------------------
-#  Liquidity constraints
-# ---------------------------------------------------------------------------
-liquidity:
-  adv_lookback: 30     # Look-back window to compute Average Daily Volume (ADV)
-  max_adv_pct:  0.05   # Max trade size = 5 % ADV 
+  # ---------------------------------------------------------------------------
+  #  Liquidity constraints
+  # ---------------------------------------------------------------------------
+  liquidity:
+    adv_lookback: 30     # Look-back window to compute Average Daily Volume (ADV)
+    max_adv_pct:  0.05   # Max trade size = 5 % ADV 
 
-# ---------------------------------------------------------------------------
-#  Execution parameters
-# ---------------------------------------------------------------------------
-execution:
-  twap_slices: 4   # Split parent order into N TWAP child orders        
+  # ---------------------------------------------------------------------------
+  #  Order Execution parameters
+  # ---------------------------------------------------------------------------
+  execution:
+    twap:
+      horizon_secs: 10.0
+      interval_secs: 2.5
+      # Split parent order into 4 TWAP child orders, each after 2.5 seconds        
 
-# ---------------------------------------------------------------------------
-#  Risk management overlays
-# ---------------------------------------------------------------------------
-risk:
-  trailing_stop_pct: 0.05      # 5 % trailing stop from HWM/LWM         
-  target_vol_annual: 0.15      # Volatility target (Hull, risk parity) 15 %
-  drawdown_pct:      0.15      # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
-  max_weight_abs:    0.03      # Max 3 % NAV per single position        (concentration limit)
-  max_weight_rel:    0.20      # Max 20 % of gross exposure in one name
-  beta_neutral:                # Optional index-beta hedge 
-    enabled: false
-    benchmark: SPY            # Proxy for market factor (S&P 500 ETF)
-    lookback_days: 60         # Regression window for beta estimation
-    beta_tol: 0.02            # Allow residual β in ±0.02 band
+  # ---------------------------------------------------------------------------
+  #  Risk management overlays
+  # ---------------------------------------------------------------------------
+  risk:
+    trailing_stop_pct: 0.05      # 5 % trailing stop from HWM/LWM         
+    target_vol_annual: 0.15      # Volatility target (Hull, risk parity) 15 %
+    drawdown_pct:      0.15      # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
+    max_weight_abs:    0.03      # Max 3 % NAV per single position        (concentration limit)
+    max_weight_rel:    0.20      # Max 20 % of gross exposure in one name
+    beta_neutral:                # Optional index-beta hedge 
+      enabled: false
+      benchmark: SPY            # Proxy for market factor (S&P 500 ETF)
+      lookback_days: 60         # Regression window for beta estimation
+      beta_tol: 0.02            # Allow residual β in ±0.02 band

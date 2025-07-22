@@ -17,13 +17,20 @@ from typing import Dict, Iterator, List, Optional
 import numpy as np
 import pandas as pd
 from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+from nautilus_trader.model.instruments import Equity
+from nautilus_trader.model.objects import Price, Quantity, Money
+from nautilus_trader.model.c_enums import AssetClass, CurrencyType
+from nautilus_trader.model.currencies import USD,EUR
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from ....models.utils import freq2barspec
 #from nautilus_trader.model import Data  # base class for custom data
 
 
 # ------------------------------------------------------------------ #
 # Custom data class
 # ------------------------------------------------------------------ #
-class FeatureBarData(Data):
+class FeatureBarData:
     """
     Carries the *entire* numeric feature vector for one instrument at one
     timestamp.  Stored in the cache so that the model can rebuild the same
@@ -33,7 +40,6 @@ class FeatureBarData(Data):
     __slots__ = ("_instrument", "_ts_event", "_ts_init", "_features")
 
     def __init__(self, instrument: str, ts_event: int, ts_init: int, features: np.ndarray):
-        # CHANGED: Call Data.__init__ with proper timestamp parameters
         self._ts_event = ts_event
         self._ts_init = ts_init
         self._instrument = instrument
@@ -64,18 +70,21 @@ class FeatureBarData(Data):
 class CsvBarLoader:
     def __init__(
         self,
-        root: Path,
-        freq: str,
+        cfg: Dict,
+        venue_name: str="SIM",
         tz: str = "UTC",
         universe: Optional[List[str]] = None,
     ):
+        root = Path(cfg["data_dir"])
+        freq = cfg["freq"]
         self._root = Path(root).expanduser().resolve()
         if not self._root.is_dir():
             raise FileNotFoundError(self._root)
 
         self.freq     = freq
         self.tz       = tz
-        self.bar_type = BarType.from_string(freq.upper())
+        self.venue = Venue(venue_name)
+        self.cfg = cfg
 
         stock_dir = self._root / "stocks"
         bond_dir  = self._root / "bonds"
@@ -89,19 +98,52 @@ class CsvBarLoader:
         )
 
         # parse CSVs once to numeric frames
-        self._frames: Dict[str, pd.DataFrame] = {
-            p.stem.upper(): self._parse_stock_csv(p) for p in self._stock_files
-        }
+        self._frames: Dict[str, pd.DataFrame] = {}
+        self._instruments: Dict[str, Equity] = {}
+        
+        for p in self._stock_files:
+            symbol = p.stem.upper()
+            if symbol in self._universe:
+                df = self._parse_stock_csv(p)
+                self._frames[symbol] = df
+                # Create instrument for each stock
+                self._instruments[symbol] = self._create_equity_instrument(symbol)
         self._yield_series: Optional[pd.Series] = (
             self._parse_rf_csv(self._rf_file) if self._rf_file.exists() else None
         )
 
+    def _create_equity_instrument(self, symbol: str) -> Equity:
+        """Create an Equity instrument for the given symbol."""
+        instrument_id = InstrumentId(
+            symbol=Symbol(symbol),
+            venue=self.venue
+        )
+        
+        return Equity(
+            instrument_id=instrument_id,
+            native_symbol=Symbol(symbol),
+            currency=self.cfg["currency"],
+            price_precision=2,  # Standard for US equities
+            price_increment=Price.from_str("0.01"),
+            lot_size=Quantity.from_int(1),
+            # margin_init=Money(0, USD),  # No margin requirement for cash account
+            # margin_maint=Money(0, USD),
+            # maker_fee=Money(0, USD),    # Fees handled by commission model
+            # taker_fee=Money(0, USD),
+            ts_event=0,
+            ts_init=0,
+        )
     # ------------------------------------------------------------------ #
     # public ----------------------------------------------------------------
     # ------------------------------------------------------------------ #
     @property
     def universe(self) -> List[str]:
         return self._universe
+
+    @property
+    def instruments(self) -> Dict[str, Equity]:
+        """Return all created instruments."""
+        return self._instruments
 
     @property
     def rf_series(self) -> Optional[pd.Series]:
@@ -111,7 +153,7 @@ class CsvBarLoader:
         """
         Yield **two** events per symbol/time-stamp:
             1. FeatureBarData   (all numeric columns)
-            2. Bar              (OHLCV only)
+            2. Bar              (OHLCV with adjusted close)
 
         They share the VERY SAME ts_event so the cache keeps them aligned.
         """
@@ -122,12 +164,17 @@ class CsvBarLoader:
             ts_init = epoch_ns  # Use same as event time for simplicity
 
             for sym in self._universe:
+                if sym not in self._frames:
+                    continue
+                    
                 df = self._frames[sym]
                 if ts not in df.index:
                     continue        # missing bar – universe padding
 
-                row            = df.loc[ts]
+                row = df.loc[ts]
                 numeric_vector = row.values.astype(np.float32)
+                
+                instrument = self._instruments[sym]
 
                 # ---- 1) full-feature object -------------------------
                 yield FeatureBarData(
@@ -137,18 +184,20 @@ class CsvBarLoader:
                     features=numeric_vector,
                 )
 
-                # ---- 2) traditional Bar -----------------------------
-                # Missing columns default to 0.0
+                # ---- 2) traditional Bar with ADJUSTED CLOSE ---------
+                # Always use adjusted close as the close price
                 def _get(col): return float(row[col]) if col in row else 0.0
-                # Fixed Bar constructor parameters
+                
                 yield Bar(
-                    bar_type=self.bar_type,
-                    instrument_id=sym,
-                    open=_get("Open"),
-                    high=_get("High"),
-                    low=_get("Low"),
-                    close=_get("Adj Close") if "Adj Close" in row else _get("Close"),
-                    volume=_get("Volume"),
+                    bar_type=BarType(
+                        instrument_id=instrument.id,
+                        bar_spec= freq2barspec(self.cfg["freq"])),
+                    instrument_id=instrument.id,
+                    open=Price.from_str(f"{_get('Open'):.2f}"),
+                    high=Price.from_str(f"{_get('High'):.2f}"),
+                    low=Price.from_str(f"{_get('Low'):.2f}"),
+                    close=Price.from_str(f"{_get('Adj Close'):.2f}"),  # Always use adjusted close
+                    volume=Quantity.from_int(int(_get('Volume'))),
                     ts_event=epoch_ns,
                     ts_init=ts_init,
                 )
@@ -161,12 +210,16 @@ class CsvBarLoader:
         df.set_index("Date", inplace=True)
         df.sort_index(inplace=True)
 
-        # -- adjusted close --------------------------------------------
+        # Ensure we have adjusted close - compute it if not present
         cols_lc = {c.lower(): c for c in df.columns}
         if "adj close" in cols_lc:
             df.rename(columns={cols_lc["adj close"]: "Adj Close"}, inplace=True)
         else:
             df = self._compute_adj_close(df)
+
+        # Verify we have the adjusted close column
+        if "Adj Close" not in df.columns:
+            raise ValueError(f"Failed to compute adjusted close for {path.stem}")
 
         return df.select_dtypes(include=[np.number])   # keep ALL numeric columns
 
