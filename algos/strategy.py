@@ -75,7 +75,7 @@ class BacktestLongShortStrategy(Strategy):
         # self.universe: List[str] = self.loader.universe
 
 
-        #TODO: to add ["strategy"] as first dimension
+        #TODO: to add cfg["strategy"] as first dimension
 
         # # 3) ---------------- optimiser --------------------------------
         # opt_name = str(self.cfg.get("optimizer", {}).get("name", "max_sharpe")).lower()
@@ -183,7 +183,7 @@ class BacktestLongShortStrategy(Strategy):
             cfg["hparams"] = defaults
         
         # setup universe and ensure enough history for each stock and let universe be universe_mult*n_instruments
-        # model.initialize()
+        # model.initialize(): get universe at the beginning and universe at the end and do set_end - set_beg -> initialize only stocks live at end_t+1. handle case when stock is still not there. ensure all stocks have min last history to be counted
         # set self.now or similar
 
         for sym in self.universe:

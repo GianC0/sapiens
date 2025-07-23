@@ -10,13 +10,13 @@ initial_cash: 20000           # portfolio initial cash                    (portf
 currency: USD
 
 # ---------------------------------------------------------------------------
-#  Calendar – defines the walk-forward split
+#  Calendar 
 # ---------------------------------------------------------------------------
-train_start:    2018-01-01  # First bar used for **Stage-1 factor learning**  (UMI paper §4.1)
-train_end:      2020-12-31  # Last bar of training set
-valid_end:      2021-06-30  # Final bar of validation set (early stopping / Optuna)
-backtest_start: 2021-07-01  # First bar the strategy trades (“live simulation”)
-backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years)
+backtest_start: 2021-07-01  # First bar the strategy trades. 
+train_offset:   6M          # Last bar of training set
+valid_offset:   30B         # Validation set (early stopping / Optuna) if enabled
+test_offset:    30B         # It follows that test_end_date = backtest_start + train_offset [+ valid_offset] + test_offset
+backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= backtest_start + train_offset [+ valid_offset] + test_offset + pred_len
 
 # ---------------------------------------------------------------------------
 #  Universe / data granularity
