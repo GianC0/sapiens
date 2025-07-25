@@ -17,7 +17,8 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import yaml
-
+from nautilus_trader.common.component import init_logging
+from nautilus_trader.common.component import Logger
 from nautilus_trader.common.component import Clock
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.events import OrderFilled
@@ -66,13 +67,41 @@ class BacktestLongShortStrategy(Strategy):
 
         self.cfg = config
 
-        # ---------------- data loader ------------------------------
-        self.loader = CsvBarLoader(
-            cfg=self.cfg,
-        )
+        # ---------------- Universe Management ------------------------------
 
         self.bar_spec = freq2barspec(self.cfg["freq"])
-        # self.universe: List[str] = self.loader.universe
+        self.min_bars_required = self.cfg["batch_size"]
+        self.walkfwd_start = self.cfg["walkfwd_start"]
+        loader = CsvBarLoader(cfg=self.cfg)
+        candidate_universe = loader.universe
+        
+        selected = []
+        
+        for ticker in candidate_universe:
+            if ticker not in loader._frames:
+                continue
+                
+            df = loader._frames[ticker]
+            
+            # Check 1: Has enough historical data before train_end
+            train_data = df[df.index < walkfwd_start ]
+            if len(train_data) < self.min_bars_required:
+                #TODO: implement proper nautilus logger
+                print(f"[Universe] Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
+                continue
+                
+            # Check 2: Active at test start (has data around test start)
+            test_window = df[(df.index >= self.test_start - pd.DateOffset(days=5)) & 
+                           (df.index <= self.test_start + pd.DateOffset(days=5))]
+            if len(test_window) == 0:
+                #TODO: implement proper nautilus logger
+                print(f"[Universe] Skipping {ticker}: not active at test start")
+                continue
+                
+            selected.append(ticker)
+            
+        print(f"[Universe] Selected {len(selected)} from {len(candidate_universe)} candidates")
+        self.universe=sorted(selected)
 
 
         #TODO: to add cfg["strategy"] as first dimension
@@ -132,6 +161,8 @@ class BacktestLongShortStrategy(Strategy):
             interval=freq2pdoffset(self.cfg["retrain_delta"]),  # Timer interval
             callback=self.on_retrain,  # Custom callback function invoked on timer
         )
+
+        
 
         # INITIAL MODEL TRAINING STEPS
         # setup train dataset, with start/end date

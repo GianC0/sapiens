@@ -91,14 +91,14 @@ class CsvBarLoader:
         self._stock_files = sorted(stock_dir.glob("*.csv"))
         self._rf_file     = bond_dir / "DGS10.csv"
 
-        self._universe = (
+        self._universe: List[str] = (
             universe
             if universe is not None
             else [p.stem.upper() for p in self._stock_files]
-        )
+        )   
 
         # parse CSVs once to numeric frames
-        self._frames: Dict[str, pd.DataFrame] = {}
+        self._frames: Dict[str, pd.DataFrame] = {}    
         self._instruments: Dict[str, Equity] = {}
         
         for p in self._stock_files:

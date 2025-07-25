@@ -30,16 +30,16 @@ dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+u
 #  Training schedule & hyper-param search
 # ---------------------------------------------------------------------------
 training:
-  tune_hparams:   false       # Use Optuna Bayesian search                 
-  n_trials:       20          # #Optuna trials for each run
-  n_epochs:       20          # Full epochs on train+valid after tuning
-  batch_size:     64          # Mini-batch size for AdamW                 
-  training_mode:  sequential  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain) → Stage-1 + Stage-2
-  pretrain_epochs: 5          # Stage-1 warm-up epochs in hybrid mode
-  patience:       10          # Early-stop patience 
-  warm_start:          true   # Enable warm-start                           (common in finance live rolls)
-  warm_training_epochs: 5     # Light fine-tune epochs
-  retrain_delta:  30B          # Retrain every (30 * freq) bars
+  tune_hparams:    false       # Use Optuna Bayesian search                 
+  n_trials:        20          # #Optuna trials for each run
+  n_epochs:        20          # Full epochs on train+valid after tuning
+  batch_size:      64          # Mini-batch size for AdamW                 
+  training_mode:   sequential  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain) → Stage-1 + Stage-2
+  pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
+  patience:        10          # Early-stop patience 
+  warm_start:      true        # Enable warm-start                           (common in finance live rolls)
+  warm_training_epochs: 5      # Light fine-tune epochs
+  retrain_delta:   30B         # Retrain every (30 * freq) bars
 
 
 

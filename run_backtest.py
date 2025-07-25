@@ -7,6 +7,7 @@ import argparse
 from pathlib import Path
 import yaml
 import pandas as pd
+from pandas.tseries.frequencies import to_offset
 
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.data import BacktestDataConfig
@@ -15,19 +16,46 @@ from nautilus_trader.config import BacktestRunConfig, BacktestEngineConfig
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model import Bar
 from nautilus_trader.model.enums import OmsType, AccountType
+from models.utils import freq2barspec, freq2pdoffset
 
 
 from algos.strategy import BacktestLongShortStrategy
 from algos.engine.hparam_tuner import OptunaHparamsTuner, split_hparam_cfg
 from algos.engine.data_loader import CsvBarLoader
 from models.umi import UMIModel
-from model.utils import freq2barspec
 from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm
 
 def main():
     # loads configuration file
     cfg_path = Path("configs/config.yaml")  # CHANGED: Fixed config filename
     cfg = yaml.safe_load(cfg_path.read_text())
+
+    # Calculate proper date ranges
+    backtest_start = pd.Timestamp(cfg["backtest_start"], tz="UTC")
+    train_offset = freq2pdoffset(cfg["train_offset"])
+    valid_offset = freq2pdoffset(cfg["valid_offset"]) 
+    test_offset = freq2pdoffset(cfg["test_offset"])
+    backtest_end = pd.Timestamp(cfg["backtest_end"], tz="UTC")
+    pred_offset = freq2pdoffset(cfg["freq"])*int(cfg["pred_len"])
+
+    # Calculate key dates
+    train_end = backtest_start + train_offset
+    valid_end = train_end
+    if cfg["training"]["tune_hparams"]:
+        valid_end += valid_offset
+    test_end = valid_end + test_offset
+    
+    # Update config with calculated dates
+    cfg["train_start"] = backtest_start
+    cfg["train_end"] = train_end.strftime("%Y-%m-%d")
+    cfg["valid_start"] = cfg["train_end"] + to_offset("1ns") #ensures dataset segregation 
+    cfg["valid_end"] = valid_end.strftime("%Y-%m-%d")#
+    cfg["train start"] = cfg["valid_end"] + to_offset("1ns")
+    cfg["test_end"] = test_end.strftime("%Y-%m-%d")
+    cfg["walkfwd_start"] = cfg["test_end"] + to_offset("1ns")
+    cfg["pred_offset"] = pred_offset
+
+    assert backtest_end >= cfg["walkfwd_start"] + pred_offset
 
     # --- engine bootstrap --------------------------------------------
     start = pd.Timestamp(cfg["backtest_start"], tz="UTC")
@@ -87,14 +115,15 @@ def main():
     for bar_or_feature in loader.bar_iterator():
         # Only add Bar objects to the engine (skip FeatureBarData)
         if isinstance(bar_or_feature, Bar):
-            engine.add_data(bar_or_feature)
-            bar_count += 1
-            
-            # Progress indicator
-            if bar_count % 10000 == 0:
-                print(f"  Loaded {bar_count} bars...")
-    
-    print(f"[DATA] Loaded {bar_count} total bars")
+            bar_ts = pd.Timestamp(bar_or_feature.ts_event, unit='ns', tz='UTC')
+            # Only include bars in our date range
+            if backtest_start <= bar_ts <= backtest_end:
+                engine.add_data(bar_or_feature)
+                bar_count += 1
+                
+                # Progress indicator
+                if bar_count % 10000 == 0:
+                    print(f"  Loaded {bar_count} bars...")
 
 
     # --- run ----------------------------------------------------------
