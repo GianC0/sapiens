@@ -25,14 +25,15 @@ freq: 1B                      # 1 business-day bars ( offset )
 window_len: 60                # L : look-back window length (UMI paper)   (sliding-window features)
 pred_len:   1                 # H : prediction horizon (next bar)         (one-step forecast)
 dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+univers_mult (in this case ↑20%)       
+feature_dim: 5                # OHLCV + extra features for L1 market data. To be changed if higher level data is avail
 
 # ---------------------------------------------------------------------------
 #  Training schedule & hyper-param search
 # ---------------------------------------------------------------------------
 training:
   tune_hparams:    false       # Use Optuna Bayesian search                 
-  n_trials:        20          # #Optuna trials for each run
-  n_epochs:        20          # Full epochs on train+valid after tuning
+  n_trials:        20          # Optuna trials for each run
+  n_epochs:        20          # Epochs on train+valid after hp tuning and rolling initialization
   batch_size:      64          # Mini-batch size for AdamW                 
   training_mode:   sequential  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain) → Stage-1 + Stage-2
   pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode

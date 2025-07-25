@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
-
+from pandas import DataFrame
      
 
 # --------------------------------------------------------------------------- #
@@ -40,10 +40,10 @@ class UMIModel(nn.Module):
         feature_dim: int,
         window_len: int,
         pred_len: int,
-        end_train: str,
-        end_valid: str,
-        retrain_delta: pd.DateOffset = pd.DateOffset(days=30),
-        dynamic_universe_mult: float | int = 2,
+        train_end: str,
+        valid_end: str,
+        #retrain_delta: pd.DateOffset = pd.DateOffset(days=30),
+        #dynamic_universe_mult: float | int = 2,
         n_epochs: int = 20,
         batch_size: int = 64,
         training_mode: str="sequential",    # hybrid/sequential:
@@ -68,11 +68,13 @@ class UMIModel(nn.Module):
         # time parameters
         self.freq           = freq                                                                 # e.g. "1d", "15m", "1h"  
         self.pred_len    = pred_len                                                                # number of bars to predict
-        self.retrain_delta  = retrain_delta                                                        # time delta for retraining 
-        self.end_train      = pd.to_datetime(end_train, utc=True)                                  # end of training date
-        self.end_valid      = pd.to_datetime(end_valid, utc=True)                                  # end of validation date
-        self.bt_end         = pd.to_datetime(bt_end, utc=True)                                     # end of back-test date (optional)
-        self._last_fit_time = None                                                                 # last time fit() was called
+        
+        # these should be managed by the TRADING STRATEGY, no by model.
+        #self.retrain_delta  = retrain_delta                                                        # time delta for retraining 
+        self.train_end      = pd.to_datetime(train_end, utc=True)                                  # end of training date
+        self.valid_end      = pd.to_datetime(valid_end, utc=True)                                  # end of validation date
+        #self.bt_end         = pd.to_datetime(bt_end, utc=True)                                     # end of back-test date (optional)
+        #self._last_fit_time = None                                                                 # last time fit() was called
         
 
         # model parameters
@@ -91,9 +93,11 @@ class UMIModel(nn.Module):
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
         # stock universe
-        self._universe: list[str] = []                                                              # stable “slot → ticker” mapping
-        self.universe_mult = max(1, int(dynamic_universe_mult))                                     # over-allocation factor for dynamic universe
-        self.close_idx = close_idx                                                                  # usually "close" is at index 3 in the dataframes
+        #self._universe: list[str] = []                                                              # stable “slot → ticker” mapping
+        #self.universe_mult = max(1, int(dynamic_universe_mult))                                     # over-allocation factor for dynamic universe
+        
+        # TODO: to change to target index
+        #self.close_idx = close_idx                                                                  # usually "close" is at index 3 in the dataframes
         
         # training parameters
         self._is_initialized = False
@@ -106,7 +110,7 @@ class UMIModel(nn.Module):
         self._global_epoch = 0                                                                      # global epoch counter for stats
 
 
-    def initialize(self, data: Cache, **kwargs) -> None:
+    def initialize(self, data: Dict[str, DataFrame], **kwargs) -> None:
 
         assert self._is_initialized == False
         """
@@ -131,8 +135,8 @@ class UMIModel(nn.Module):
         self._build_submodules()
 
         # Create train/valid split
-        train_mask = idx <= self.end_train
-        valid_mask = (idx > self.end_train) & (idx <= self.end_valid)
+        train_mask = idx <= self.train_end
+        valid_mask = (idx > self.train_end) & (idx <= self.valid_end)
         
         ds_train = SlidingWindowDataset(panel[train_mask], active[:, train_mask], self.L, self.pred_len, close_idx=self.close_idx)
         ds_valid = SlidingWindowDataset(panel[valid_mask], active[:, valid_mask] ,self.L, self.pred_len, close_idx=self.close_idx)
@@ -174,10 +178,10 @@ class UMIModel(nn.Module):
             if latest_ts:
                 latest = pd.Timestamp(latest_ts, unit='ns', tz='UTC')
                 # Shift windows forward
-                train_period = self.end_valid - self.end_train
-                self.end_valid = latest
-                self.end_train = self.end_valid - train_period
-                print(f"[fit] Updated windows - train_end: {self.end_train}, valid_end: {self.end_valid}")
+                train_period = self.valid_end - self.train_end
+                self.valid_end = latest
+                self.train_end = self.valid_end - train_period
+                print(f"[fit] Updated windows - train_end: {self.train_end}, valid_end: {self.valid_end}")
     
             # Reinitialize with new windows
             self._is_initialized = False
@@ -212,11 +216,11 @@ class UMIModel(nn.Module):
         current_time = self._clock()
         if self._last_fit_time:
             time_shift = current_time - self._last_fit_time
-            self.end_train = self.end_train + time_shift
-            self.end_valid = self.end_valid + time_shift
+            self.train_end = self.train_end + time_shift
+            self.valid_end = self.valid_end + time_shift
 
-        train_mask = idx <= self.end_train
-        valid_mask = (idx > self.end_train) & (idx <= self.end_valid)
+        train_mask = idx <= self.train_end
+        valid_mask = (idx > self.train_end) & (idx <= self.valid_end)
         
         ds_train = SlidingWindowDataset(
             panel[train_mask], active[:, train_mask],
@@ -281,8 +285,8 @@ class UMIModel(nn.Module):
         _, active, idx = _build_panel(data_dict, universe=self._universe)
         new_mask = active[:, -1]                       # (I_active_now) mask for stocks that are live NOW
         latest = idx[-1]
-        self.end_valid = latest
-        self.end_train = self.end_valid - pd.DateOffset(months=6)
+        self.valid_end = latest
+        self.train_end = self.valid_end - pd.DateOffset(months=6)
         pad = self.I - new_mask.size(0)
         if pad:
             new_mask = torch.cat([new_mask, torch.zeros(pad, dtype=torch.bool)])
@@ -374,7 +378,7 @@ class UMIModel(nn.Module):
     # --------------------------------------------------------------------------- #
     #  Utility : build a panel tensor from the {stockID: dataframe} dict        #
     # --------------------------------------------------------------------------- #
-    def _build_panel(data: Cache, lookback: int) -> torch.Tensor:
+    def _build_panel(data_dict: Dict[str, DataFrame], lookback: int) -> torch.Tensor:
         """
         Returns training data tensor of shape (T, I, F) sorted by timestamp ascending &
         stocks alphabetically.
@@ -384,21 +388,11 @@ class UMIModel(nn.Module):
         idx    : DatetimeIndex (UTC)
         """
 
-        # Convert data source
-        assert isinstance(data, Cache)
-        data_dict = cache_to_dict(
-            data,
-            tickers=sorted(data.instruments()),
-            lookback=lookback,  # Get all available data
-            bar_type=self.bar_type, # TODO: No bar type
-        )
         
         # Set universe
         universe = sorted(data_dict.keys())
-        print(f"[initialize] Universe: {len(self._universe)} stocks")
+        print(f"[initialize] Universe: {len(universe)} stocks")
         
-
-        keys = universe if universe is not None else sorted(data_dict)
         
         # --- harmonise indices -------------------------------------------------
         for k, df in data_dict.items():
@@ -406,21 +400,20 @@ class UMIModel(nn.Module):
                 df.set_index("Date", inplace=True)
             df.index = pd.to_datetime(df.index, utc=True)  
 
-        feature_cols = data_dict[keys[0]].columns          # all numeric + tech-indicators
-        long = pd.concat([df[feature_cols].assign(stock=k) for k, df in data_dict.items()])
+        long = pd.concat([df[self.feature_dim].assign(stock=k) for k, df in data_dict.items()])
 
         # ---------- proper pivot ---------------------------------------------- #
         df_pivot = long.pivot_table(
-            values=feature_cols,      # every feature
-            index=long.index,         #
+            values=self.feature_dim,      # every feature
+            index=long.index,             
             columns="stock"
         ).sort_index()
 
         #  re-index columns ⇢ fill missing tickers with NaN so slots
         if universe is not None:
-            df_pivot = df_pivot.reindex( pd.MultiIndex.from_product([feature_cols, keys]), axis=1 )
+            df_pivot = df_pivot.reindex( pd.MultiIndex.from_product([self.feature_dim, keys]), axis=1 )
 
-        T, F, I = len(df_pivot), len(feature_cols), len(keys)
+        T, F, I = len(df_pivot), len(self.feature_dim), len(keys)
         values = torch.tensor(df_pivot.values, dtype=torch.float32)
         tensor = values.reshape(T, F, I).permute(0,2,1) # (T,I,F)
         active = torch.isfinite(tensor).all(-1).transpose(0,1) # (I,T)
@@ -509,8 +502,8 @@ class UMIModel(nn.Module):
         # some model params information
         some = dict(
             freq=self.freq, feature_dim=self.F, window_len=self.L,
-            pred_len=self.pred_len, end_train=str(self.end_train),
-            end_valid=str(self.end_valid), n_epochs=self.n_epochs,
+            pred_len=self.pred_len, train_end=str(self.train_end),
+            valid_end=str(self.valid_end), n_epochs=self.n_epochs,
             dynamic_universe_mult=self.universe_mult, total_params=total_p,
             approx_size_mb=round(total_b / 1024 / 1024, 3),
         )
@@ -800,7 +793,7 @@ class UMIModel(nn.Module):
 #         raise ValueError("No data directory provided. Use --data-dir to specify the path to the data.")
 
     
-#     clock = SimClock(pd.Timestamp(args.end_valid, tz="UTC"))
+#     clock = SimClock(pd.Timestamp(args.valid_end, tz="UTC"))
 
 #     # ---------- build & fit -----------------------------------------
 #     # Each SLURM array task sees exactly one GPU thanks to CUDA_VISIBLE_DEVICES
@@ -809,8 +802,8 @@ class UMIModel(nn.Module):
 #         feature_dim=len(next(iter(data_dict.values())).columns),
 #         window_len=args.window_len,
 #         pred_len=args.pred_len,
-#         end_train=args.end_train,
-#         end_valid=args.end_valid,
+#         train_end=args.train_end,
+#         valid_end=args.valid_end,
 #         n_epochs=args.n_epochs,     # then trains for n_epochs
 #         batch_size=args.batch_size,
 #         retrain_delta=pd.DateOffset(days=args.retrain_delta),    # to modify if wanted hours or minutes

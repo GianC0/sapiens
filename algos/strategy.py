@@ -13,7 +13,7 @@ import math
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
-
+from pandas.tseries.frequencies import to_offset
 import numpy as np
 import pandas as pd
 import yaml
@@ -66,42 +66,59 @@ class BacktestLongShortStrategy(Strategy):
         super().__init__()  
 
         self.cfg = config
+        
+        # Core timing parameters
+        self.backtest_start = pd.Timestamp(self.cfg["backtest_start"], tz="UTC")
+        self.backtest_end = pd.Timestamp(self.cfg["backtest_end"], tz="UTC")
+        self.train_end = pd.Timestamp(self.cfg["train_end"], tz="UTC")
+        self.valid_end = pd.Timestamp(self.cfg["valid_end"], tz="UTC")
+        self.test_end = pd.Timestamp(self.cfg["test_end"], tz="UTC")
+        self.walkfwd_start = pd.Timestamp(self.cfg["walkfwd_start"], tz="UTC")
+        self.pred_offset = to_offset(cfg["pred_offset"])
+        self.pred_len = int(cfg["pred_len"])
 
-        # ---------------- Universe Management ------------------------------
-
+        # Model and data parameters
+        self.model_name = self.cfg["model_name"]
+        self.bar_type = None  # Set in on_start
         self.bar_spec = freq2barspec(self.cfg["freq"])
-        self.min_bars_required = self.cfg["batch_size"]
-        self.walkfwd_start = self.cfg["walkfwd_start"]
-        loader = CsvBarLoader(cfg=self.cfg)
-        candidate_universe = loader.universe
+        self.min_bars_required = self.cfg["window_len"] + self.cfg["pred_len"] + 100  # Safety margin
         
-        selected = []
+        # State tracking
+        self.universe: List[str] = []  # Active universe
+        self.model: Optional[MarketModel] = None
+        self._last_prediction_time: Optional[pd.Timestamp] = None
+        self._position_qty: Dict[str, float] = {}  # Track position quantities
         
-        for ticker in candidate_universe:
-            if ticker not in loader._frames:
-                continue
+        # Loader for data access
+        self.loader = CsvBarLoader(cfg=self.cfg)
+        
+        # selected = []
+        
+        # for ticker in candidate_universe:
+        #     if ticker not in loader._frames:
+        #         continue
                 
-            df = loader._frames[ticker]
+        #     df = loader._frames[ticker]
             
-            # Check 1: Has enough historical data before train_end
-            train_data = df[df.index < walkfwd_start ]
-            if len(train_data) < self.min_bars_required:
-                #TODO: implement proper nautilus logger
-                print(f"[Universe] Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
-                continue
+        #     # Check 1: Has enough historical data before train_end
+        #     train_data = df[df.index < walkfwd_start ]
+        #     if len(train_data) < self.min_bars_required:
+        #         #TODO: implement proper nautilus logger
+        #         print(f"[Universe] Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
+        #         continue
                 
-            # Check 2: Active at test start (has data around test start)
-            test_window = df[(df.index >= self.test_start - pd.DateOffset(days=5)) & 
-                           (df.index <= self.test_start + pd.DateOffset(days=5))]
-            if len(test_window) == 0:
-                #TODO: implement proper nautilus logger
-                print(f"[Universe] Skipping {ticker}: not active at test start")
-                continue
+        #     # Check 2: Active at test start (has data around test start)
+        #     test_window = df[(df.index >= self.test_start - pd.DateOffset(days=5)) & 
+        #                    (df.index <= self.test_start + pd.DateOffset(days=5))]
+        #     if len(test_window) == 0:
+        #         #TODO: implement proper nautilus logger
+        #         print(f"[Universe] Skipping {ticker}: not active at test start")
+        #         continue
                 
-            selected.append(ticker)
+        #     selected.append(ticker)
             
-        print(f"[Universe] Selected {len(selected)} from {len(candidate_universe)} candidates")
-        self.universe=sorted(selected)
+        # print(f"[Universe] Selected {len(selected)} from {len(candidate_universe)} candidates")
+        # self.universe=sorted(selected)
 
 
         #TODO: to add cfg["strategy"] as first dimension
@@ -142,7 +159,20 @@ class BacktestLongShortStrategy(Strategy):
     def on_start(self): 
         """Initialize strategy."""
 
-        # assert now + freq2pdoffset(self.cfg["holdout"] < now + pred_len 
+        # Select universe based on stocks active at walk-forward start with enough history
+        self._select_universe()
+
+        # Subscribe to bars for selected universe
+        for instrument in self.loader.instruments.values():
+            if instrument.id.symbol.value in self.universe:
+                self.bar_type = BarType(
+                    instrument_id=instrument.id,
+                    bar_spec=self.bar_spec
+                )
+                self.subscribe_bars(self.bar_type)
+
+        # Build and initialize model
+        self._initialize_model()
 
         self.clock.set_timer(
             name="update_timer",  
@@ -310,8 +340,73 @@ class BacktestLongShortStrategy(Strategy):
 
 
     # ================================================================= #
-    # internal helpers
+    # INTERNAL HELPERS
     # ================================================================= #
+
+    def _select_universe(self):
+        """Select stocks active at walk-forward start with sufficient history."""
+        candidate_universe = self.loader.universe
+        selected = []
+        
+        for ticker in candidate_universe:
+            if ticker not in self.loader._frames:
+                continue
+                
+            df = self.loader._frames[ticker]
+            
+            # Check 1: Has enough historical data before walk-forward start
+            train_data = df[df.index < self.walkfwd_start]
+            if len(train_data) < self.min_bars_required:
+                self.log.info(f"Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
+                continue
+            
+            # Check 2: Active at walk-forward start (has data within 5 days)
+            pred_window = df[(df.index >= self.walkfwd_start) ]
+            if len(pred_window) < self.pred_len :
+                self.log.info(f"Skipping {ticker}: not active at walk-forward start")
+                continue
+                
+
+                
+            selected.append(ticker)
+            
+        self.log.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates")
+        self.universe = sorted(selected)
+
+    def _initialize_model(self):
+        """Build and initialize the model."""
+        # Import model class dynamically
+        mod = importlib.import_module(f"models.{self.model_name}.{self.model_name}")
+        ModelCls = getattr(mod, f"{self.model_name}Model", None) or getattr(mod, "Model")
+        if ModelCls is None:
+            raise ImportError(f"Could not find model class in models.{self.model_name}")
+            
+        
+        # Initialize model with proper parameters
+        self.model = ModelCls(
+            freq=self.cfg["freq"],
+            feature_dim=self.cfg["feature_dim"],
+            window_len=self.cfg["window_len"],
+            pred_len=self.cfg["pred_len"],
+            train_end=self.train_end,
+            valid_end=self.valid_end,
+            batch_size=self.cfg["training"]["batch_size"],
+            retrain_delta=freq2pdoffset(self.cfg["training"]["retrain_delta"]),
+            dynamic_universe_mult=self.cfg["dynamic_universe_mult"],
+            logger=self.log,  # Pass logger to model
+            **self.cfg.get("hparams", {})
+        )
+        
+        # Prepare initial training data (only universe stocks)
+        train_data = {
+            ticker: self.loader._frames[ticker][(self.loader._frames[ticker].index <= self.valid_end) & (self.loader._frames[ticker].index >= self.backtest_start) ]
+            for ticker in self.universe
+        }
+        
+        # Initialize model
+        self.model.initialize(train_data)
+
+
     # ----- model factory ----------------------------------------------
     def _build_model(self) -> MarketModel:
         name = str(self.cfg["model_name"]).lower()
