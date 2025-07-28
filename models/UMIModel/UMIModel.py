@@ -10,6 +10,8 @@
 #
 ###############################################################################
 
+# TODO: CLOCK LOGIC TO BE REMOVED self._clock()
+
 import os, math, json, shutil, datetime as dt
 from pathlib import Path
 from typing import Dict, Optional, Any, Callable, Union
@@ -46,16 +48,17 @@ class UMIModel(nn.Module):
         #dynamic_universe_mult: float | int = 2,
         n_epochs: int = 20,
         batch_size: int = 64,
+        patience:int=10,
+        pretrain_epochs:int=5,
         training_mode: str="sequential",    # hybrid/sequential:
                                             # hybrid -> stage1 factors for few epochs, then stage2 altogether
                                             # sequential -> stage1 first until early stopping, then stage2
-        pretrain_epochs:int=5,
-        patience:int=10,       
-        close_idx: int = 3,  # usually "close" is at index 3       
-        model_dir: Path = Path("models/UMIModel"),
-        data_dir: Path = Path("data/stocks"),
+        close_idx: int = 3,  # usually "close" is at index 3
         warm_start : bool= False,
         warm_training_epochs: int = 5,
+        data_dir: Path = Path("data/stocks"),
+        model_dir: Path = Path("logs/UMIModel"),
+        logger: Optional[Any] = None,
         **hparams,
     ):
 
@@ -83,21 +86,19 @@ class UMIModel(nn.Module):
         self.n_epochs       = n_epochs                                                             # number of epochs for training
         self.pretrain_epochs = pretrain_epochs                                                     # epochs for Stage-1 pre-training (hybrid mode)
         self.training_mode = training_mode                                                         # "hybrid" or "sequential"
-        self.data_dir       = data_dir                                                             # directory where the data is stored
-        ts    = self._clock().strftime("%Y-%m-%dT%H-%M-%S")                                        # timestamp to use for model directory
+        self.data_dir       = data_dir                                                             # directory where the data is stored       
         hp_id =   f"lamic{hparams.get('lambda_ic',0):.3f}_"\
                 + f"lamsync{hparams.get('lambda_sync',0):.3f}_"\
                 + f"lamrankic{hparams.get('lambda_rankic',0):.3f}"\
                 + f"syncthres{hparams.get('sync_thr',0):.3f}"
-        self.model_dir = (model_dir / freq / f"{ts}_{hp_id}").resolve()                             # model directory with timestamp and hparams
+        self.model_dir = (model_dir / freq / f"{hp_id}").resolve()                             # model directory with timestamp and hparams
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
         # stock universe
         #self._universe: list[str] = []                                                              # stable “slot → ticker” mapping
         #self.universe_mult = max(1, int(dynamic_universe_mult))                                     # over-allocation factor for dynamic universe
         
-        # TODO: to change to target index
-        #self.close_idx = close_idx                                                                  # usually "close" is at index 3 in the dataframes
+        self.close_idx = close_idx                                                                  # usually "close" is at index 3 in the dataframes
         
         # training parameters
         self._is_initialized = False
@@ -166,7 +167,7 @@ class UMIModel(nn.Module):
         One-off training (train + valid).
         """
 
-        if !warm_start:
+        if not warm_start:
             # Update training windows to latest data
             assert isinstance(data, Cache)
             # Get latest timestamp from cache
@@ -504,7 +505,8 @@ class UMIModel(nn.Module):
             freq=self.freq, feature_dim=self.F, window_len=self.L,
             pred_len=self.pred_len, train_end=str(self.train_end),
             valid_end=str(self.valid_end), n_epochs=self.n_epochs,
-            dynamic_universe_mult=self.universe_mult, total_params=total_p,
+            #dynamic_universe_mult=self.universe_mult, 
+            total_params=total_p,
             approx_size_mb=round(total_b / 1024 / 1024, 3),
         )
         # adding hparams

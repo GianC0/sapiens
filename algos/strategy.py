@@ -76,6 +76,7 @@ class BacktestLongShortStrategy(Strategy):
         self.walkfwd_start = pd.Timestamp(self.cfg["walkfwd_start"], tz="UTC")
         self.pred_offset = to_offset(cfg["pred_offset"])
         self.pred_len = int(cfg["pred_len"])
+        self.retrain_delta = pd.DateOffset(days=cfg["training"]["retrain_delta"])
 
         # Model and data parameters
         self.model_name = self.cfg["model_name"]
@@ -188,7 +189,7 @@ class BacktestLongShortStrategy(Strategy):
 
         self.clock.set_timer(
             name="retrain_timer",  
-            interval=freq2pdoffset(self.cfg["retrain_delta"]),  # Timer interval
+            interval=self.retrain_delta,  # Timer interval
             callback=self.on_retrain,  # Custom callback function invoked on timer
         )
 
@@ -198,50 +199,7 @@ class BacktestLongShortStrategy(Strategy):
         # setup train dataset, with start/end date
         loader     = CsvBarLoader(cfg=cfg, venue_name="SIM")
         data_dict  = loader._frames
-        ### SETUP HPARAMS TUNING
-        # pulls defaults and hparams search space from cfg file
-        defaults, search_space = split_hparam_cfg(cfg["hparams"])
-        if cfg["training"]["tune_hparams"]:
-            print("[HPO] Optuna search started …")
 
-
-
-            # CHANGED: Create clock function to pass to model
-            def clock_fn():
-                return pd.Timestamp.utcnow()
-
-            fixed = dict(
-                freq        = cfg["freq"],
-                feature_dim = len(next(iter(data_dict.values())).columns),
-                window_len  = cfg["window_len"],
-                pred_len    = cfg["pred_len"],
-                end_train   = cfg["train_end"],
-                end_valid   = cfg["valid_end"],
-                batch_size  = cfg["training"]["batch_size"],
-                retrain_delta = pd.DateOffset(days=cfg["training"]["retrain_delta"]),
-                dynamic_universe_mult = cfg["dynamic_universe_mult"],
-                data_dir    = Path(cfg["data_dir"]),
-                bar_spec    = freq2barspec(cfg["freq"]) # TODO: doublecheck if necessary
-                **defaults,
-            )
-
-            tuner = OptunaHparamsTuner(   # TODO: check training logic and if can rigthly start to trade
-                model_name  = cfg["model_name"],
-                logs_dir    = Path(cfg.get("logs_dir", "logs")),
-                model_cls   = UMIModel,
-                train_dict  = data_dict,
-                search_space= search_space,
-                defaults    = defaults, 
-                fixed_kwargs= fixed,
-                fit_kwargs  = dict(n_epochs=cfg["training"]["n_epochs"]),
-                study_name  = f"{model_name}_hpo",  
-                n_trials    = cfg["training"]["n_trials"],
-            )
-            best = tuner.optimize()
-            cfg["hparams"] = {**defaults, **best["params"]}
-            print(f"Optuna tuning complete. Best hparams: {best["params"]}")
-        else:
-            cfg["hparams"] = defaults
         
         # setup universe and ensure enough history for each stock and let universe be universe_mult*n_instruments
         # model.initialize(): get universe at the beginning and universe at the end and do set_end - set_beg -> initialize only stocks live at end_t+1. handle case when stock is still not there. ensure all stocks have min last history to be counted
@@ -377,13 +335,21 @@ class BacktestLongShortStrategy(Strategy):
         """Build and initialize the model."""
         # Import model class dynamically
         mod = importlib.import_module(f"models.{self.model_name}.{self.model_name}")
-        ModelCls = getattr(mod, f"{self.model_name}Model", None) or getattr(mod, "Model")
-        if ModelCls is None:
+        ModelClass = getattr(mod, f"{self.model_name}", None) or getattr(mod, "Model")
+        if ModelClass is None:
             raise ImportError(f"Could not find model class in models.{self.model_name}")
-            
         
-        # Initialize model with proper parameters
-        self.model = ModelCls(
+        # Prepare initial training data (only universe stocks)
+        train_data = {
+            ticker: self.loader._frames[ticker][(self.loader._frames[ticker].index <= self.valid_end) & (self.loader._frames[ticker].index >= self.backtest_start) ]
+            for ticker in self.universe
+        }
+
+        #create loader for test and valid
+        
+
+
+        model_params = Dict(
             freq=self.cfg["freq"],
             feature_dim=self.cfg["feature_dim"],
             window_len=self.cfg["window_len"],
@@ -391,17 +357,69 @@ class BacktestLongShortStrategy(Strategy):
             train_end=self.train_end,
             valid_end=self.valid_end,
             batch_size=self.cfg["training"]["batch_size"],
-            retrain_delta=freq2pdoffset(self.cfg["training"]["retrain_delta"]),
-            dynamic_universe_mult=self.cfg["dynamic_universe_mult"],
+            n_epochs=self.cfg["training"]["n_epochs"],
+            patience=self.cfg["training"]["patience"],
+            pretrain_epochs=self.cfg["training"]["pretrain_epochs"],
+            training_mode=self.cfg["training"]["training_mode"],
+            close_idx=self.cfg["training"]["target_idx"],
+            warm_start=self.cfg["training"]["warm_start"],
+            warm_training_epochs=self.cfg["training"]["warm_training_epochs"],
+            data_dir=self.cfg["training"]["data_dir"],
+            logger=self.log,  # Pass logger to model
+
+        ) 
+
+        
+        ### SETUP HPARAMS TUNING
+        defaults, search_space = split_hparam_cfg(self.cfg["hparams"])
+        n_trials = self.cfg["training"]["n_trials"]
+        # ensure hparams tuning is not running when 
+        if not self.cfg["training"]["tune_hparams"]:
+            self.log.info("[HPO] Optuna search DISABLED …")
+            search_space = None
+            n_trials = 1
+
+        tuner = OptunaHparamsTuner(   # TODO: check training logic and if can rigthly start to trade
+            model_name  = self.cfg["model_name"],
+            ModelClass   = ModelClass,
+            start = self.backtest_start.strftime('%Y-%m-%d %X'),
+            end = self.test_end.strftime('%Y-%m-%d %X'),
+            logs_dir    = Path(self.cfg.get("logs_dir", "logs")),
+            train_dict  = train_data,
+            model_params= model_params,
+            defaults    = defaults,           # default values of hparams
+            search_space= search_space,       # search sapce of hparams
+            n_trials    = n_trials,
+        )
+        best = tuner.optimize()
+
+        #TODO separate best hparams from normal params
+        cfg["hparams"] = {**defaults, **best["params"]}
+        print(f"Optuna tuning complete. Best hparams: {best["params"]}")
+
+        # Initialize model with proper parameters
+        self.model = ModelClass(
+            freq=self.cfg["freq"],
+            feature_dim=self.cfg["feature_dim"],
+            window_len=self.cfg["window_len"],
+            pred_len=self.cfg["pred_len"],
+            train_end=self.train_end,
+            valid_end=self.test_end,
+            batch_size=self.cfg["training"]["batch_size"],
+            n_epochs=self.cfg["training"]["n_epochs"],
+            patience=self.cfg["training"]["patience"],
+            pretrain_epochs=self.cfg["training"]["pretrain_epochs"],
+            training_mode=self.cfg["training"]["training_mode"],
+            close_idx=self.cfg["training"]["target_idx"],
+            warm_start=self.cfg["training"]["warm_start"],
+            warm_training_epochs=self.cfg["training"]["warm_training_epochs"],
+            data_dir=self.cfg["training"]["data_dir"],
+            model_dir=,
             logger=self.log,  # Pass logger to model
             **self.cfg.get("hparams", {})
         )
         
-        # Prepare initial training data (only universe stocks)
-        train_data = {
-            ticker: self.loader._frames[ticker][(self.loader._frames[ticker].index <= self.valid_end) & (self.loader._frames[ticker].index >= self.backtest_start) ]
-            for ticker in self.universe
-        }
+
         
         # Initialize model
         self.model.initialize(train_data)
@@ -411,14 +429,14 @@ class BacktestLongShortStrategy(Strategy):
     def _build_model(self) -> MarketModel:
         name = str(self.cfg["model_name"]).lower()
         mod = importlib.import_module(f"models.{name}.{name}")
-        ModelCls = getattr(mod, "Model", None) or getattr(mod, f"{name.upper()}Model")
-        if ModelCls is None:
+        ModelClass = getattr(mod, "Model", None) or getattr(mod, f"{name.upper()}Model")
+        if ModelClass is None:
             raise ImportError(f"models.{name}.{name} must export a Model class")
         
         
         first_df = next(iter(self.loader._frames.values()))
         
-        model: MarketModel = ModelCls(
+        model: MarketModel = ModelClass(
             freq=self.cfg["freq"],
             feature_dim=len(first_df.columns),
             window_len=self.cfg["window_len"],

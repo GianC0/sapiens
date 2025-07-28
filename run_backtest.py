@@ -50,7 +50,7 @@ def main():
     cfg["train_end"] = train_end.strftime("%Y-%m-%d")
     cfg["valid_start"] = cfg["train_end"] + to_offset("1ns") #ensures dataset segregation 
     cfg["valid_end"] = valid_end.strftime("%Y-%m-%d")#
-    cfg["train start"] = cfg["valid_end"] + to_offset("1ns")
+    cfg["test start"] = cfg["valid_end"] + to_offset("1ns")
     cfg["test_end"] = test_end.strftime("%Y-%m-%d")
     cfg["walkfwd_start"] = cfg["test_end"] + to_offset("1ns")
     cfg["pred_offset"] = pred_offset

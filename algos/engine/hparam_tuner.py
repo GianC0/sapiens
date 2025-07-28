@@ -4,54 +4,44 @@ from typing   import Callable, Dict, Any
 import optuna
 from optuna.storages import RDBStorage
 import pandas as pd
+import torch.nn as nn
+from typing import Dict, List, Optional
+from pathlib import Path
 
 
 class OptunaHparamsTuner:
     """
     Generic Optuna wrapper.
-
-    Parameters
-    ----------
-    model_cls      : a class (not an instance) with signature  model_cls(**fixed_kwargs, **trial_params)
-                     and a .fit(train_dict, **fit_kwargs) method returning a scalar score
-                     (lower is better unless `direction="maximize"` is passed).
-    train_dict     : {ticker: pd.DataFrame}  –- the data shown to every trial.
-                     For pure ML models this is commonly `model._eval(loader_valid)`.
-    search_space   : Dict[str, Dict]         –- see YAML example below.
-    fixed_kwargs   : kwargs required by the model but *not* tuned.
-    fit_kwargs     : kwargs forwarded verbatim to model.fit().
     """
 
     def __init__(
         self,
         *,
         model_name: str,
+        ModelClass: nn.Model,                    # class  – NOT an instance
+        start: str,                              # train start
+        end: str,                                # validation end
         logs_dir: str | Path = "logs",           # logs root directory 
-        model_cls,                               # class  – NOT an instance
-        train_dict: Dict[str, Any],              # {ticker: DataFrame}
-        search_space: Dict[str, Dict],           # parsed from YAML
+        train_dict: Dict[str, Any],              # {ticker: DataFrame, ...}
+        model_params: Dict[str, Any],
         defaults: Dict[str, Any],                # default hp values
-        fixed_kwargs: Dict[str, Any],
-        fit_kwargs: Dict[str, Any] ,
-        study_name: str ,
+        search_space: Optional[Dict[str, Dict]], # parsed from YAML
         n_trials: int,
         direction: str = "minimize",
         sampler: optuna.samplers.TPESampler | None = None,
     ):
-        self.model_cls   = model_cls
+        self.ModelClass   = ModelClass
         self.train_dict  = train_dict
         self.search_space = search_space
+        self.model_params  = model_params
         self.defaults    = defaults
-        self.fit_kwargs  = fit_kwargs                # warm n_epochs and warm_start
-        self.fixed_kwargs  = fixed_kwargs
         self.n_trials    = n_trials
 
         # directories storing models and hp tuning data
 
-        self.base_dir   = Path(logs_dir).expanduser().resolve() / "optuna" / model_name
-        self.trials_dir = self.base_dir / "trials"
-        self.trials_dir.mkdir(parents=True, exist_ok=True)
+        self.base_dir   = Path(logs_dir).expanduser().resolve() / "optuna" / f"{start}--{end}"/ model_name
 
+        study_name = model_name.lower()
         db_path = self.base_dir / f"{model_name}_hpo.db"                              # trials database
         self.hp_log    = self.base_dir / "hp_trials.csv"                              # logs/optuna/models/<model>/hp_trials.csv
         storage = RDBStorage(f"sqlite:///{db_path}")
@@ -70,36 +60,54 @@ class OptunaHparamsTuner:
     def _suggest(self, trial: optuna.Trial) -> Dict[str, Any]:
         """Translate YAML search-space into Optuna API calls."""
         params = {}
-        for name, cfg in self.search_space.items():
-            t = cfg["type"]
-            if t == "float":
-                params[name] = trial.suggest_float(name, cfg["low"], cfg["high"])
-            elif t == "log_float":
-                params[name] = trial.suggest_float(
-                    name, cfg["low"], cfg["high"], log=True
-                )
-            elif t == "int":
-                params[name] = trial.suggest_int(name, cfg["low"], cfg["high"])
-            elif t == "categorical":
-                params[name] = trial.suggest_categorical(name, cfg["choices"])
+        
+        # Process all parameters
+        for name, default_value in self.defaults.items():
+            if self.search_space and name in self.search_space:
+                # Use Optuna to suggest value
+                cfg = self.search_space[name]
+                opt_t = cfg["optuna_type"]
+                
+                if opt_t == "low-high":
+                    params[name] = trial.suggest_float(name, cfg["low"], cfg["high"])
+                elif opt_t == "log_low-high":
+                    params[name] = trial.suggest_float(name, cfg["low"], cfg["high"], log=True)
+                elif opt_t == "int_low-high":
+                    params[name] = trial.suggest_int(name, cfg["low"], cfg["high"])
+                elif opt_t == "categorical":
+                    params[name] = trial.suggest_categorical(name, cfg["choices"])
+                else:
+                    raise ValueError(f"Unknown optuna_type '{opt_t}' for parameter '{name}'")
             else:
-                raise ValueError(f"Unknown param type {t} for {name}")
+                # Use default value - Python preserves the type from YAML parsing
+                params[name] = trial.suggest_categorical(name, [default_value])
+        
         return params
 
     def _objective(self, trial: optuna.Trial) -> float:
-        trial_params = self._suggest(trial)
-        # ensure every trial lands inside <logs_root>/optuna/models/<name>/trials/
-        model_dir_base        = self.trials_dir
-        model = self.model_cls(model_dir=model_dir_base, **self.fixed_kwargs,
-                             **trial_params)
-        model.fit(self.train_dict, **self.fit_kwargs)
+        trial_hparams = self._suggest(trial)
+        # ensure every trial lands inside <logs_root>/optuna/<start>-<end>/<model_name>/
+        
+
+        hp_id = f"lamic{trial_hparams.get('lambda_ic',0):.3f}_"\
+            + f"lamsync{trial_hparams.get('lambda_sync',0):.3f}_"\
+            + f"lamrankic{trial_hparams.get('lambda_rankic',0):.3f}"\
+            + f"syncthres{trial_hparams.get('sync_thr',0):.3f}"
+        time = pd.Timestamp.utcnow().strftime('%Y-%m-%d %X')
+        model_dir = (self.base_dir / self.model_params["freq"] / f"{time}_{hp_id}").resolve()   
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        self.model_params["model_dir"] = model_dir
+
+        model = self.ModelClass(**self.model_params, **trial_hparams)
+        model.initialize(self.train_dict)
         score = model._eval()
 
         # keep a pointer to the weights folder
         trial.set_user_attr("model_dir", str(model.model_dir))
 
         # ------------- append to hp_trials.csv -----------------------
-        rec = {"trial": trial.number, "loss": score, **trial_params}
+        rec = {"trial": trial.number, "loss": score, **trial_hparams}
         pd.DataFrame([rec]).to_csv(
             self.hp_log,
             mode   ="a",

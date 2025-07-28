@@ -31,11 +31,12 @@ feature_dim: 5                # OHLCV + extra features for L1 market data. To be
 #  Training schedule & hyper-param search
 # ---------------------------------------------------------------------------
 training:
+  target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
   tune_hparams:    false       # Use Optuna Bayesian search                 
   n_trials:        20          # Optuna trials for each run
   n_epochs:        20          # Epochs on train+valid after hp tuning and rolling initialization
   batch_size:      64          # Mini-batch size for AdamW                 
-  training_mode:   sequential  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain) → Stage-1 + Stage-2
+  training_mode:   sequential  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) → Stage-1 + Stage-2
   pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
   patience:        10          # Early-stop patience 
   warm_start:      true        # Enable warm-start                           (common in finance live rolls)
@@ -47,33 +48,34 @@ training:
 # ---------------------------------------------------------------------------
 #  Default hyper-parameters (UMI paper, Table 2) – Optuna overwrites them
 # ---------------------------------------------------------------------------
-hparams:
+hparams:  # optuna_type: categorical, low-high (assumed float), int_low-high, log_low-high
+
   # λ_IC   : independence loss weight
-  lambda_ic:         
+  lambda_ic:        
     default: 0.5
     optuna:            
-      type: categorical
+      optuna_type: categorical
       choices: [0, 0.25, 0.5, 0.75, 1]
 
   # λ_sync : synchronous factor loss 
   lambda_sync:
     default: 1.0
     optuna:
-      type: categorical
+      optuna_type: categorical
       choices: [0, 0.5, 1, 1.5, 2]
 
   # λ_rank : rank-IC regulariser
-  lambda_rankic:       
+  lambda_rankic:     
     default: 0.1
     optuna:
-      type: categorical
+      optuna_type: categorical
       choices: [0, 0.05, 0.1, 0.15, 0.2]
 
   # τ : attention temperature
   temperature:
     default: 0.07
     optuna:
-      type: float
+      optuna_type: low-high
       low: 0.03
       high: 0.2
   
@@ -81,7 +83,7 @@ hparams:
   sync_thr:
     default: 0.6
     optuna:
-      type: float
+      optuna_type: low-high
       low: 0.5
       high: 0.8
 
@@ -89,27 +91,29 @@ hparams:
   lr_stage1:
     default: 0.001
     optuna:
-      type: log_float
-      low: 1e-4
-      high: 5e-3
+      optuna_type: log_low-high
+      low: 0.0001
+      high: 0.005
 
   # α₁^ft  : LR when fine-tuning Stage-1 in hybrid mode
   lr_stage1_ft:
     default: 0.0001
     optuna:
-      type: log_float
-      low: 1e-5
-      high: 1e-3
+      optuna_type: log_low-high
+      low: 0.0001
+      high: 0.005
 
   # α₂: learning-rate Forecasting head
   lr_stage2:
     default: 0.0001
     optuna:
-      type: log_float
-      low: 1e-5
-      high: 1e-3
+      optuna_type: log_low-high
+      low: 0.00001
+      high: 0.001
+
   # stays frozen withouyt specifying the optuna values for hp optimization
-  weight_decay: 0.0        
+  weight_decay: 
+    default: 0.0       
 
 # ---------------------------------------------------------------------------
 #  Allocation targets
