@@ -20,9 +20,10 @@ from models.utils import freq2barspec, freq2pdoffset
 
 
 from algos.strategy import BacktestLongShortStrategy
+from ..models.utils import freq2pdoffset
 from algos.engine.hparam_tuner import OptunaHparamsTuner, split_hparam_cfg
 from algos.engine.data_loader import CsvBarLoader
-from models.umi import UMIModel
+from models.UMIModel import UMIModel
 from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm
 
 def main():

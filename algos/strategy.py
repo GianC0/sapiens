@@ -29,7 +29,8 @@ from nautilus_trader.model.enums import OrderSide
 # ----- project imports -----------------------------------------------------
 from .models.interfaces import MarketModel
 from .engine.data_loader import CsvBarLoader, FeatureBarData
-from ..models.utils import cache_to_dict, freq2pandas, freq2barspec
+from ..models.utils import freq2pandas, freq2barspec
+from .engine.hparam_tuner import split_hparam_cfg, OptunaHparamsTuner
 
 #  risk / execution helpers (same modules you used before)
 from .engine.execution import CommissionModelBps, SlippageModelBps
@@ -338,86 +339,91 @@ class BacktestLongShortStrategy(Strategy):
         ModelClass = getattr(mod, f"{self.model_name}", None) or getattr(mod, "Model")
         if ModelClass is None:
             raise ImportError(f"Could not find model class in models.{self.model_name}")
-        
-        # Prepare initial training data (only universe stocks)
-        train_data = {
-            ticker: self.loader._frames[ticker][(self.loader._frames[ticker].index <= self.valid_end) & (self.loader._frames[ticker].index >= self.backtest_start) ]
-            for ticker in self.universe
+
+        model_params = {
+            "freq"=self.cfg["freq"],
+            "feature_dim"=self.cfg["feature_dim"],
+            "window_len"=self.cfg["window_len"],
+            "pred_len"=self.cfg["pred_len"],
+            "train_end"=self.train_end,
+            "valid_end"=self.valid_end,
+            "batch_size"=self.cfg["training"]["batch_size"],
+            "n_epochs"=self.cfg["training"]["n_epochs"],
+            "patience"=self.cfg["training"]["patience"],
+            "pretrain_epochs"=self.cfg["training"]["pretrain_epochs"],
+            "training_mode"=self.cfg["training"]["training_mode"],
+            "close_idx"=self.cfg["training"]["target_idx"],
+            "warm_start"=self.cfg["training"]["warm_start"],
+            "warm_training_epochs"=self.cfg["training"]["warm_training_epochs"],
+            "data_dir"=self.cfg["data_dir"],
+            "logger"=self.log,  # Pass logger to model
         }
 
-        #create loader for test and valid
         
-
-
-        model_params = Dict(
-            freq=self.cfg["freq"],
-            feature_dim=self.cfg["feature_dim"],
-            window_len=self.cfg["window_len"],
-            pred_len=self.cfg["pred_len"],
-            train_end=self.train_end,
-            valid_end=self.valid_end,
-            batch_size=self.cfg["training"]["batch_size"],
-            n_epochs=self.cfg["training"]["n_epochs"],
-            patience=self.cfg["training"]["patience"],
-            pretrain_epochs=self.cfg["training"]["pretrain_epochs"],
-            training_mode=self.cfg["training"]["training_mode"],
-            close_idx=self.cfg["training"]["target_idx"],
-            warm_start=self.cfg["training"]["warm_start"],
-            warm_training_epochs=self.cfg["training"]["warm_training_epochs"],
-            data_dir=self.cfg["training"]["data_dir"],
-            logger=self.log,  # Pass logger to model
-
-        ) 
-
-        
-        ### SETUP HPARAMS TUNING
+        # HPs
         defaults, search_space = split_hparam_cfg(self.cfg["hparams"])
-        n_trials = self.cfg["training"]["n_trials"]
-        # ensure hparams tuning is not running when 
-        if not self.cfg["training"]["tune_hparams"]:
-            self.log.info("[HPO] Optuna search DISABLED …")
-            search_space = None
-            n_trials = 1
 
-        tuner = OptunaHparamsTuner(   # TODO: check training logic and if can rigthly start to trade
+        # Determine if we should run hyperparameter tuning 
+        if self.cfg["training"]["tune_hparams"]:
+
+            # Setup and Prepare initial training data (only universe stocks)
+            self.log.info("[HPO] Optuna search ENABLED")
+            search_space = search_space
+            n_trials = self.cfg["training"]["n_trials"]
+            train_data = {
+                ticker: self.loader._frames[ticker][(self.loader._frames[ticker].index <= self.valid_end) & (self.loader._frames[ticker].index >= self.backtest_start) ]
+                for ticker in self.universe
+            }
+
+            # model_dir is sepcified by the tuner
+            tuner = OptunaHparamsTuner( 
+                model_name  = self.cfg["model_name"],
+                ModelClass   = ModelClass,
+                start = self.backtest_start.strftime('%Y-%m-%d_%X'),
+                end = self.valid_end.strftime('%Y-%m-%d_%X'),
+                logs_dir    = Path(self.cfg.get("logs_dir", "logs")),
+                train_dict  = train_data,
+                model_params= model_params,
+                defaults    = defaults,           # default values of hparams
+                search_space= search_space,       # search sapce of hparams
+                n_trials    = n_trials,
+                logger = self.log
+            )
+            
+            best = tuner.optimize()
+
+            # Update defaults with best hyperparameters
+            defaults = {**best["params"]}
+
+        # Initialize model with best hyperparameters. It will have new model directory and trained on train + valid set
+        model_params.update("valid_end", self.test_end )
+        train_data = {
+                ticker: self.loader._frames[ticker][(self.loader._frames[ticker].index <= self.test_end) & (self.loader._frames[ticker].index >= self.backtest_start) ]
+                for ticker in self.universe
+        }
+
+        # model_dir is sepcified by the tuner
+        tuner = OptunaHparamsTuner( 
             model_name  = self.cfg["model_name"],
             ModelClass   = ModelClass,
-            start = self.backtest_start.strftime('%Y-%m-%d %X'),
-            end = self.test_end.strftime('%Y-%m-%d %X'),
+            start = self.backtest_start.strftime('%Y-%m-%d_%X'),
+            end = self.test_end.strftime('%Y-%m-%d_%X'),
             logs_dir    = Path(self.cfg.get("logs_dir", "logs")),
             train_dict  = train_data,
             model_params= model_params,
             defaults    = defaults,           # default values of hparams
-            search_space= search_space,       # search sapce of hparams
-            n_trials    = n_trials,
+            search_space= None,               # empty search space: use defaults and 1 trial only
+            n_trials    = 1,
+            logger = self.log
         )
-        best = tuner.optimize()
 
-        #TODO separate best hparams from normal params
-        cfg["hparams"] = {**defaults, **best["params"]}
-        print(f"Optuna tuning complete. Best hparams: {best["params"]}")
+        # return the whole model so that it can be used for sequent steps !!
+        # ensure the initialize of UMI is correct and return model
+        _ , model_dir = tuner.optimize()
+
+        
 
         # Initialize model with proper parameters
-        self.model = ModelClass(
-            freq=self.cfg["freq"],
-            feature_dim=self.cfg["feature_dim"],
-            window_len=self.cfg["window_len"],
-            pred_len=self.cfg["pred_len"],
-            train_end=self.train_end,
-            valid_end=self.test_end,
-            batch_size=self.cfg["training"]["batch_size"],
-            n_epochs=self.cfg["training"]["n_epochs"],
-            patience=self.cfg["training"]["patience"],
-            pretrain_epochs=self.cfg["training"]["pretrain_epochs"],
-            training_mode=self.cfg["training"]["training_mode"],
-            close_idx=self.cfg["training"]["target_idx"],
-            warm_start=self.cfg["training"]["warm_start"],
-            warm_training_epochs=self.cfg["training"]["warm_training_epochs"],
-            data_dir=self.cfg["training"]["data_dir"],
-            model_dir=,
-            logger=self.log,  # Pass logger to model
-            **self.cfg.get("hparams", {})
-        )
         
 
         

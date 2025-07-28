@@ -32,7 +32,7 @@ feature_dim: 5                # OHLCV + extra features for L1 market data. To be
 # ---------------------------------------------------------------------------
 training:
   target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
-  tune_hparams:    false       # Use Optuna Bayesian search                 
+  tune_hparams:    false       # Use Optuna Bayesian search. Every trial lands inside <logs_root>/optuna/<start>-<end>/<model_name>/<time_now>_<hp_id>               
   n_trials:        20          # Optuna trials for each run
   n_epochs:        20          # Epochs on train+valid after hp tuning and rolling initialization
   batch_size:      64          # Mini-batch size for AdamW                 

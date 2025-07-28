@@ -27,6 +27,7 @@ class OptunaHparamsTuner:
         defaults: Dict[str, Any],                # default hp values
         search_space: Optional[Dict[str, Dict]], # parsed from YAML
         n_trials: int,
+        log: Any,                                # logger
         direction: str = "minimize",
         sampler: optuna.samplers.TPESampler | None = None,
     ):
@@ -36,14 +37,16 @@ class OptunaHparamsTuner:
         self.model_params  = model_params
         self.defaults    = defaults
         self.n_trials    = n_trials
+        self.log = log
 
         # directories storing models and hp tuning data
 
-        self.base_dir   = Path(logs_dir).expanduser().resolve() / "optuna" / f"{start}--{end}"/ model_name
+        base_dir   = Path(logs_dir).expanduser().resolve() / "optuna" / f"{start}_{end}"/ model_name
+        self.model_params["model_dir"] = base_dir
 
         study_name = model_name.lower()
-        db_path = self.base_dir / f"{model_name}_hpo.db"                              # trials database
-        self.hp_log    = self.base_dir / "hp_trials.csv"                              # logs/optuna/models/<model>/hp_trials.csv
+        db_path = base_dir / f"{model_name}_hpo.db"                              # trials database
+        self.hp_log    = base_dir / "hp_trials.csv"                              # logs/optuna/models/<model>/hp_trials.csv
         storage = RDBStorage(f"sqlite:///{db_path}")
 
         self.study = optuna.create_study(
@@ -86,22 +89,11 @@ class OptunaHparamsTuner:
 
     def _objective(self, trial: optuna.Trial) -> float:
         trial_hparams = self._suggest(trial)
-        # ensure every trial lands inside <logs_root>/optuna/<start>-<end>/<model_name>/
-        
-
-        hp_id = f"lamic{trial_hparams.get('lambda_ic',0):.3f}_"\
-            + f"lamsync{trial_hparams.get('lambda_sync',0):.3f}_"\
-            + f"lamrankic{trial_hparams.get('lambda_rankic',0):.3f}"\
-            + f"syncthres{trial_hparams.get('sync_thr',0):.3f}"
-        time = pd.Timestamp.utcnow().strftime('%Y-%m-%d %X')
-        model_dir = (self.base_dir / self.model_params["freq"] / f"{time}_{hp_id}").resolve()   
-        model_dir.mkdir(parents=True, exist_ok=True)
-
-        self.model_params["model_dir"] = model_dir
+        # ensure every trial lands inside <logs_root>/optuna/<start>-<end>/<model_name>/<time>_<hp_id>
 
         model = self.ModelClass(**self.model_params, **trial_hparams)
         model.initialize(self.train_dict)
-        score = model._eval()
+        score = model._last_val_loss
 
         # keep a pointer to the weights folder
         trial.set_user_attr("model_dir", str(model.model_dir))
@@ -114,6 +106,7 @@ class OptunaHparamsTuner:
             header = not self.hp_log.exists(),
             index  = False,
         )
+        self.log.info("New HPO trial: {rec}")
         return float(score)
 
     # ------------------------------------------------------------------ #
@@ -122,6 +115,7 @@ class OptunaHparamsTuner:
     def optimize(self) -> dict:
         self.study.optimize(self._objective, n_trials=self.n_trials)
         best   = self.study.best_trial
+        self.log.info(f"Best hparams: {best.params} \nBest model path: {best.user_attrs["model_dir"]}")
         return {
             "params"    : best.params,
             "model_dir" : Path(best.user_attrs["model_dir"]),   # ← contains best.pt

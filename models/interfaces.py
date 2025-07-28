@@ -6,10 +6,9 @@ from __future__ import annotations
 import pickle
 from typing import Protocol, Dict, Any, Union, runtime_checkable
 import pandas as pd
-from nautilus_trader.cache.cache import Cache   # NT built-in cache ¹
+from pathlib import Path
 
 DataDict = Dict[str, pd.DataFrame]
-DataSource = Union[DataDict, Cache]             # accepted everywhere
 
 
 @runtime_checkable
@@ -23,24 +22,25 @@ class MarketModel(Protocol):
     L: int               # look-back window in bars (≥ 1)
     pred_len: int        # forecast horizon in bars
     is_initialized: bool # whether model has been initialized
+    model_dir: Path      # Model dir base path. Full path is : <logs_root>/optuna/<start>-<end>/<model_name>/<time>_<hp_id>
 
     # -------- Mandatory lifecycle methods --------
-    def fit(self, data: DataSource, *, n_epochs: int = 1, **kwargs) -> None:
+    def fit(self, data: DataDict, *, n_epochs: int = 1, **kwargs) -> None:
         """(Re)train the model on fresher data."""
         ...
 
-    def update(self, data: DataSource, **kwargs) -> None:
+    def update(self, data: DataDict, **kwargs) -> None:
         """Light-weight maintenance (e.g. decide if re-training is needed)."""
         ...
 
-    def predict(self, data: DataSource, **kwargs) -> Dict[str, float]:
+    def predict(self, data: DataDict, **kwargs) -> Dict[str, float]:
         """
         Return next-bar return forecasts *per ticker*.
         Keys must be exactly the tickers present in `data`.
         """
         ...
 
-    def initialize(self, data: DataSource, **kwargs) -> None:
+    def initialize(self, data: DataDict, **kwargs) -> None:
         """
         Perform initial training on historical data.
         Called ONCE at strategy startup.
@@ -99,8 +99,7 @@ class MarketModel(Protocol):
     
     def _build_panel(self, train_data: Any, valid_data: Any, n_epochs: int) -> float:
         """
-        Convert input data type from Nautilus.Cache to
-        whatever panel the model expects (e.g., {"StockTicker": Dataframe, ..., })
+        Convert input data type  to whatever panel the model expects (e.g., {"StockTicker": Dataframe, ..., })
         """
         raise NotImplementedError("Model must implement _train or override fit/initialize")
 

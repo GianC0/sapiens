@@ -15,9 +15,8 @@
 import os, math, json, shutil, datetime as dt
 from pathlib import Path
 from typing import Dict, Optional, Any, Callable, Union
-from nautilus_trader.cache.cache import Cache
 from concurrent.futures import ThreadPoolExecutor
-from ..utils import cache_to_dict, SlidingWindowDataset
+from ..utils import SlidingWindowDataset
 from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
 import pandas as pd
 import torch
@@ -69,13 +68,13 @@ class UMIModel(nn.Module):
         self._device        = torch.device("cuda" if torch.cuda.is_available() else "cpu")         # device for training
         
         # time parameters
-        self.freq           = freq                                                                 # e.g. "1d", "15m", "1h"  
-        self.pred_len    = pred_len                                                                # number of bars to predict
+        self.freq           = freq                                                                  # e.g. "1d", "15m", "1h"  
+        self.pred_len    = pred_len                                                                 # number of bars to predict
         
-        # these should be managed by the TRADING STRATEGY, no by model.
         #self.retrain_delta  = retrain_delta                                                        # time delta for retraining 
-        self.train_end      = pd.to_datetime(train_end, utc=True)                                  # end of training date
-        self.valid_end      = pd.to_datetime(valid_end, utc=True)                                  # end of validation date
+        self.train_end      = pd.to_datetime(train_end, utc=True)                                   # end of training date
+        self.valid_end      = pd.to_datetime(valid_end, utc=True)                                   # end of validation date
+        self.log         = logger                                                                   # actions logger
         #self.bt_end         = pd.to_datetime(bt_end, utc=True)                                     # end of back-test date (optional)
         #self._last_fit_time = None                                                                 # last time fit() was called
         
@@ -86,12 +85,15 @@ class UMIModel(nn.Module):
         self.n_epochs       = n_epochs                                                             # number of epochs for training
         self.pretrain_epochs = pretrain_epochs                                                     # epochs for Stage-1 pre-training (hybrid mode)
         self.training_mode = training_mode                                                         # "hybrid" or "sequential"
-        self.data_dir       = data_dir                                                             # directory where the data is stored       
+        self.data_dir       = data_dir                                                             # directory where the data is stored      
+         
         hp_id =   f"lamic{hparams.get('lambda_ic',0):.3f}_"\
                 + f"lamsync{hparams.get('lambda_sync',0):.3f}_"\
                 + f"lamrankic{hparams.get('lambda_rankic',0):.3f}"\
                 + f"syncthres{hparams.get('sync_thr',0):.3f}"
-        self.model_dir = (model_dir / freq / f"{hp_id}").resolve()                             # model directory with timestamp and hparams
+        time = pd.Timestamp.utcnow().strftime('%Y-%m-%d %X')
+        
+        self.model_dir = (model_dir / freq / f"{time}_{hp_id}").resolve()                             # model directory with timestamp and hparams
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
         # stock universe
@@ -119,12 +121,12 @@ class UMIModel(nn.Module):
          
         - This is the entry point for first training
         - No walk-forward logic
-        - Sets up universe and trains from scratch
+        - Trains from scratch
         """
-        print(f"[{self.__class__.__name__}] Initializing model...")
+        self.log.info(f"[{self.__class__.__name__}] Initializing model...")
         
         # Build panel and setup
-        panel, active, idx, self._universe = self._build_panel(data, lookback=0)
+        panel, active, idx, universe = self._build_panel(data, lookback=0)
         self.I_active = panel.size(1)                                                        # real stocks today
         self.I = max(self.I_active + 1, math.ceil(self.I_active * (1.0 + self.universe_mult)))   # padded size for dynamic universe
 
@@ -145,8 +147,9 @@ class UMIModel(nn.Module):
         loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
        
         # Train from scratch
-        print(f"[initialize] Training for {self.n_epochs} epochs...")
+        self.log.info(f"[initialize] Training for {self.n_epochs} epochs...")
         best_val = self._train(loader_train, loader_valid, self.n_epochs)
+        self._last_val_loss = best_val
         
         # Save initial state
         torch.save(self.state_dict(), self.model_dir / "initial.pt")
@@ -154,12 +157,12 @@ class UMIModel(nn.Module):
         
         # Mark as initialized
         self._is_initialized = True
-        self._last_fit_time = self._clock()
+        self._last_fit_time = pd.Timestamp.utcnow()
         
         # Dump metadata
         self._dump_model_metadata()
         
-        print(f"[initialize] Complete. Best validation: {best_val:.6f}")
+        self.log.info(f"[initialize] Complete. Best validation: {best_val:.6f}")
 
     # ---------------- fit -------------------------------------------- #
     def fit(self, data: DataSource , warm_start: bool = True):
@@ -182,7 +185,7 @@ class UMIModel(nn.Module):
                 train_period = self.valid_end - self.train_end
                 self.valid_end = latest
                 self.train_end = self.valid_end - train_period
-                print(f"[fit] Updated windows - train_end: {self.train_end}, valid_end: {self.valid_end}")
+                self.log.info(f"[fit] Updated windows - train_end: {self.train_end}, valid_end: {self.valid_end}")
     
             # Reinitialize with new windows
             self._is_initialized = False
@@ -191,12 +194,12 @@ class UMIModel(nn.Module):
 
         # Check if architecture needs updating after insertion. TODO: does not account for insertion and delisting at the same time
         if panel.size(1) > self.I_active:
-            print(f"[fit] Universe expanded, need to reinitialize...")
+            self.log.info(f"[fit] Universe expanded, need to reinitialize...")
             self.fit(data, initialize=True)
             return
 
         # Regular warm-start training
-        print(f"[fit] Warm-start training...")
+        self.log.info(f"[fit] Warm-start training...")
 
         # Build panel
         panel, active, idx = self._build_panel(data, lookback=None)   # panel.shape: (T,I,F)
@@ -205,11 +208,11 @@ class UMIModel(nn.Module):
 
         best_path = self.model_dir / "best.pt"
         if best_path.exists():
-            print(f"[fit] Loading weights from {best_path}")
+            self.log.info(f"[fit] Loading weights from {best_path}")
             try:
                 self.load_state_dict(torch.load(best_path, map_location='cpu'))
             except Exception as e:
-                print(f"[fit] Failed to load weights: {e}, training from scratch")
+                self.log.info(f"[fit] Failed to load weights: {e}, training from scratch")
         else:
             raise Exception("Could not find best.pt warmed-up model in ", model_dir)
 
@@ -249,22 +252,14 @@ class UMIModel(nn.Module):
 
         self._last_fit_time = current_time
         
-        print(f"[fit] Complete. Best validation: {best_val:.6f}")       
+        self.log.info(f"[fit] Complete. Best validation: {best_val:.6f}")       
 
     # ------------------------------------------------------------------ #
     # update : decide if retrain_delta elapsed → refit on latest data    #
     # ------------------------------------------------------------------ #
-    def update(self, data_dict: DataSource ):
+    def update(self, data_dict: Dict[str, DataFrame] ):
         if self._last_fit_time is None:
             raise RuntimeError("Call fit() before update().")
-        
-        assert isinstance(data_dict, Cache)
-        data_dict = cache_to_dict(
-            data_dict,
-            tickers=self._universe or sorted(data_dict.symbols()),  # preserves slot order
-            lookback=self.L + self.pred_len + 1,
-            bar_type=self.bar_type,  # TODO: No bar type
-        )
 
         now = self._clock()        # <── the only place we read “time”
 
@@ -279,7 +274,7 @@ class UMIModel(nn.Module):
                     return
                 else:
                     self._universe.append(k)              # give the new stock a slot
-                    print(f"[info] universe full. Retraining …")
+                    self.log.info(f"[info] universe full. Retraining …")
                     self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
                     return                                # early exit; retrain done
 
@@ -304,21 +299,14 @@ class UMIModel(nn.Module):
         time_elapsed = now >= self._last_fit_time + self.retrain_delta
         if time_elapsed or just_delisted:
             reason = "time window" if time_elapsed else "delisting event"
-            print(f"Retraining triggered : {reason}.")
+            self.log.info(f"Retraining triggered : {reason}.")
             self.fit(data_dict, warm_start=self.warm_start, n_epochs=self.warm_training_epochs)
 
     # ------------------------------------------------------------------ #
     # predict : one inference step                                       #
     # ------------------------------------------------------------------ #
-    def predict(self, data_dict: DataSource,  _retry: bool = False) -> Dict[str, float]:
+    def predict(self, data_dict: Dict[str, DataFrame],  _retry: bool = False) -> Dict[str, float]:
 
-        assert isinstance(data_dict, Cache)
-        data_dict = cache_to_dict(
-            data_dict,
-            tickers=self._universe or sorted(data_dict.symbols()),  # preserves slot order
-            lookback=self.L + self.pred_len + 1,
-            bar_type=self.bar_type, # TODO: No bar type
-        )
         panel, active, idx = _build_panel(data_dict, universe=self._universe)   # (T,I_active,F) , (I_active,T)
         assert panel.size(0) >= self.L + 1, "need L+1 bars for inference"
 
@@ -335,7 +323,7 @@ class UMIModel(nn.Module):
         else:
             if _retry:
                 raise RuntimeError("Universe capacity still insufficient after one retrain.")
-            print("[warn] universe overflow – growing capacity and retraining once.")
+            self.log.info("[warn] universe overflow – growing capacity and retraining once.")
             # 2) full re-fit on the larger I
             self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs )
             # 3) recurse – now pad will be ≥ 0
@@ -392,7 +380,7 @@ class UMIModel(nn.Module):
         
         # Set universe
         universe = sorted(data_dict.keys())
-        print(f"[initialize] Universe: {len(universe)} stocks")
+        self.log.info(f"[initialize] Universe: {len(universe)} stocks")
         
         
         # --- harmonise indices -------------------------------------------------
@@ -573,7 +561,7 @@ class UMIModel(nn.Module):
                     best_val = min(best_val, val)
 
                 if ep == 0 or (ep + 1) % max(1, (self.pretrain_epochs + n_epochs) // 5) == 0:
-                    print(f"ep {ep:>3} | train {trn:.5f} | val {val:.5f} | best {best_val:.5f}")
+                    self.log.info(f"ep {ep:>3} | train {trn:.5f} | val {val:.5f} | best {best_val:.5f}")
 
                 self._log_epoch(l_s, l_m, l_pred, val_pred=val)
                 ep += 1
@@ -581,12 +569,12 @@ class UMIModel(nn.Module):
         # ─────────────────────────── schedule switch ──────────────────────
         if self.training_mode == "hybrid":
             # 1) warm-up – Stage-1 only
-            print(f"[hybrid] warm-up Stage-1  ({self.pretrain_epochs} epochs)")
+            self.log.info(f"[hybrid] warm-up Stage-1  ({self.pretrain_epochs} epochs)")
             self.forecaster.requires_grad_(False)
             _run_epochs(self.pretrain_epochs)
 
             # 2) joint fine-tune
-            print(f"[hybrid] joint fine-tune  ({n_epochs} epochs)")
+            self.log.info(f"[hybrid] joint fine-tune  ({n_epochs} epochs)")
             self.forecaster.requires_grad_(True)
             for g in opt_s.param_groups + opt_m.param_groups:
                 g["lr"] = self.hp.get("lr_stage1_ft", self.hp["lr_stage1"])
@@ -594,7 +582,7 @@ class UMIModel(nn.Module):
 
         elif self.training_mode == "sequential":
             # ---------- Stage-1 with early-stopping ----------
-            print("[sequential] Stage-1 until early-stop")
+            self.log.info("[sequential] Stage-1 until early-stop")
             self.forecaster.requires_grad_(False)
 
             best_state_s = best_state_m = None
@@ -611,7 +599,7 @@ class UMIModel(nn.Module):
                         best_state_s = {k: v.cpu() for k, v in self.stock_factor.state_dict().items()}
                         best_state_m = {k: v.cpu() for k, v in self.market_factor.state_dict().items()}
                     if bad >= self.patience:
-                        print(f"[sequential] early-stop after {bad} bad rounds")
+                        self.log.info(f"[sequential] early-stop after {bad} bad rounds")
                         break
 
                 self._log_epoch(l_s, l_m, l_pred, val_pred=val)
@@ -622,7 +610,7 @@ class UMIModel(nn.Module):
                 self.market_factor.load_state_dict(best_state_m)
 
             # ---------- Stage-2 only ----------
-            print(f"[sequential] Stage-2 fine-tune  ({n_epochs} epochs)")
+            self.log.info(f"[sequential] Stage-2 fine-tune  ({n_epochs} epochs)")
             self.stock_factor.requires_grad_(False)
             self.market_factor.requires_grad_(False)
             self.forecaster.requires_grad_(True)
@@ -820,14 +808,14 @@ class UMIModel(nn.Module):
 #         clock_fn=clock,              # pass the clock closure
 #     )
 
-#     print(next(iter(data_dict.items()))[1].head())
-#     print("Detected close_idx =", list(next(iter(data_dict.values())).columns).index("Close"))
+#     self.log.info(next(iter(data_dict.items()))[1].head())
+#     self.log.info("Detected close_idx =", list(next(iter(data_dict.values())).columns).index("Close"))
 
 #     try:
 #         model.fit(data_dict, )  
 #     except RuntimeError as e:
 #         if "out of memory" in str(e).lower():
-#             print("[warn] OOM – retrying with dynamic_universe_mult = 1")
+#             self.log.info("[warn] OOM – retrying with dynamic_universe_mult = 1")
 #             raise
 #         else:
 #             raise
@@ -912,5 +900,5 @@ class UMIModel(nn.Module):
 #     pred_df.to_csv(out_dir / "bt_pred_close.csv")
 #     truth_df.to_csv(out_dir / "bt_truth_close.csv")
 
-#     print("DONE")
+#     self.log.info("DONE")
 
