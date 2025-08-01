@@ -152,7 +152,6 @@ class UMIModel(nn.Module):
         self._last_val_loss = best_val
         
         # Save initial state
-        torch.save(self.state_dict(), self.model_dir / "initial.pt")
         torch.save(self.state_dict(), self.model_dir / "best.pt")
         
         # Mark as initialized
@@ -360,7 +359,8 @@ class UMIModel(nn.Module):
         self.stock_factor.load_state_dict(sd["stock_factor"])
         self.market_factor.load_state_dict(sd["market_factor"])
         self.forecaster.load_state_dict(sd["forecaster"])
-        assert self.I == sd["I"] and self.F == sd["F"]
+        self._is_initialized = True
+        
 
 
 

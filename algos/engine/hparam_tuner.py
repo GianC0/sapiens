@@ -89,7 +89,6 @@ class OptunaHparamsTuner:
 
     def _objective(self, trial: optuna.Trial) -> float:
         trial_hparams = self._suggest(trial)
-        # ensure every trial lands inside <logs_root>/optuna/<start>-<end>/<model_name>/<time>_<hp_id>
 
         model = self.ModelClass(**self.model_params, **trial_hparams)
         model.initialize(self.train_dict)
@@ -117,7 +116,7 @@ class OptunaHparamsTuner:
         best   = self.study.best_trial
         self.log.info(f"Best hparams: {best.params} \nBest model path: {best.user_attrs["model_dir"]}")
         return {
-            "params"    : best.params,
+            "hparams"    : best.params,
             "model_dir" : Path(best.user_attrs["model_dir"]),   # ← contains best.pt
         }
 

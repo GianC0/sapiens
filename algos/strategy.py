@@ -362,6 +362,7 @@ class BacktestLongShortStrategy(Strategy):
         
         # HPs
         defaults, search_space = split_hparam_cfg(self.cfg["hparams"])
+        best_hparams = {}
 
         # Determine if we should run hyperparameter tuning 
         if self.cfg["training"]["tune_hparams"]:
@@ -393,42 +394,52 @@ class BacktestLongShortStrategy(Strategy):
             best = tuner.optimize()
 
             # Update defaults with best hyperparameters
-            defaults = {**best["params"]}
+            best_hparams = {**defaults, **best["hparams"]}
+            self.log.info(f"Best hyperparameters found: {best_hparams}")
+        else:
+            self.log.info("[HPO] Hyperparameter tuning disabled, using defaults")
+            best_hparams = defaults
 
         # Initialize model with best hyperparameters. It will have new model directory and trained on train + valid set
-        model_params.update("valid_end", self.test_end )
-        train_data = {
-                ticker: self.loader._frames[ticker][(self.loader._frames[ticker].index <= self.test_end) & (self.loader._frames[ticker].index >= self.backtest_start) ]
-                for ticker in self.universe
+        final_model_params = model_params.copy()
+        final_model_params["valid_end"] = self.test_end.strftime("%Y-%m-%d")
+
+        # Prepare extended training data
+        final_train_data = {
+            ticker: self.loader._frames[ticker][
+                (self.loader._frames[ticker].index >= self.backtest_start) & 
+                (self.loader._frames[ticker].index <= self.test_end)
+            ] for ticker in self.universe
         }
 
         # model_dir is sepcified by the tuner
-        tuner = OptunaHparamsTuner( 
+        final_tuner = OptunaHparamsTuner( 
             model_name  = self.cfg["model_name"],
             ModelClass   = ModelClass,
             start = self.backtest_start.strftime('%Y-%m-%d_%X'),
             end = self.test_end.strftime('%Y-%m-%d_%X'),
             logs_dir    = Path(self.cfg.get("logs_dir", "logs")),
-            train_dict  = train_data,
-            model_params= model_params,
-            defaults    = defaults,           # default values of hparams
+            train_dict  = final_train_data,
+            model_params= final_model_params,
+            defaults    = best_hparams,       # Use best hyperparameters
             search_space= None,               # empty search space: use defaults and 1 trial only
             n_trials    = 1,
             logger = self.log
         )
-
-        # return the whole model so that it can be used for sequent steps !!
-        # ensure the initialize of UMI is correct and return model
+        
         _ , model_dir = tuner.optimize()
-
         
 
-        # Initialize model with proper parameters
-        
+        # reload the model to use for walk-forward steps
+        self.model = ModelClass(**final_model_params, **best_hparams)
 
+        if (model_dir / "best.pt").exists():
+                state_dict = torch.load(saved_state_path, map_location='cpu')
+                self.model.load_state_dict(state_dict)
+                self.model._is_initialized = True
+        else:
+            raise ImportError(f"Could not find best.pt in {model_dir}")
         
-        # Initialize model
-        self.model.initialize(train_data)
 
 
     # ----- model factory ----------------------------------------------
