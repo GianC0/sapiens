@@ -25,21 +25,6 @@ class MarketModel(Protocol):
     model_dir: Path      # Model dir base path. Full path is : <logs_root>/optuna/<start>-<end>/<model_name>/<time>_<hp_id>
 
     # -------- Mandatory lifecycle methods --------
-    def fit(self, data: DataDict, *, n_epochs: int = 1, **kwargs) -> None:
-        """(Re)train the model on fresher data."""
-        ...
-
-    def update(self, data: DataDict, **kwargs) -> None:
-        """Light-weight maintenance (e.g. decide if re-training is needed)."""
-        ...
-
-    def predict(self, data: DataDict, **kwargs) -> Dict[str, float]:
-        """
-        Return next-bar return forecasts *per ticker*.
-        Keys must be exactly the tickers present in `data`.
-        """
-        ...
-
     def initialize(self, data: DataDict, **kwargs) -> None:
         """
         Perform initial training on historical data.
@@ -50,6 +35,32 @@ class MarketModel(Protocol):
             **kwargs: Training parameters (epochs, batch_size, etc.)
         """
         ...
+
+
+    def update(self, data: DataDict, **kwargs) -> None:
+        """
+        Retrain/update the model on fresher data.
+        
+        Args:
+            data: Updated data including train and validation periods
+            **kwargs: Additional parameters (save_backup, etc.)
+        """
+        ...
+
+    def predict(self, data: DataDict, **kwargs) -> Dict[str, float]:
+        """
+        Return next-bar return forecasts *per ticker*.
+        Keys must be exactly the tickers present in `data`.
+        
+        Args:
+            data: Current market data as Dict[ticker, DataFrame]
+            **kwargs: Additional parameters
+            
+        Returns:
+            Dict[str, float]: Predicted returns for each ticker
+        """
+
+
 
     # -------- State persistence (required) --------
     def save_state_dict(self) -> Dict[str, Any]:

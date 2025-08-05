@@ -13,18 +13,19 @@
 # TODO: CLOCK LOGIC TO BE REMOVED self._clock()
 
 import os, math, json, shutil, datetime as dt
-from pathlib import Path
-from typing import Dict, Optional, Any, Callable, Union
 from concurrent.futures import ThreadPoolExecutor
-from ..utils import SlidingWindowDataset
-from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
+from pathlib import Path
+from typing import Dict, Optional, Any
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
-from pandas import DataFrame
-     
+
+from pandas import DataFrame, Timestamp
+
+from ..utils import SlidingWindowDataset
+from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
 
 # --------------------------------------------------------------------------- #
 # Main model                                                               #
@@ -55,6 +56,7 @@ class UMIModel(nn.Module):
         close_idx: int = 3,  # usually "close" is at index 3
         warm_start : bool= False,
         warm_training_epochs: int = 5,
+        save_backups: bool = False,         # Flag for saving backups during walk-forward
         data_dir: Path = Path("data/stocks"),
         model_dir: Path = Path("logs/UMIModel"),
         logger: Optional[Any] = None,
@@ -75,13 +77,14 @@ class UMIModel(nn.Module):
         self.train_end      = pd.to_datetime(train_end, utc=True)                                   # end of training date
         self.valid_end      = pd.to_datetime(valid_end, utc=True)                                   # end of validation date
         self.log         = logger                                                                   # actions logger
+        self.save_backups   = save_backups                                                          # whether to save backups during walk-forward
         #self.bt_end         = pd.to_datetime(bt_end, utc=True)                                     # end of back-test date (optional)
-        #self._last_fit_time = None                                                                 # last time fit() was called
         
 
         # model parameters
         self.F              = feature_dim                                                          # number of features per stock
         self.L              = window_len                                                           # length of the sliding window (L+1 bars)
+        self.I              = None                                                                 # number of stocks/instruments. here it is just initialized
         self.n_epochs       = n_epochs                                                             # number of epochs for training
         self.pretrain_epochs = pretrain_epochs                                                     # epochs for Stage-1 pre-training (hybrid mode)
         self.training_mode = training_mode                                                         # "hybrid" or "sequential"
@@ -111,68 +114,63 @@ class UMIModel(nn.Module):
         self.warm_start          = warm_start                                                       # warm start when stock is deleted or retrain delta elapsed
         self.warm_training_epochs = warm_training_epochs if warm_start is not None else self.n_epochs
         self._global_epoch = 0                                                                      # global epoch counter for stats
+    
 
-
+    @property
+    def is_initialized(self) -> bool:
+        """Check if model has been initialized."""
+        return self._is_initialized
+    
     def initialize(self, data: Dict[str, DataFrame], **kwargs) -> None:
-
-        assert self._is_initialized is False
         """
         Initial training on historical data.
          
         - This is the entry point for first training
         - No walk-forward logic
         - Trains from scratch
+        - Returns best validation loss
         """
+        assert self._is_initialized is False
         self.log.info(f"[{self.__class__.__name__}] Initializing model...")
-        
-        # Build panel and setup
-        panel, active, idx, universe = self._build_panel(data, lookback=0)
-        self.I_active = panel.size(1)                                                        # real stocks today
-        self.I = max(self.I_active + 1, math.ceil(self.I_active * (1.0 + self.universe_mult)))   # padded size for dynamic universe
-
+    
         # Register active mask
-        pad = self.I - self.I_active
-        self.register_buffer("_active_mask",torch.cat([torch.ones(self.I_active), torch.zeros(pad)]).bool())
+        self.I = len(data)
+        self.register_buffer("_active_mask",torch.ones(self.I)).bool()
         
         # Build submodules (learners)
         self._build_submodules()
 
         # Create train/valid split
-        train_mask = idx <= self.train_end
-        valid_mask = (idx > self.train_end) & (idx <= self.valid_end)
+        train_data = {k: df[df.index <= self.train_end ] for k, df in data.items()}
+        valid_data = {k: df[(df.index > self.train_end) and (df.index <= self.valid_end) ] for k, df in data.items()}
         
-        ds_train = SlidingWindowDataset(panel[train_mask], active[:, train_mask], self.L, self.pred_len, close_idx=self.close_idx)
-        ds_valid = SlidingWindowDataset(panel[valid_mask], active[:, valid_mask] ,self.L, self.pred_len, close_idx=self.close_idx)
-        loader_train = DataLoader(ds_train, batch_size=self.batch_size, shuffle=True)
-        loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
+        # mask is initialized to use all stocks provided for initial training
+        active_mask = torch.ones(self.I)
        
         # Train from scratch
         self.log.info(f"[initialize] Training for {self.n_epochs} epochs...")
-        best_val = self._train(loader_train, loader_valid, self.n_epochs)
-        self._last_val_loss = best_val
+        best_val = self._train(train_data, valid_data, self.n_epochs, active_mask )
         
         # Save initial state
-        torch.save(self.state_dict(), self.model_dir / "best.pt")
+        torch.save(self.state_dict(), self.model_dir / "init.pt")
         
         # Mark as initialized
         self._is_initialized = True
-        self._last_fit_time = pd.Timestamp.utcnow()
         
         # Dump metadata
         self._dump_model_metadata()
         
         self.log.info(f"[initialize] Complete. Best validation: {best_val:.6f}")
+        return best_val
 
     # ---------------- fit -------------------------------------------- #
-    def fit(self, data: Dict[str, DataFrame] , warm_start: bool = True):
+    def fit(self, data: Dict[str, DataFrame], current_time: Timestamp, active_mask: torch.Tensor, warm_start: bool = True):
         """
         One-off training (train + valid).
         """
 
         if not warm_start:
             # Update training windows to latest data
-            assert isinstance(data, Cache)
-            # Get latest timestamp from cache
             latest_ts = None
             for bar in data.bars(self.bar_type): #TODO: no bar type
                 if latest_ts is None or bar.ts_event > latest_ts:
@@ -205,22 +203,21 @@ class UMIModel(nn.Module):
 
 
 
-        best_path = self.model_dir / "best.pt"
-        if best_path.exists():
-            self.log.info(f"[fit] Loading weights from {best_path}")
+        latest_path = self.model_dir / "latest.pt"
+        if latest_path.exists():
+            self.log.info(f"[fit] Loading weights from {latest_path}")
             try:
-                self.load_state_dict(torch.load(best_path, map_location='cpu'))
+                self.load_state_dict(torch.load(latest_path, map_location='cpu'))
             except Exception as e:
                 self.log.info(f"[fit] Failed to load weights: {e}, training from scratch")
         else:
-            raise Exception("Could not find best.pt warmed-up model in ", model_dir)
+            raise Exception("Could not find latest.pt warmed-up model in ", model_dir)
 
         # Update training windows for walk-forward
-        current_time = self._clock()
-        if self._last_fit_time:
-            time_shift = current_time - self._last_fit_time
-            self.train_end = self.train_end + time_shift
-            self.valid_end = self.valid_end + time_shift
+        # if self._last_fit_time:
+        #     time_shift = current_time - self._last_fit_time
+        #     self.train_end = self.train_end + time_shift
+        #     self.valid_end = self.valid_end + time_shift
 
         train_mask = idx <= self.train_end
         valid_mask = (idx > self.train_end) & (idx <= self.valid_end)
@@ -239,19 +236,23 @@ class UMIModel(nn.Module):
         loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
         
         # Train
-        best_val = self._train(loader_train, loader_valid, self.warm_training_epochs)
+        best_val = self._train(loader_train, loader_valid, self.warm_training_epochs, active_mask)
+        
+        # Save backup if requested
+        if self.save_backups:
+            backup_name = f"checkpoint_{current_time.strftime('%Y%m%d_%H%M%S')}.pt"
+            torch.save(self.state_dict(), self.model_dir / backup_name)
+            self.log.info(f"[update] Saved backup: {backup_name}")
         
         # Save state
-        torch.save(self.state_dict(), self.model_dir / "best.pt")
+        torch.save(self.state_dict(), self.model_dir / "latest.pt")
 
         # save training logs
-        pd.DataFrame(self._epoch_logs).to_csv(self.model_dir / "train_losses.csv",index=False)
+        #pd.DataFrame(self._epoch_logs).to_csv(self.model_dir / "train_losses.csv",index=False)
         if self._global_epoch == 0:
             self._dump_model_metadata() # save model metadata
 
-        self._last_fit_time = current_time
-        
-        self.log.info(f"[fit] Complete. Best validation: {best_val:.6f}")       
+        self.log.info(f"[update] Complete. Best validation: {best_val:.6f}")       
 
     # ------------------------------------------------------------------ #
     # update : decide if retrain_delta elapsed → refit on latest data    #
@@ -295,6 +296,7 @@ class UMIModel(nn.Module):
             self._active_mask.copy_(new_mask)
 
         # ---------- decide whether to retrain -------------------------
+        # to remove last fit time
         time_elapsed = now >= self._last_fit_time + self.retrain_delta
         if time_elapsed or just_delisted:
             reason = "time window" if time_elapsed else "delisting event"
@@ -477,7 +479,7 @@ class UMIModel(nn.Module):
         return tot / len(loader)
 
     # ------------ shared training routine ---------------------------- #
-    def _train( self, loader_train: "DataLoader", loader_valid: Optional["DataLoader"], n_epochs: int, ) -> float:
+    def _train( self, train_data: Dict[str, DataFrame], valid_data: Optional[Dict[str, DataFrame]], n_epochs: int, active_mask: torch.Tensor ) -> float:
         """ 
         ONE entry-point that now handles all three schedules:
 
@@ -488,6 +490,13 @@ class UMIModel(nn.Module):
                                                 then Stage-2 only
         Returns the best validation MSE seen across *all* phases. 
         """
+
+
+        # ───────────────────────────── loaders ─────────────────────────────
+        ds_train = SlidingWindowDataset(train_data, self.L, self.pred_len, close_idx=self.close_idx)
+        ds_valid = SlidingWindowDataset(valid_data, self.L, self.pred_len, close_idx=self.close_idx)
+        loader_train = DataLoader(ds_train, batch_size=self.batch_size, shuffle=True)
+        loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
 
         # ───────────────────────────── optimisers ──────────────────────────
         opt_s = torch.optim.AdamW(self.stock_factor.parameters(),
@@ -669,192 +678,3 @@ class UMIModel(nn.Module):
         return self.forecaster(
             feat_seq, u_seq, r_t, m_t, stockIDs, target, active_mask
         )
-
-
-
-# ------------------------------------------------------------------ #
-#  Main guard: lets the file act as CLI for SLURM array jobs         #
-# ------------------------------------------------------------------ #
-# if __name__ == "__main__":
-
-#     # use fixed random seeds for reproducibility
-#     torch.manual_seed(0); np.random.seed(0); random.seed(0)
-
-#     BASE_DIR        = Path(__file__).resolve().parent
-#     DEFAULT_DATADIR = BASE_DIR / "data"
-#     DEFAULT_MODELDR = BASE_DIR / "models" / "UMI"          #   umi/models/UMI
-
-#     import argparse, json, pandas as pd, os
-#     ap = argparse.ArgumentParser()
-#     ap.add_argument("--data-dir",   default=DEFAULT_DATADIR, help=f"directory with OHLCV data in format (TICKER).csv")
-#     ap.add_argument("--freq", default="1B", help="frequency of the data e.g. 1D, 15m, 1h. B means 1 business day")
-#     ap.add_argument("--window-len",  type=int, default=60)
-#     ap.add_argument("--pred-len",    type=int, default=1, help="horizon in *bars*, e.g. 4 → predict 4 steps ahead")
-#     ap.add_argument("--dynamic-universe-mult", type=int, default=2, help="over-allocation factor for dynamic universe")   
-#     ap.add_argument("--training-mode", choices=["hybrid","sequential"], default="sequential",
-#                     help="hybrid: stage-1 pre-training, then joint training; sequential: stage-1 first, then stage-2")
-#     ap.add_argument("--retrain-delta", type=int, default=30, help="delta bars (time units) for retraining, e.g. 30, 300 minutes or days")
-#     ap.add_argument("--pretrain-epochs", type=int, default=5, help="Stage-1 epochs before joint training (hybrid)")
-#     ap.add_argument("--patience",    type=int, default=10, help="Early stopping patience epochs for any training stage")
-#     ap.add_argument("--start-train", default="2018-01-01", help="start date for back-test")
-#     ap.add_argument("--end-train",   default="2018-02-28")
-#     ap.add_argument("--end-valid",   default="2018-04-30")
-#     ap.add_argument("--end-test",    default="2018-04-30", help="optional end date for test set")
-#     ap.add_argument("--n-epochs",    type=int, default=1)
-#     ap.add_argument("--batch-size",    type=int, default=128)
-#     ap.add_argument("--n-trials", type=int, default=20)
-#     ap.add_argument("--close-idx", type=int, default=3, help="index of the 'close' column in the dataframes (default: 3)")
-#     ap.add_argument("--model-dir", type=str, default=DEFAULT_MODELDR, help="directory where the model is saved")
-#     ap.add_argument("--bt-end",  default="2018-04-30", help="backtest end date, if not provided, uses the max date in the data")
-
-    
-#     args = ap.parse_args()
-
-#     # ---------- load data -------------------------------------------
-#     if args.data_dir is not None:
-#         data_path = Path(args.data_dir)
-#         if not data_path.is_dir():
-#             raise FileNotFoundError(f"{data_path} is not a directory.")
-
-#         data_dict: dict[str, pd.DataFrame] = {}
-#         for csv_file in data_path.glob("*.csv"):
-#             ticker = csv_file.stem.upper()          # file name → ticker
-
-#             df = pd.read_csv(csv_file)
-
-#             # -- make sure the index is a datetime index the rest of the code expects
-#             if "Date" in df.columns:
-#                 df["Date"] = pd.to_datetime(df["Date"], utc=True)
-#                 df.set_index("Date", inplace=True)
-#             else:
-#                 raise ValueError(f"{csv_file} must contain a 'Date' column.")
-
-#             # OPTIONAL – bring the classic OHLCV to the front so that
-#             #           'Close' really is column #3 as the model defaults expect.
-#             wanted = ["Open", "High", "Low", "Close"]
-#             reorder = [c for c in wanted if c in df.columns] + [c for c in df.columns if c not in wanted]
-#             df = df[reorder]
-#             data_dict[ticker] = df
-#     else:
-#         raise ValueError("No data directory provided. Use --data-dir to specify the path to the data.")
-
-    
-#     clock = SimClock(pd.Timestamp(args.valid_end, tz="UTC"))
-
-#     # ---------- build & fit -----------------------------------------
-#     # Each SLURM array task sees exactly one GPU thanks to CUDA_VISIBLE_DEVICES
-#     model = UMIModel(
-#         freq=args.freq,
-#         feature_dim=len(next(iter(data_dict.values())).columns),
-#         window_len=args.window_len,
-#         pred_len=args.pred_len,
-#         train_end=args.train_end,
-#         valid_end=args.valid_end,
-#         n_epochs=args.n_epochs,     # then trains for n_epochs
-#         batch_size=args.batch_size,
-#         retrain_delta=pd.DateOffset(days=args.retrain_delta),    # to modify if wanted hours or minutes
-#         dynamic_universe_mult=args.dynamic_universe_mult,    # 2x over-allocation for dynamic universe
-#         training_mode=args.training_mode,
-#         pretrain_epochs=args.pretrain_epochs,
-#         patience=args.patience,
-#         close_idx=( args.close_idx if args.close_idx is not None else list(next(iter(data_dict.values())).columns).index("Close")),
-#         model_dir=args.model_dir,
-#         data_dir= args.data_dir,
-#         bt_end = args.bt_end,
-#         clock_fn=clock,              # pass the clock closure
-#     )
-
-#     self.log.info(next(iter(data_dict.items()))[1].head())
-#     self.log.info("Detected close_idx =", list(next(iter(data_dict.values())).columns).index("Close"))
-
-#     try:
-#         model.fit(data_dict, )  
-#     except RuntimeError as e:
-#         if "out of memory" in str(e).lower():
-#             self.log.info("[warn] OOM – retrying with dynamic_universe_mult = 1")
-#             raise
-#         else:
-#             raise
-      
-
-#     assert model._last_fit_time is not None   # sanity check
-
-#         # -------------- WALK-FORWARD BACK-TEST --------------------------
-#     bt_start = pd.Timestamp(args.start_train, tz="UTC")
-#     bt_end   = (pd.Timestamp(args.end_test, tz="UTC")
-#                 if args.bt_end else max(df.index.max() for df in data_dict.values()))
-
-#     # initialise clock *on* bt_start − 1 bar
-#     clock = SimClock(bt_start - pd.Timedelta(model.freq))
-#     model._clock = clock   # hand the mutable clock to the already-fitted model
-
-#     preds, targets = [], []
-#     dates = pd.date_range(bt_start, bt_end, freq="B")  # business days only
-
-#     pred_rows, truth_rows = [], []
-
-
-#     for t in dates:
-#         # advance the clock first
-#         clock.tick(t)
-
-#         # slice up-to-now (keep only last L+1 bars – faster)
-#         now_dict = cut_off(data_dict, t, lookback=model.L + model.pred_len + 1)
-
-#         # === prediction ===
-#         y_hat = model.predict(now_dict)
-
-
-#         step   = pd.tseries.frequencies.to_offset(model.freq) * model.pred_len
-#         t_next = t + step                       # first bar the forecast refers to
-
-#         # 1) close[t]  —— last price we *know* at time t
-#         close_now = {k: df.loc[t, "Close"] for k, df in now_dict.items()}
-
-#         # 2) close[t_next] —— realise it only if it already exists in the file
-#         if all(t_next in df.index for df in data_dict.values()):
-#             close_next = {k: df.loc[t_next, "Close"] for k, df in data_dict.items()}
-
-#             # ----- SERIES we will store -----------------------------------
-#             truth_close_ser = pd.Series(close_next, name=t)            # real future close
-#             truth_ret_ser   = ((truth_close_ser - pd.Series(close_now)) /                 # realised return
-#                             pd.Series(close_now)).rename(t)
-
-#             # optional: convert model's return prediction into a
-#             # predicted close so the notebook can plot both on the same axis
-#             pred_close_ser = (1.0 + pd.Series(y_hat)) * pd.Series(close_now)
-#             pred_close_ser.name = t
-
-#             # ----- book-keeping -------------------------------------------
-#             pred_rows.append(pred_close_ser)
-#             truth_rows.append(truth_close_ser)
-
-#         else:
-#             # Horizon exceeds file – stop the back-test here
-#             break
-
-#         pred_ser = pd.Series(y_hat, name=t)  # pd.Series of predictions, index = tickers
-#         preds.append(pred_ser)  # pd.Series of predictions, index = tickers)
-
-
-#         # ground truth: next-bar return that the model tries to predict
-#         if t + pd.tseries.frequencies.to_offset(model.freq) in now_dict[next(iter(now_dict))].index:
-#             tgt_dict = cut_off(data_dict, t + pd.tseries.frequencies.to_offset(model.freq), lookback=1)
-#             close_now  = {k: df.loc[t, "Close"]   for k, df in now_dict.items()}
-#             close_next = {k: df.iloc[-1]["Close"] for k, df in tgt_dict.items()}
-#             rtn = {k: (close_next[k] - close_now[k]) / close_now[k] for k in close_now}
-#             targets.append(pd.Series(rtn, name=t))
-
-#         # === optional retrain === (maintains correct chronology)
-#         model.update(now_dict)
-
-#     # concatenate & evaluate
-#     pred_df  = pd.concat(pred_rows,  axis=1).T   # predicted closes
-#     truth_df = pd.concat(truth_rows, axis=1).T   # realised closes
-
-#     out_dir = Path(args.model_dir)
-#     pred_df.to_csv(out_dir / "bt_pred_close.csv")
-#     truth_df.to_csv(out_dir / "bt_truth_close.csv")
-
-#     self.log.info("DONE")
-

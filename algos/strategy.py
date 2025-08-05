@@ -211,10 +211,17 @@ class BacktestLongShortStrategy(Strategy):
 
     def on_update(self, event: TimeEvent):
         if event.name == "update_timer":
+
+            # to pass self.clock.utc_now()
             # the logic should be the following:
             # update prediction for the next pred_len = now + holdout - holdout_start
             # checks for stocks events (new or delisted) and retrain_delta and if nothing happens directly calls predict() method of the model (which should happen only if holdout period in bars is passed (otherwise do not do anything), and this variable is in the config.yaml); if retrain delta is passed without stocks event, it calls update() which runs a warm start fit() on the new training window and then the strategy calls predict(); if stock event happens then the strategy calls update() and then predict(). update() should manage the following: if delisting then just use the model active mask to cut off those stocks (so that future preds and training loss are not computed for these. the model is ready to predict after that) but if new stocks are added it checks for universe availability and enough history in the Cache for those new stocks and then calls an initialization. ensure that the most up to date mask is always set by update (or by initialize only at the start) so that the other functions use always the most up to date mask.
-
+            # Update training windows for walk-forward
+            # self._last_fit_time = None                                                                 # last time fit() was called
+            if self._last_fit_time:
+                time_shift = current_time - self._last_fit_time
+                self.train_end = self.train_end + time_shift
+                self.valid_end = self.valid_end + time_shift
     def on_holdout(self, event: TimeEvent):
         if event.name == "holdout_timer":
             # new prediction up until re-optimize portfolio
@@ -355,6 +362,7 @@ class BacktestLongShortStrategy(Strategy):
             "close_idx"=self.cfg["training"]["target_idx"],
             "warm_start"=self.cfg["training"]["warm_start"],
             "warm_training_epochs"=self.cfg["training"]["warm_training_epochs"],
+            "save_backups"= self.cfg["training"]["save_backups"],
             "data_dir"=self.cfg["data_dir"],
             "logger"=self.log,  # Pass logger to model
         }
@@ -380,8 +388,8 @@ class BacktestLongShortStrategy(Strategy):
             tuner = OptunaHparamsTuner( 
                 model_name  = self.cfg["model_name"],
                 ModelClass   = ModelClass,
-                start = self.backtest_start.strftime('%Y-%m-%d_%X'),
-                end = self.valid_end.strftime('%Y-%m-%d_%X'),
+                start = self.backtest_start,
+                end = self.valid_end,
                 logs_dir    = Path(self.cfg.get("logs_dir", "logs")),
                 train_dict  = train_data,
                 model_params= model_params,
@@ -416,8 +424,8 @@ class BacktestLongShortStrategy(Strategy):
         final_tuner = OptunaHparamsTuner( 
             model_name  = self.cfg["model_name"],
             ModelClass   = ModelClass,
-            start = self.backtest_start.strftime('%Y-%m-%d_%X'),
-            end = self.test_end.strftime('%Y-%m-%d_%X'),
+            start = self.backtest_start,
+            end = self.test_end,
             logs_dir    = Path(self.cfg.get("logs_dir", "logs")),
             train_dict  = final_train_data,
             model_params= final_model_params,
@@ -433,12 +441,11 @@ class BacktestLongShortStrategy(Strategy):
         # reload the model to use for walk-forward steps
         self.model = ModelClass(**final_model_params, **best_hparams)
 
-        if (model_dir / "best.pt").exists():
+        if (model_dir / "init.pt").exists():
                 state_dict = torch.load(saved_state_path, map_location='cpu')
                 self.model.load_state_dict(state_dict)
-                self.model._is_initialized = True
         else:
-            raise ImportError(f"Could not find best.pt in {model_dir}")
+            raise ImportError(f"Could not find init.pt in {model_dir}")
         
 
 

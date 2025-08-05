@@ -19,8 +19,8 @@ class OptunaHparamsTuner:
         *,
         model_name: str,
         ModelClass: nn.Model,                    # class  – NOT an instance
-        start: str,                              # train start
-        end: str,                                # validation end
+        start: pd.Timestamp,                     # train start
+        end: pd.Timestamp,                       # validation end
         logs_dir: str | Path = "logs",           # logs root directory 
         train_dict: Dict[str, Any],              # {ticker: DataFrame, ...}
         model_params: Dict[str, Any],
@@ -40,8 +40,9 @@ class OptunaHparamsTuner:
         self.log = log
 
         # directories storing models and hp tuning data
-
-        base_dir   = Path(logs_dir).expanduser().resolve() / "optuna" / f"{start}_{end}"/ model_name
+        start_str = start.strftime('%Y-%m-%d_%X')
+        end_str = end.strftime('%Y-%m-%d_%X')
+        base_dir   = Path(logs_dir).expanduser().resolve() / "optuna" / f"{start_str}_{end_str}"/ model_name
         self.model_params["model_dir"] = base_dir
 
         study_name = model_name.lower()
@@ -91,8 +92,7 @@ class OptunaHparamsTuner:
         trial_hparams = self._suggest(trial)
 
         model = self.ModelClass(**self.model_params, **trial_hparams)
-        model.initialize(self.train_dict)
-        score = model._last_val_loss
+        score = model.initialize(self.train_dict)
 
         # keep a pointer to the weights folder
         trial.set_user_attr("model_dir", str(model.model_dir))
@@ -117,7 +117,7 @@ class OptunaHparamsTuner:
         self.log.info(f"Best hparams: {best.params} \nBest model path: {best.user_attrs["model_dir"]}")
         return {
             "hparams"    : best.params,
-            "model_dir" : Path(best.user_attrs["model_dir"]),   # ← contains best.pt
+            "model_dir" : Path(best.user_attrs["model_dir"]),   # ← contains init.pt
         }
 
 

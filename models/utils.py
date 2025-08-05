@@ -232,13 +232,11 @@ class SlidingWindowDataset(Dataset):
     def __init__(
         self,
         panel: torch.Tensor,      # (T, I, F) F includes "close" at close_idx position
-        active: torch.Tensor,     # (I, T) bool mask for active stocks
         window_len: int,
         pred_len: int,
         close_idx: int = 3,  # usually "close" is at index 3
         with_target: bool = True,
     ):
-        self.active = active  
         self.panel = panel
         self.L = window_len
         self.pred = pred_len
@@ -251,12 +249,11 @@ class SlidingWindowDataset(Dataset):
     def __getitem__(self, idx):
         seq = self.panel[idx : idx + self.L + 1]             # (L+1,I,F)
         prices = seq[..., self.close_idx]                    # (L+1,I)
-        a = self.active[:, idx + self.L]             # (I) activity at t = L  
 
         if self.with_target:
             tgt_close = self.panel[idx + self.L : idx + self.L + self.pred,
                                     :, self.close_idx]       # (pred,I)
             ret = (tgt_close[-1] - tgt_close[0]) / (tgt_close[0] + 1e-8)
             ret = ret.unsqueeze(-1)                          # (I,1)
-            return prices, seq, ret, a
-        return prices, seq, a
+            return prices, seq, ret
+        return prices, seq
