@@ -478,7 +478,7 @@ class UMIModel(nn.Module):
         return tot / len(loader)
 
     # ------------ shared training routine ---------------------------- #
-    def _train( self, train_data: Dict[str, DataFrame], valid_data: Optional[Dict[str, DataFrame]], n_epochs: int, active_mask: torch.Tensor ) -> float:
+    def _train( self, train_data: Dict[str, DataFrame], valid_data: Dict[str, DataFrame], n_epochs: int, active_mask: torch.Tensor ) -> float:
         """ 
         ONE entry-point that now handles all three schedules:
 
@@ -490,12 +490,22 @@ class UMIModel(nn.Module):
         Returns the best validation MSE seen across *all* phases. 
         """
 
+        
+        
 
         # ───────────────────────────── loaders ─────────────────────────────
         ds_train = SlidingWindowDataset(train_data, self.L, self.pred_len, close_idx=self.close_idx)
-        ds_valid = SlidingWindowDataset(valid_data, self.L, self.pred_len, close_idx=self.close_idx)
+        ds_valid = None
+
         loader_train = DataLoader(ds_train, batch_size=self.batch_size, shuffle=True)
-        loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
+        loader_valid = None
+
+        # update() call when valid_data is empty
+        to_validate = len(valid_data) > 0
+        if to_validate:
+            ds_valid = SlidingWindowDataset(valid_data, self.L, self.pred_len, close_idx=self.close_idx)
+            loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
+        
 
         # ───────────────────────────── optimisers ──────────────────────────
         opt_s = torch.optim.AdamW(self.stock_factor.parameters(),
@@ -520,7 +530,7 @@ class UMIModel(nn.Module):
                                                         opt_s, opt_m, opt_f)
 
                 val = float("nan")
-                if loader_valid is not None:
+                if to_validate:
                     val = self._eval(loader_valid)
                     best_val = min(best_val, val)
 
