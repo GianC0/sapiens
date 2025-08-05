@@ -34,25 +34,19 @@ def main():
     # Calculate proper date ranges
     backtest_start = pd.Timestamp(cfg["backtest_start"], tz="UTC")
     train_offset = freq2pdoffset(cfg["train_offset"])
-    valid_offset = freq2pdoffset(cfg["valid_offset"]) 
-    test_offset = freq2pdoffset(cfg["test_offset"])
+    valid_offset = freq2pdoffset(cfg["valid_offset"])
     backtest_end = pd.Timestamp(cfg["backtest_end"], tz="UTC")
     pred_offset = freq2pdoffset(cfg["freq"])*int(cfg["pred_len"])
 
     # Calculate key dates
     train_end = backtest_start + train_offset
-    valid_end = train_end
-    if cfg["training"]["tune_hparams"]:
-        valid_end += valid_offset
-    test_end = valid_end + test_offset
+    valid_end = train_end + valid_offset
     
     # Update config with calculated dates
     cfg["train_start"] = backtest_start
     cfg["train_end"] = train_end.strftime("%Y-%m-%d")
     cfg["valid_start"] = cfg["train_end"] + to_offset("1ns") #ensures dataset segregation 
-    cfg["valid_end"] = valid_end.strftime("%Y-%m-%d")#
-    cfg["test start"] = cfg["valid_end"] + to_offset("1ns")
-    cfg["test_end"] = test_end.strftime("%Y-%m-%d")
+    cfg["valid_end"] = valid_end.strftime("%Y-%m-%d")
     cfg["walkfwd_start"] = cfg["test_end"] + to_offset("1ns")
     cfg["pred_offset"] = pred_offset
 

@@ -42,8 +42,12 @@ class MarketModel(Protocol):
         Retrain/update the model on fresher data.
         
         Args:
-            data: Updated data including train and validation periods
-            **kwargs: Additional parameters (save_backup, etc.)
+            data: Dict[str, DataFrame] where each DataFrame contains the full 
+                history up to current time. Model should split using 
+                self.train_end and self.valid_end. Model should not pass 
+                any validation data if training has to be done on all the
+                updated input.
+            **kwargs: Additional parameters (active_mask, save_backup, etc.)
         """
         ...
 

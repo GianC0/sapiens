@@ -42,8 +42,8 @@ class UMIModel(nn.Module):
         feature_dim: int,
         window_len: int,
         pred_len: int,
-        train_end: str,
-        valid_end: str,
+        train_end: pd.Timestamp,
+        valid_end: pd.Timestamp,
         #retrain_delta: pd.DateOffset = pd.DateOffset(days=30),
         #dynamic_universe_mult: float | int = 2,
         n_epochs: int = 20,
@@ -74,8 +74,10 @@ class UMIModel(nn.Module):
         self.pred_len    = pred_len                                                                 # number of bars to predict
         
         #self.retrain_delta  = retrain_delta                                                        # time delta for retraining 
-        self.train_end      = pd.to_datetime(train_end, utc=True)                                   # end of training date
-        self.valid_end      = pd.to_datetime(valid_end, utc=True)                                   # end of validation date
+        self.train_end      = pd.Timestamp(train_end, tz="UTC")                                     # end of training date
+        self.valid_end      = pd.Timestamp(valid_end, tz="UTC")                                     # end of validation date
+        assert self.valid_end > self.valid_end
+        self.update_window  = self.valid_end - self.train_end                                       # fixed-windows size used for retraining 
         self.log         = logger                                                                   # actions logger
         self.save_backups   = save_backups                                                          # whether to save backups during walk-forward
         #self.bt_end         = pd.to_datetime(bt_end, utc=True)                                     # end of back-test date (optional)
@@ -140,12 +142,15 @@ class UMIModel(nn.Module):
         # Build submodules (learners)
         self._build_submodules()
 
-        # Create train/valid split
+        # Create train/valid split. if train_end == valid_end -> this is an update() call so no 
         train_data = {k: df[df.index <= self.train_end ] for k, df in data.items()}
-        valid_data = {k: df[(df.index > self.train_end) and (df.index <= self.valid_end) ] for k, df in data.items()}
-        
-        # mask is initialized to use all stocks provided for initial training
-        active_mask = torch.ones(self.I)
+        valid_data = {}
+        if self.valid_end > self.train_end:
+            valid_data = {k: df[(df.index > self.train_end) and (df.index <= self.valid_end) ] for k, df in data.items()}
+        elif self.valid_end < self.train_end:
+            raise ValueError(f"Validation end date: {self.valid_end} is earlier that end train end date {self.train_end}")
+            
+
        
         # Train from scratch
         self.log.info(f"[initialize] Training for {self.n_epochs} epochs...")
@@ -164,25 +169,15 @@ class UMIModel(nn.Module):
         return best_val
 
     # ---------------- fit -------------------------------------------- #
-    def fit(self, data: Dict[str, DataFrame], current_time: Timestamp, active_mask: torch.Tensor, warm_start: bool = True):
+    def update(self, data: Dict[str, DataFrame], current_time: Timestamp, active_mask: torch.Tensor, warm_start: bool = True):
         """
         One-off training (train + valid).
         """
+        start = current_time-self.update_window
+        end = current_time
 
         if not warm_start:
-            # Update training windows to latest data
-            latest_ts = None
-            for bar in data.bars(self.bar_type): #TODO: no bar type
-                if latest_ts is None or bar.ts_event > latest_ts:
-                    latest_ts = bar.ts_event
-            
-            if latest_ts:
-                latest = pd.Timestamp(latest_ts, unit='ns', tz='UTC')
-                # Shift windows forward
-                train_period = self.valid_end - self.train_end
-                self.valid_end = latest
-                self.train_end = self.valid_end - train_period
-                self.log.info(f"[fit] Updated windows - train_end: {self.train_end}, valid_end: {self.valid_end}")
+            self.log.info(f"[update] Initialization on most updated window: FROM {start}  TO  {end}")
     
             # Reinitialize with new windows
             self._is_initialized = False
@@ -190,6 +185,10 @@ class UMIModel(nn.Module):
             return
 
         # Check if architecture needs updating after insertion. TODO: does not account for insertion and delisting at the same time
+        latest_path = self.model_dir / "latest.pt"
+        if latest_path.exists():
+            self.load_state_dict(torch.load(latest_path, map_location=self._device))
+        
         if panel.size(1) > self.I_active:
             self.log.info(f"[fit] Universe expanded, need to reinitialize...")
             self.fit(data, initialize=True)
@@ -257,51 +256,51 @@ class UMIModel(nn.Module):
     # ------------------------------------------------------------------ #
     # update : decide if retrain_delta elapsed → refit on latest data    #
     # ------------------------------------------------------------------ #
-    def update(self, data_dict: Dict[str, DataFrame] ):
-        if self._last_fit_time is None:
-            raise RuntimeError("Call fit() before update().")
+    # def update(self, data_dict: Dict[str, DataFrame] ):
+    #     if self._last_fit_time is None:
+    #         raise RuntimeError("Call fit() before update().")
 
-        now = self._clock()        # <── the only place we read “time”
+    #     now = self._clock()        # <── the only place we read “time”
 
-        # ---------- build fresh activity mask at NOW ------------------
+    #     # ---------- build fresh activity mask at NOW ------------------
 
-        #  Add new tickers to the first free slots
-        for k in sorted(data_dict):
-            if k not in self._universe:
-                if len(self._universe) < self.I:        # capacity check
-                    self._universe.append(k)            # reserve slot
-                    self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
-                    return
-                else:
-                    self._universe.append(k)              # give the new stock a slot
-                    self.log.info(f"[info] universe full. Retraining …")
-                    self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
-                    return                                # early exit; retrain done
+    #     #  Add new tickers to the first free slots
+    #     for k in sorted(data_dict):
+    #         if k not in self._universe:
+    #             if len(self._universe) < self.I:        # capacity check
+    #                 self._universe.append(k)            # reserve slot
+    #                 self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
+    #                 return
+    #             else:
+    #                 self._universe.append(k)              # give the new stock a slot
+    #                 self.log.info(f"[info] universe full. Retraining …")
+    #                 self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
+    #                 return                                # early exit; retrain done
 
-        _, active, idx = _build_panel(data_dict, universe=self._universe)
-        new_mask = active[:, -1]                       # (I_active_now) mask for stocks that are live NOW
-        latest = idx[-1]
-        self.valid_end = latest
-        self.train_end = self.valid_end - pd.DateOffset(months=6)
-        pad = self.I - new_mask.size(0)
-        if pad:
-            new_mask = torch.cat([new_mask, torch.zeros(pad, dtype=torch.bool)])
+    #     _, active, idx = _build_panel(data_dict, universe=self._universe)
+    #     new_mask = active[:, -1]                       # (I_active_now) mask for stocks that are live NOW
+    #     latest = idx[-1]
+    #     self.valid_end = latest
+    #     self.train_end = self.valid_end - pd.DateOffset(months=6)
+    #     pad = self.I - new_mask.size(0)
+    #     if pad:
+    #         new_mask = torch.cat([new_mask, torch.zeros(pad, dtype=torch.bool)])
 
-        # ---------- detect newly-delisted stocks ----------------------
-        was_live = self._active_mask[: new_mask.size(0)]
-        just_delisted = (was_live & (~new_mask)).any().item()   # True if at least one stock has disappeared since the last update, False otherwise.
+    #     # ---------- detect newly-delisted stocks ----------------------
+    #     was_live = self._active_mask[: new_mask.size(0)]
+    #     just_delisted = (was_live & (~new_mask)).any().item()   # True if at least one stock has disappeared since the last update, False otherwise.
 
-        # always store most-recent mask for later calls
-        with torch.no_grad():
-            self._active_mask.copy_(new_mask)
+    #     # always store most-recent mask for later calls
+    #     with torch.no_grad():
+    #         self._active_mask.copy_(new_mask)
 
-        # ---------- decide whether to retrain -------------------------
-        # to remove last fit time
-        time_elapsed = now >= self._last_fit_time + self.retrain_delta
-        if time_elapsed or just_delisted:
-            reason = "time window" if time_elapsed else "delisting event"
-            self.log.info(f"Retraining triggered : {reason}.")
-            self.fit(data_dict, warm_start=self.warm_start, n_epochs=self.warm_training_epochs)
+    #     # ---------- decide whether to retrain -------------------------
+    #     # to remove last fit time
+    #     time_elapsed = now >= self._last_fit_time + self.retrain_delta
+    #     if time_elapsed or just_delisted:
+    #         reason = "time window" if time_elapsed else "delisting event"
+    #         self.log.info(f"Retraining triggered : {reason}.")
+    #         self.fit(data_dict, warm_start=self.warm_start, n_epochs=self.warm_training_epochs)
 
     # ------------------------------------------------------------------ #
     # predict : one inference step                                       #

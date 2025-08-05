@@ -70,10 +70,9 @@ class BacktestLongShortStrategy(Strategy):
         
         # Core timing parameters
         self.backtest_start = pd.Timestamp(self.cfg["backtest_start"], tz="UTC")
-        self.backtest_end = pd.Timestamp(self.cfg["backtest_end"], tz="UTC")
         self.train_end = pd.Timestamp(self.cfg["train_end"], tz="UTC")
         self.valid_end = pd.Timestamp(self.cfg["valid_end"], tz="UTC")
-        self.test_end = pd.Timestamp(self.cfg["test_end"], tz="UTC")
+        self.backtest_end = pd.Timestamp(self.cfg["backtest_end"], tz="UTC")
         self.walkfwd_start = pd.Timestamp(self.cfg["walkfwd_start"], tz="UTC")
         self.pred_offset = to_offset(cfg["pred_offset"])
         self.pred_len = int(cfg["pred_len"])
@@ -93,34 +92,6 @@ class BacktestLongShortStrategy(Strategy):
         
         # Loader for data access
         self.loader = CsvBarLoader(cfg=self.cfg)
-        
-        # selected = []
-        
-        # for ticker in candidate_universe:
-        #     if ticker not in loader._frames:
-        #         continue
-                
-        #     df = loader._frames[ticker]
-            
-        #     # Check 1: Has enough historical data before train_end
-        #     train_data = df[df.index < walkfwd_start ]
-        #     if len(train_data) < self.min_bars_required:
-        #         #TODO: implement proper nautilus logger
-        #         print(f"[Universe] Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
-        #         continue
-                
-        #     # Check 2: Active at test start (has data around test start)
-        #     test_window = df[(df.index >= self.test_start - pd.DateOffset(days=5)) & 
-        #                    (df.index <= self.test_start + pd.DateOffset(days=5))]
-        #     if len(test_window) == 0:
-        #         #TODO: implement proper nautilus logger
-        #         print(f"[Universe] Skipping {ticker}: not active at test start")
-        #         continue
-                
-        #     selected.append(ticker)
-            
-        # print(f"[Universe] Selected {len(selected)} from {len(candidate_universe)} candidates")
-        # self.universe=sorted(selected)
 
 
         #TODO: to add cfg["strategy"] as first dimension
@@ -193,21 +164,7 @@ class BacktestLongShortStrategy(Strategy):
             interval=self.retrain_delta,  # Timer interval
             callback=self.on_retrain,  # Custom callback function invoked on timer
         )
-
-        
-
-        # INITIAL MODEL TRAINING STEPS
-        # setup train dataset, with start/end date
-        loader     = CsvBarLoader(cfg=cfg, venue_name="SIM")
-        data_dict  = loader._frames
-
-        
-        # setup universe and ensure enough history for each stock and let universe be universe_mult*n_instruments
-        # model.initialize(): get universe at the beginning and universe at the end and do set_end - set_beg -> initialize only stocks live at end_t+1. handle case when stock is still not there. ensure all stocks have min last history to be counted
-        # set self.now or similar
-
-        for sym in self.universe:
-            self.subscribe_bars(self._bar_type, sym)  
+ 
 
     def on_update(self, event: TimeEvent):
         if event.name == "update_timer":
@@ -410,13 +367,14 @@ class BacktestLongShortStrategy(Strategy):
 
         # Initialize model with best hyperparameters. It will have new model directory and trained on train + valid set
         final_model_params = model_params.copy()
-        final_model_params["valid_end"] = self.test_end.strftime("%Y-%m-%d")
+        final_model_params["train_end"] = self.valid_end
+        final_model_params["valid_end"] = self.valid_end
 
         # Prepare extended training data
         final_train_data = {
             ticker: self.loader._frames[ticker][
                 (self.loader._frames[ticker].index >= self.backtest_start) & 
-                (self.loader._frames[ticker].index <= self.test_end)
+                (self.loader._frames[ticker].index <= self.valid_end)
             ] for ticker in self.universe
         }
 
@@ -425,7 +383,7 @@ class BacktestLongShortStrategy(Strategy):
             model_name  = self.cfg["model_name"],
             ModelClass   = ModelClass,
             start = self.backtest_start,
-            end = self.test_end,
+            end = self.valid_end,
             logs_dir    = Path(self.cfg.get("logs_dir", "logs")),
             train_dict  = final_train_data,
             model_params= final_model_params,

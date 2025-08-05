@@ -18,7 +18,7 @@ class OptunaHparamsTuner:
         self,
         *,
         model_name: str,
-        ModelClass: nn.Model,                    # class  – NOT an instance
+        ModelClass: nn.Module,                   # class  – NOT an instance
         start: pd.Timestamp,                     # train start
         end: pd.Timestamp,                       # validation end
         logs_dir: str | Path = "logs",           # logs root directory 

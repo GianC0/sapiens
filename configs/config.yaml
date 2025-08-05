@@ -15,7 +15,6 @@ currency: USD
 backtest_start: 2021-07-01  # First bar the strategy trades. 
 train_offset:   6M          # Last bar of training set
 valid_offset:   30B         # Validation set (early stopping / Optuna) if enabled
-test_offset:    30B         # It follows that test_end_date = backtest_start + train_offset [+ valid_offset] + test_offset
 backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= backtest_start + train_offset [+ valid_offset] + test_offset + pred_len
 
 # ---------------------------------------------------------------------------
