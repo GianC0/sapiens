@@ -167,6 +167,7 @@ class BacktestLongShortStrategy(Strategy):
  
 
     def on_update(self, event: TimeEvent):
+        #TODO: does not account for insertion and delisting at the same time
         if event.name == "update_timer":
 
             # to pass self.clock.utc_now()

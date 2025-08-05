@@ -13,7 +13,7 @@ currency: USD
 #  Calendar 
 # ---------------------------------------------------------------------------
 backtest_start: 2021-07-01  # First bar the strategy trades. 
-train_offset:   6M          # Last bar of training set
+train_offset:   6M          # Length in Datetime of training set
 valid_offset:   30B         # Validation set (early stopping / Optuna) if enabled
 backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= backtest_start + train_offset [+ valid_offset] + test_offset + pred_len
 
@@ -37,7 +37,7 @@ training:
   batch_size:      64          # Mini-batch size for AdamW                 
   training_mode:   sequential  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) → Stage-1 + Stage-2
   pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
-  patience:        10          # Early-stop patience 
+  patience:        3           # Early-stop patience 
   warm_start:      true        # Enable warm-start                           (common in finance live rolls)
   warm_training_epochs: 5      # Light fine-tune epochs
   retrain_delta:   30B         # Retrain every (30 * freq) bars
@@ -174,8 +174,8 @@ strategy:
     drawdown_pct:      0.15      # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
     max_weight_abs:    0.03      # Max 3 % NAV per single position        (concentration limit)
     max_weight_rel:    0.20      # Max 20 % of gross exposure in one name
-    beta_neutral:                # Optional index-beta hedge 
-      enabled: false
-      benchmark: SPY            # Proxy for market factor (S&P 500 ETF)
-      lookback_days: 60         # Regression window for beta estimation
-      beta_tol: 0.02            # Allow residual β in ±0.02 band
+#    beta_neutral:                # Optional index-beta hedge 
+#      enabled: false
+#      benchmark: SPY            # Proxy for market factor (S&P 500 ETF)
+#      lookback_days: 60         # Regression window for beta estimation
+#      beta_tol: 0.02            # Allow residual β in ±0.02 band

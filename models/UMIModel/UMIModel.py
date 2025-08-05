@@ -76,8 +76,8 @@ class UMIModel(nn.Module):
         #self.retrain_delta  = retrain_delta                                                        # time delta for retraining 
         self.train_end      = pd.Timestamp(train_end, tz="UTC")                                     # end of training date
         self.valid_end      = pd.Timestamp(valid_end, tz="UTC")                                     # end of validation date
-        assert self.valid_end > self.valid_end
-        self.update_window  = self.valid_end - self.train_end                                       # fixed-windows size used for retraining 
+        assert self.valid_end > self.valid_end, "Validation end date must be after training end date."
+
         self.log         = logger                                                                   # actions logger
         self.save_backups   = save_backups                                                          # whether to save backups during walk-forward
         #self.bt_end         = pd.to_datetime(bt_end, utc=True)                                     # end of back-test date (optional)
@@ -123,7 +123,7 @@ class UMIModel(nn.Module):
         """Check if model has been initialized."""
         return self._is_initialized
     
-    def initialize(self, data: Dict[str, DataFrame], **kwargs) -> None:
+    def initialize(self, data: Dict[str, DataFrame], **kwargs) -> float:
         """
         Initial training on historical data.
          
@@ -137,24 +137,15 @@ class UMIModel(nn.Module):
     
         # Register active mask
         self.I = len(data)
-        self.register_buffer("_active_mask",torch.ones(self.I)).bool()
+        active_mask = torch.ones(self.I, dtype=torch.bool)  # all stocks are active at initialization
         
         # Build submodules (learners)
         self._build_submodules()
 
-        # Create train/valid split. if train_end == valid_end -> this is an update() call so no 
-        train_data = {k: df[df.index <= self.train_end ] for k, df in data.items()}
-        valid_data = {}
-        if self.valid_end > self.train_end:
-            valid_data = {k: df[(df.index > self.train_end) and (df.index <= self.valid_end) ] for k, df in data.items()}
-        elif self.valid_end < self.train_end:
-            raise ValueError(f"Validation end date: {self.valid_end} is earlier that end train end date {self.train_end}")
-            
-
        
         # Train from scratch
         self.log.info(f"[initialize] Training for {self.n_epochs} epochs...")
-        best_val = self._train(train_data, valid_data, self.n_epochs, active_mask )
+        best_val = self._train(data, self.n_epochs, active_mask )
         
         # Save initial state
         torch.save(self.state_dict(), self.model_dir / "init.pt")
@@ -168,40 +159,37 @@ class UMIModel(nn.Module):
         self.log.info(f"[initialize] Complete. Best validation: {best_val:.6f}")
         return best_val
 
-    # ---------------- fit -------------------------------------------- #
-    def update(self, data: Dict[str, DataFrame], current_time: Timestamp, active_mask: torch.Tensor, warm_start: bool = True):
+
+    def update(self, data: Dict[str, DataFrame], current_time: Timestamp, active_mask: torch.Tensor):
         """
         One-off training (train + valid).
         """
-        start = current_time-self.update_window
-        end = current_time
+        
 
-        if not warm_start:
-            self.log.info(f"[update] Initialization on most updated window: FROM {start}  TO  {end}")
+        assert len(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
+
+        # set current time for end of training (no validation)
+        # the model assumes that input cutoff of old data is done by strategy at current_time - training_offset
+        self.train_end = current_time
+        self.valid_end = current_time
+
+        if not self.warm_start:
+            self.log.info(f"[update] Warm-start disabled. Initialization on most updated window up until: {current_time}")
     
             # Reinitialize with new windows
             self._is_initialized = False
             self.initialize(data)
             return
 
-        # Check if architecture needs updating after insertion. TODO: does not account for insertion and delisting at the same time
+        assert self._is_initialized
         latest_path = self.model_dir / "latest.pt"
         if latest_path.exists():
             self.load_state_dict(torch.load(latest_path, map_location=self._device))
+        else:
+            raise ImportError(f"Could not find latest.pt warmed-up model in {self.model_dir}")
         
-        if panel.size(1) > self.I_active:
-            self.log.info(f"[fit] Universe expanded, need to reinitialize...")
-            self.fit(data, initialize=True)
-            return
-
         # Regular warm-start training
         self.log.info(f"[fit] Warm-start training...")
-
-        # Build panel
-        panel, active, idx = self._build_panel(data, lookback=None)   # panel.shape: (T,I,F)
-
-
-
         latest_path = self.model_dir / "latest.pt"
         if latest_path.exists():
             self.log.info(f"[fit] Loading weights from {latest_path}")
@@ -211,31 +199,9 @@ class UMIModel(nn.Module):
                 self.log.info(f"[fit] Failed to load weights: {e}, training from scratch")
         else:
             raise Exception("Could not find latest.pt warmed-up model in ", model_dir)
-
-        # Update training windows for walk-forward
-        # if self._last_fit_time:
-        #     time_shift = current_time - self._last_fit_time
-        #     self.train_end = self.train_end + time_shift
-        #     self.valid_end = self.valid_end + time_shift
-
-        train_mask = idx <= self.train_end
-        valid_mask = (idx > self.train_end) & (idx <= self.valid_end)
-        
-        ds_train = SlidingWindowDataset(
-            panel[train_mask], active[:, train_mask],
-            self.L, self.pred_len, close_idx=self.close_idx
-        )
-        ds_valid = SlidingWindowDataset(
-            panel[valid_mask], active[:, valid_mask],
-            self.L, self.pred_len, close_idx=self.close_idx
-        )
-        
-        # Create loaders
-        loader_train = DataLoader(ds_train, batch_size=self.batch_size, shuffle=True)
-        loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
         
         # Train
-        best_val = self._train(loader_train, loader_valid, self.warm_training_epochs, active_mask)
+        _ = self._train(data, self.warm_training_epochs, active_mask)
         
         # Save backup if requested
         if self.save_backups:
@@ -246,12 +212,7 @@ class UMIModel(nn.Module):
         # Save state
         torch.save(self.state_dict(), self.model_dir / "latest.pt")
 
-        # save training logs
-        #pd.DataFrame(self._epoch_logs).to_csv(self.model_dir / "train_losses.csv",index=False)
-        if self._global_epoch == 0:
-            self._dump_model_metadata() # save model metadata
-
-        self.log.info(f"[update] Complete. Best validation: {best_val:.6f}")       
+        self.log.info(f"[update] Complete. Model up-to-date at: {current_time}")       
 
     # ------------------------------------------------------------------ #
     # update : decide if retrain_delta elapsed → refit on latest data    #
@@ -302,10 +263,10 @@ class UMIModel(nn.Module):
     #         self.log.info(f"Retraining triggered : {reason}.")
     #         self.fit(data_dict, warm_start=self.warm_start, n_epochs=self.warm_training_epochs)
 
-    # ------------------------------------------------------------------ #
-    # predict : one inference step                                       #
-    # ------------------------------------------------------------------ #
-    def predict(self, data_dict: Dict[str, DataFrame],  _retry: bool = False) -> Dict[str, float]:
+
+    def predict(self, data_dict: Dict[str, DataFrame],  active_mask: torch.Tensor, _retry: bool = False) -> Dict[str, float]:
+
+        assert len(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
 
         panel, active, idx = _build_panel(data_dict, universe=self._universe)   # (T,I_active,F) , (I_active,T)
         assert panel.size(0) >= self.L + 1, "need L+1 bars for inference"
@@ -364,9 +325,10 @@ class UMIModel(nn.Module):
         
 
 
+# --------------------------------------------------------------------------- #
+# Utilities functions                                                         #
+# --------------------------------------------------------------------------- #
 
-
-    
     # ---------------- hyper-param defaults and suggest function--------------------------- #
     def _default_hparams(self) -> Dict[str, Any]:
         return dict(
@@ -381,7 +343,6 @@ class UMIModel(nn.Module):
             lr_stage2      = 1e-4,
         )
     
-
     # ---------------- sub-module builder ----------------------------- #
     def _build_submodules(self):
         I = self.I
@@ -408,17 +369,7 @@ class UMIModel(nn.Module):
         
         return
 
-    def _log_epoch(self, l_s, l_m, l_p, *, val_pred=None):
-        row = dict(epoch=self._global_epoch, loss_stock=l_s, loss_market=l_m,
-                loss_pred=l_p, val_pred=val_pred)
-        self._epoch_logs.append(row)
-        fn = self.model_dir / "train_losses.csv"
-        pd.DataFrame([row]).to_csv(fn, mode="a", header=not fn.exists(), index=False)
-        self._global_epoch += 1
-
-    # ────────────────────────────────────────────────────────────────
-    # helper – write out every file the visual notebook relies on
-    # ────────────────────────────────────────────────────────────────
+    # ---------------- metadata on memory size and params ------------- #
     def _dump_model_metadata(self):
         """
         Persists:
@@ -461,196 +412,453 @@ class UMIModel(nn.Module):
         with open(self.model_dir / "all_params.json", "w") as fp:
             json.dump(some, fp, indent=2)
 
+    # ----------------------------------------------------------------- #
     # ---------------- training utilities ----------------------------- #
-    
-    # ------------ quick eval helper (MSE on loader) ------------------- #
-    def _eval(self, loader: "DataLoader") -> float:
+    # ----------------------------------------------------------------- #
+    def _train(self, data: Dict[str, DataFrame], n_epochs: int, active_mask: torch.Tensor) -> float:
+        """
+        Unified training function that handles all three training modes:
+        - "joint": Train all components together
+        - "hybrid": Pretrain Stage-1, then joint fine-tuning  
+        - "sequential": Train Stage-1 to convergence, then Stage-2 only
+        
+        Returns the best validation loss achieved.
+        """
+        self.log.info(f"[_train] Starting training with mode: {self.training_mode.capitalize()}")
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # 1. DATA PREPARATION
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        # Create train/valid split. if train_end == valid_end -> this is an update() cal, so no validation 
+        train_data = {k: df[df.index <= self.train_end ] for k, df in data.items()}
+        valid_data = {}
+        if self.valid_end > self.train_end:
+            valid_data = {k: df[(df.index > self.train_end) and (df.index <= self.valid_end) ] for k, df in data.items()}
+        elif self.valid_end < self.train_end:
+            raise ValueError(f"Validation end date: {self.valid_end} is earlier that end train end date {self.train_end}")
+
+        # Build training dataset
+        train_dataset = SlidingWindowDataset(
+            train_data, self.L, self.pred_len, target_idx=self.close_idx
+        )
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+        
+        # Build validation dataset (if available)
+        valid_loader = None
+        has_validation = len(valid_data) > 0
+        if has_validation:
+            valid_dataset = SlidingWindowDataset(
+                valid_data, self.L, self.pred_len, target_idx=self.close_idx
+            )
+            valid_loader = DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=False)
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # 2. OPTIMIZERS SETUP
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        optimizer_stock = torch.optim.AdamW(
+            self.stock_factor.parameters(),
+            lr=self.hp["lr_stage1"],
+            weight_decay=self.hp.get("weight_decay", 0.0)
+        )
+        
+        optimizer_market = torch.optim.AdamW(
+            self.market_factor.parameters(),
+            lr=self.hp["lr_stage1"], 
+            weight_decay=self.hp.get("weight_decay", 0.0)
+        )
+        
+        optimizer_forecaster = torch.optim.AdamW(
+            self.forecaster.parameters(),
+            lr=self.hp["lr_stage2"],
+            weight_decay=self.hp.get("weight_decay", 0.0)
+        )
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # 3. TRAINING STATE INITIALIZATION
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        best_validation_loss = float('inf')
+        self._epoch_logs = []
+        global_epoch = 0
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # 4. TRAINING MODE DISPATCH
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        if self.training_mode == "hybrid":
+            best_validation_loss = self._train_hybrid_mode(
+                train_loader, valid_loader, has_validation,
+                optimizer_stock, optimizer_market, optimizer_forecaster,
+                n_epochs, best_validation_loss, global_epoch
+            )
+            
+        elif self.training_mode == "sequential":
+            best_validation_loss = self._train_sequential_mode(
+                train_loader, valid_loader, has_validation,
+                optimizer_stock, optimizer_market, optimizer_forecaster,
+                n_epochs, best_validation_loss, global_epoch
+            )
+            
+        else:  # "joint" mode (default) - safe fallback
+            best_validation_loss = self._train_joint_mode(
+                train_loader, valid_loader, has_validation,
+                optimizer_stock, optimizer_market, optimizer_forecaster,
+                n_epochs, best_validation_loss, global_epoch
+            )
+        
+        self.log.info(f"[_train] Training completed. Best validation loss: {best_validation_loss:.6f}")
+        return best_validation_loss
+
+
+    def _train_joint_mode(self, train_loader, valid_loader, has_validation,
+                        optimizer_stock, optimizer_market, optimizer_forecaster,
+                        n_epochs, best_validation_loss, global_epoch):
+        """Train all components jointly for n_epochs."""
+        
+        self.log.info(f"[joint] Training all components jointly for {n_epochs} epochs")
+        
+        # Enable gradients for all components
+        self.stock_factor.requires_grad_(True)
+        self.market_factor.requires_grad_(True) 
+        self.forecaster.requires_grad_(True)
+        
+        for epoch in range(n_epochs):
+            # Training step
+            train_loss, loss_stock, loss_market, loss_pred = self._execute_training_epoch(
+                train_loader, optimizer_stock, optimizer_market, optimizer_forecaster
+            )
+            
+            # Validation step
+            validation_loss = float('nan')
+            if has_validation:
+                validation_loss = self._execute_validation_epoch(valid_loader)
+                best_validation_loss = min(best_validation_loss, validation_loss)
+            
+            # Logging
+            if epoch == 0 or (epoch + 1) % max(1, n_epochs // 5) == 0:
+                self.log.info(f"Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                            f"val {validation_loss:.5f} | best {best_validation_loss:.5f}")
+            
+            self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
+            global_epoch += 1
+        
+        return best_validation_loss
+
+
+    def _train_hybrid_mode(self, train_loader, valid_loader, has_validation,
+                        optimizer_stock, optimizer_market, optimizer_forecaster,
+                        n_epochs, best_validation_loss, global_epoch):
+        """Hybrid training: Stage-1 pretraining + joint fine-tuning."""
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # PHASE 1: Stage-1 Pretraining
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        self.log.info(f"[hybrid] Phase 1: Stage-1 pretraining for {self.pretrain_epochs} epochs")
+        
+        # Disable forecaster gradients
+        self.stock_factor.requires_grad_(True)
+        self.market_factor.requires_grad_(True)
+        self.forecaster.requires_grad_(False)
+        
+        for epoch in range(self.pretrain_epochs):
+            train_loss, loss_stock, loss_market, loss_pred = self._execute_training_epoch(
+                train_loader, optimizer_stock, optimizer_market, optimizer_forecaster
+            )
+            
+            validation_loss = float('nan')
+            if has_validation:
+                validation_loss = self._execute_validation_epoch(valid_loader)
+                best_validation_loss = min(best_validation_loss, validation_loss)
+            
+            if epoch == 0 or (epoch + 1) % max(1, self.pretrain_epochs // 3) == 0:
+                self.log.info(f"Pretrain Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                            f"val {validation_loss:.5f} | best {best_validation_loss:.5f}")
+            
+            self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
+            global_epoch += 1
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # PHASE 2: Joint Fine-tuning
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        self.log.info(f"[hybrid] Phase 2: Joint fine-tuning for {n_epochs} epochs")
+        
+        # Enable all gradients and reduce Stage-1 learning rates
+        self.forecaster.requires_grad_(True)
+        stage1_finetune_lr = self.hp.get("lr_stage1_ft", self.hp["lr_stage1"])
+        
+        for param_group in optimizer_stock.param_groups:
+            param_group["lr"] = stage1_finetune_lr
+        for param_group in optimizer_market.param_groups:
+            param_group["lr"] = stage1_finetune_lr
+        
+        for epoch in range(n_epochs):
+            train_loss, loss_stock, loss_market, loss_pred = self._execute_training_epoch(
+                train_loader, optimizer_stock, optimizer_market, optimizer_forecaster
+            )
+            
+            validation_loss = float('nan')
+            if has_validation:
+                validation_loss = self._execute_validation_epoch(valid_loader)
+                best_validation_loss = min(best_validation_loss, validation_loss)
+            
+            if epoch == 0 or (epoch + 1) % max(1, n_epochs // 5) == 0:
+                self.log.info(f"Finetune Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                            f"val {validation_loss:.5f} | best {best_validation_loss:.5f}")
+            
+            self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
+            global_epoch += 1
+        
+        return best_validation_loss
+
+
+    def _train_sequential_mode(self, train_loader, valid_loader, has_validation,
+                            optimizer_stock, optimizer_market, optimizer_forecaster,
+                            n_epochs, best_validation_loss, global_epoch):
+        """Sequential training: Stage-1 with early stopping + Stage-2 only."""
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # PHASE 1: Stage-1 Training with Early Stopping
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        self.log.info(f"[sequential] Phase 1: Stage-1 training with early stopping")
+        
+        # Disable forecaster gradients
+        self.stock_factor.requires_grad_(True)
+        self.market_factor.requires_grad_(True)
+        self.forecaster.requires_grad_(False)
+        
+        # Early stopping state
+        best_stage1_state_stock = None
+        best_stage1_state_market = None
+        patience_counter = 0
+        stage1_best_loss = float('inf')
+        
+        for epoch in range(n_epochs):
+            train_loss, loss_stock, loss_market, loss_pred = self._execute_training_epoch(
+                train_loader, optimizer_stock, optimizer_market, optimizer_forecaster
+            )
+            
+            validation_loss = float('nan')
+            if has_validation:
+                validation_loss = self._execute_validation_epoch(valid_loader)
+                
+                # Early stopping logic
+                improvement_threshold = 0.995  # 0.5% improvement required
+                if validation_loss < stage1_best_loss * improvement_threshold:
+                    stage1_best_loss = validation_loss
+                    best_validation_loss = min(best_validation_loss, validation_loss)
+                    patience_counter = 0
+                    
+                    # Save best Stage-1 weights
+                    best_stage1_state_stock = {k: v.cpu().clone() 
+                                            for k, v in self.stock_factor.state_dict().items()}
+                    best_stage1_state_market = {k: v.cpu().clone() 
+                                            for k, v in self.market_factor.state_dict().items()}
+                else:
+                    patience_counter += 1
+                
+                # Check early stopping
+                if patience_counter >= self.patience:
+                    self.log.info(f"[sequential] Early stopping after {patience_counter} epochs without improvement")
+                    break
+            
+            if epoch == 0 or (epoch + 1) % max(1, n_epochs // 10) == 0:
+                self.log.info(f"Stage1 Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                            f"val {validation_loss:.5f} | best {best_validation_loss:.5f} | patience {patience_counter}")
+            
+            self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
+            global_epoch += 1
+        
+        # Restore best Stage-1 weights
+        if best_stage1_state_stock is not None and best_stage1_state_market is not None and has_validation:
+            self.log.info("[sequential] Restoring best Stage-1 weights")
+            self.stock_factor.load_state_dict(best_stage1_state_stock)
+            self.market_factor.load_state_dict(best_stage1_state_market)
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # PHASE 2: Stage-2 Only Training
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        self.log.info(f"[sequential] Phase 2: Stage-2 training for {n_epochs} epochs")
+        
+        # Freeze Stage-1 components, enable forecaster
+        self.stock_factor.requires_grad_(False)
+        self.market_factor.requires_grad_(False)
+        self.forecaster.requires_grad_(True)
+        
+        # Reinitialize forecaster optimizer
+        optimizer_forecaster = torch.optim.AdamW(
+            self.forecaster.parameters(),
+            lr=self.hp["lr_stage2"],
+            weight_decay=self.hp.get("weight_decay", 0.0)
+        )
+        
+        for epoch in range(n_epochs):
+            train_loss, loss_stock, loss_market, loss_pred = self._execute_training_epoch(
+                train_loader, optimizer_stock, optimizer_market, optimizer_forecaster
+            )
+            
+            validation_loss = float('nan')
+            if has_validation:
+                validation_loss = self._execute_validation_epoch(valid_loader)
+                best_validation_loss = min(best_validation_loss, validation_loss)
+            
+            if epoch == 0 or (epoch + 1) % max(1, n_epochs // 5) == 0:
+                self.log.info(f"Stage2 Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                            f"val {validation_loss:.5f} | best {best_validation_loss:.5f}")
+            
+            self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
+            global_epoch += 1
+        
+        return best_validation_loss
+
+
+    def _execute_training_epoch(self, train_loader, optimizer_stock, optimizer_market, optimizer_forecaster):
+        """Execute one training epoch and return average losses."""
+        
+        # Set models to training mode
+        self.stock_factor.train()
+        self.market_factor.train()
+        self.forecaster.train()
+        
+        total_loss = 0.0
+        total_loss_stock = 0.0
+        total_loss_market = 0.0
+        total_loss_pred = 0.0
+        num_batches = len(train_loader)
+        
+        for batch_idx, (prices_seq, features_seq, targets, active_mask) in enumerate(train_loader):
+            # Move data to device
+            prices_seq = prices_seq.to(self._device)
+            features_seq = features_seq.to(self._device) 
+            targets = targets.to(self._device)
+            active_mask = active_mask.to(self._device)
+            
+            # ═══════════════════════════════════════════════════════════════════════════════
+            # Stage-1 Forward Pass (Stock + Market Factors)
+            # ═══════════════════════════════════════════════════════════════════════════════
+            
+            u_seq, r_t, m_t, loss_stock, loss_market = self._stage1_forward(
+                prices_seq, features_seq, active_mask
+            )
+            
+            # Stage-1 Backward Pass (if components require gradients)
+            stage1_requires_grad = (
+                any(p.requires_grad for p in self.stock_factor.parameters()) or
+                any(p.requires_grad for p in self.market_factor.parameters())
+            )
+            
+            if stage1_requires_grad:
+                optimizer_stock.zero_grad(set_to_none=True)
+                optimizer_market.zero_grad(set_to_none=True)
+                
+                # Parallel backward passes on GPU, sequential on CPU
+                if torch.cuda.is_available():
+                    stream_stock = torch.cuda.Stream()
+                    stream_market = torch.cuda.Stream()
+                    with torch.cuda.stream(stream_stock):
+                        loss_stock.backward(retain_graph=True)
+                        optimizer_stock.step()
+                    with torch.cuda.stream(stream_market):
+                        loss_market.backward()
+                        optimizer_market.step()
+                    torch.cuda.synchronize()  # Wait for both streams
+                else:
+                    loss_stock.backward(retain_graph=True)
+                    loss_market.backward()
+                    optimizer_stock.step()
+                    optimizer_market.step()
+                
+                
+            
+            # ═══════════════════════════════════════════════════════════════════════════════
+            # Stage-2 Forward Pass (Forecasting)
+            # ═══════════════════════════════════════════════════════════════════════════════
+            
+            if any(p.requires_grad for p in self.forecaster.parameters()):
+                predictions, loss_pred, _ = self._stage2_forward(
+                    features_seq, u_seq, r_t, m_t, targets, active_mask
+                )
+                
+                optimizer_forecaster.zero_grad(set_to_none=True)
+                loss_pred.backward()
+                optimizer_forecaster.step()
+            else:
+                # Forecaster frozen, just compute dummy loss for logging
+                loss_pred = torch.tensor(0.0, device=self._device)
+            
+            # ═══════════════════════════════════════════════════════════════════════════════
+            # Accumulate Losses
+            # ═══════════════════════════════════════════════════════════════════════════════
+            
+            batch_total_loss = loss_stock.item() + loss_market.item() + loss_pred.item()
+            total_loss += batch_total_loss
+            total_loss_stock += loss_stock.item()
+            total_loss_market += loss_market.item()
+            total_loss_pred += loss_pred.item()
+        
+        # Return average losses
+        return (
+            total_loss / num_batches,
+            total_loss_stock / num_batches,
+            total_loss_market / num_batches, 
+            total_loss_pred / num_batches
+        )
+
+
+    def _execute_validation_epoch(self, valid_loader):
+        """Execute validation epoch and return average prediction loss."""
+        
+        # Set models to evaluation mode
         self.stock_factor.eval()
         self.market_factor.eval()
         self.forecaster.eval()
-        tot = 0.0
+        
+        total_loss = 0.0
+        
         with torch.no_grad():
-            for p_seq, f_seq, tgt, active_mask in loader:
-                p_seq, f_seq, tgt = p_seq.to(self._device), f_seq.to(self._device), tgt.to(self._device)
-                u_seq, r_t, m_t, _, _  = self._stage1_forward(p_seq, f_seq, active_mask)
-                _, loss, _ = self._stage2_forward(f_seq, u_seq, r_t, m_t, tgt, active_mask)
-                tot += loss.item()
-        return tot / len(loader)
-
-    # ------------ shared training routine ---------------------------- #
-    def _train( self, train_data: Dict[str, DataFrame], valid_data: Dict[str, DataFrame], n_epochs: int, active_mask: torch.Tensor ) -> float:
-        """ 
-        ONE entry-point that now handles all three schedules:
-
-            • self.training_mode == "joint"      – unchanged behaviour
-            • self.training_mode == "hybrid"     – k warm-up epochs (Stage-1 only)
-                                                then joint fine-tune
-            • self.training_mode == "sequential" – Stage-1 with early-stop,
-                                                then Stage-2 only
-        Returns the best validation MSE seen across *all* phases. 
-        """
-
+            for prices_seq, features_seq, targets, active_mask in valid_loader:
+                # Move data to device
+                prices_seq = prices_seq.to(self._device)
+                features_seq = features_seq.to(self._device)
+                targets = targets.to(self._device) 
+                active_mask = active_mask.to(self._device)
+                
+                # Forward pass
+                u_seq, r_t, m_t, _, _ = self._stage1_forward(prices_seq, features_seq, active_mask)
+                _, loss_pred, _ = self._stage2_forward(features_seq, u_seq, r_t, m_t, targets, active_mask)
+                
+                total_loss += loss_pred.item()
         
+        return total_loss / len(valid_loader)
+
+
+    def _log_training_metrics(self, epoch, loss_stock, loss_market, loss_pred, validation_loss):
+        """Log training metrics for the current epoch."""
         
-
-        # ───────────────────────────── loaders ─────────────────────────────
-        ds_train = SlidingWindowDataset(train_data, self.L, self.pred_len, close_idx=self.close_idx)
-        ds_valid = None
-
-        loader_train = DataLoader(ds_train, batch_size=self.batch_size, shuffle=True)
-        loader_valid = None
-
-        # update() call when valid_data is empty
-        to_validate = len(valid_data) > 0
-        if to_validate:
-            ds_valid = SlidingWindowDataset(valid_data, self.L, self.pred_len, close_idx=self.close_idx)
-            loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, shuffle=True)
+        metrics = {
+            'epoch': epoch,
+            'loss_stock': loss_stock,
+            'loss_market': loss_market, 
+            'loss_pred': loss_pred,
+            'val_pred': validation_loss
+        }
         
-
-        # ───────────────────────────── optimisers ──────────────────────────
-        opt_s = torch.optim.AdamW(self.stock_factor.parameters(),
-                                lr=self.hp["lr_stage1"],
-                                weight_decay=self.hp.get("weight_decay", 0))
-        opt_m = torch.optim.AdamW(self.market_factor.parameters(),
-                                lr=self.hp["lr_stage1"],
-                                weight_decay=self.hp.get("weight_decay", 0))
-        opt_f = torch.optim.AdamW(self.forecaster.parameters(),
-                                lr=self.hp["lr_stage2"],
-                                weight_decay=self.hp.get("weight_decay", 0))
-
-        best_val: float = math.inf
-        self._epoch_logs = []
-        ep = 0                         # global epoch counter for logging
-
-        # ────────────────────────── helper inner loop ─────────────────────
-        def _run_epochs(num: int) -> None:
-            nonlocal ep, best_val
-            for _ in range(num):
-                trn, l_s, l_m, l_pred = self._train_epoch(loader_train,
-                                                        opt_s, opt_m, opt_f)
-
-                val = float("nan")
-                if to_validate:
-                    val = self._eval(loader_valid)
-                    best_val = min(best_val, val)
-
-                if ep == 0 or (ep + 1) % max(1, (self.pretrain_epochs + n_epochs) // 5) == 0:
-                    self.log.info(f"ep {ep:>3} | train {trn:.5f} | val {val:.5f} | best {best_val:.5f}")
-
-                self._log_epoch(l_s, l_m, l_pred, val_pred=val)
-                ep += 1
-
-        # ─────────────────────────── schedule switch ──────────────────────
-        if self.training_mode == "hybrid":
-            # 1) warm-up – Stage-1 only
-            self.log.info(f"[hybrid] warm-up Stage-1  ({self.pretrain_epochs} epochs)")
-            self.forecaster.requires_grad_(False)
-            _run_epochs(self.pretrain_epochs)
-
-            # 2) joint fine-tune
-            self.log.info(f"[hybrid] joint fine-tune  ({n_epochs} epochs)")
-            self.forecaster.requires_grad_(True)
-            for g in opt_s.param_groups + opt_m.param_groups:
-                g["lr"] = self.hp.get("lr_stage1_ft", self.hp["lr_stage1"])
-            _run_epochs(n_epochs)
-
-        elif self.training_mode == "sequential":
-            # ---------- Stage-1 with early-stopping ----------
-            self.log.info("[sequential] Stage-1 until early-stop")
-            self.forecaster.requires_grad_(False)
-
-            best_state_s = best_state_m = None
-            bad = 0
-            for _ in range(n_epochs):
-                _, l_s, l_m, l_pred = self._train_epoch(loader_train, opt_s, opt_m, opt_f)
-                val = float("nan")
-                if loader_valid is not None:
-                    val = self._eval(loader_valid)
-                    improve = val < best_val * 0.995
-                    best_val = min(best_val, val)
-                    bad = 0 if improve else bad + 1
-                    if improve:
-                        best_state_s = {k: v.cpu() for k, v in self.stock_factor.state_dict().items()}
-                        best_state_m = {k: v.cpu() for k, v in self.market_factor.state_dict().items()}
-                    if bad >= self.patience:
-                        self.log.info(f"[sequential] early-stop after {bad} bad rounds")
-                        break
-
-                self._log_epoch(l_s, l_m, l_pred, val_pred=val)
-
-            # restore best Stage-1 weights
-            if best_state_s:
-                self.stock_factor.load_state_dict(best_state_s)
-                self.market_factor.load_state_dict(best_state_m)
-
-            # ---------- Stage-2 only ----------
-            self.log.info(f"[sequential] Stage-2 fine-tune  ({n_epochs} epochs)")
-            self.stock_factor.requires_grad_(False)
-            self.market_factor.requires_grad_(False)
-            self.forecaster.requires_grad_(True)
-
-            # (re-)initialise optimiser for the head only
-            opt_f = torch.optim.AdamW(self.forecaster.parameters(),
-                                    lr=self.hp["lr_stage2"],
-                                    weight_decay=self.hp.get("weight_decay", 0))
-            _run_epochs(n_epochs)
-
-        else:   # "joint" (default behaviour)
-            _run_epochs(n_epochs)
-
-        return best_val
- 
-    def _train_epoch(self, loader, optim_s, optim_m, optim_f):
-        self.stock_factor.train(); self.market_factor.train(); self.forecaster.train()
-        sum_pred = sum_s = sum_m = 0.0
-        n_batches = len(loader)
-
-        for p_seq, f_seq, tgt, active_mask in loader:
-            p_seq, f_seq, tgt = p_seq.to(self._device), f_seq.to(self._device), tgt.to(self._device)
-
-            # ───────── Stage-1  (parallel fwd + bwd) ────────────────
-            u_seq, r_t, m_t, loss_s, loss_m = self._stage1_forward(p_seq, f_seq, active_mask)
-
-            if any(p.requires_grad for p in self.stock_factor.parameters()) \
-            or any(p.requires_grad for p in self.market_factor.parameters()):
-
-                optim_s.zero_grad(set_to_none=True)
-                optim_m.zero_grad(set_to_none=True)
-
-                if torch.cuda.is_available():
-                    stream_s, stream_m = torch.cuda.Stream(), torch.cuda.Stream()
-                    with torch.cuda.stream(stream_s):
-                        loss_s.backward(retain_graph=True)
-                    with torch.cuda.stream(stream_m):
-                        loss_m.backward()
-                else:                                  # CPU fallback
-                    loss_s.backward(retain_graph=True)
-                    loss_m.backward()
-
-                optim_s.step(); optim_m.step()
-
-            # ───────── Stage-2  (only if head is trainable) ─────────
-            if any(p.requires_grad for p in self.forecaster.parameters()):
-                preds, loss_pred, _ = self._stage2_forward(
-                    f_seq, u_seq, r_t, m_t, tgt, active_mask
-                )
-                optim_f.zero_grad(set_to_none=True)
-                loss_pred.backward()
-                optim_f.step()
-            else:
-                preds = torch.zeros(tgt.size(0), tgt.size(1), device=tgt.device)
-                loss_pred = torch.tensor(0.0, device=self._device)
-
-            # ───────── bookkeeping ──────────────────────────────────
-            sum_pred += loss_pred.item()
-            sum_s    += loss_s.item()
-            sum_m    += loss_m.item()
-
-        # averages for logging
-        return ( (sum_pred + sum_s + sum_m) / n_batches,
-                sum_s   / n_batches,
-                sum_m   / n_batches,
-                sum_pred / n_batches)
+        self._epoch_logs.append(metrics)
+        
+        # Save to CSV file
+        log_file = self.model_dir / "train_losses.csv"
+        pd.DataFrame([metrics]).to_csv(
+            log_file, 
+            mode="a", 
+            header=not log_file.exists(), 
+            index=False
+        )
+        self._global_epoch += 1
     # ---------------- stage1 / stage2 wrappers ----------------------- #
     def _stage1_forward(self, prices_seq, feat_seq, active_mask):
         """Run stock-level & market-level factor learning *concurrently*."""
@@ -665,18 +873,13 @@ class UMIModel(nn.Module):
                 u_seq, loss_s, _ = self.stock_factor(prices_seq, active_mask)  
             with torch.cuda.stream(stream_m):
                 r_t, m_t, loss_m, _ = self.market_factor(feat_seq, stockIDs, active_mask)
+            torch.cuda.synchronize()  # Wait for both streams to finish
             
         else:
-            # ---- CPU fallback: simple Python threads ----------------- #
-            def _run_stock(): 
-                return self.stock_factor(prices_seq, active_mask)
-            def _run_market(): 
-                return self.market_factor(feat_seq, stockIDs, active_mask)
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                fu_s = pool.submit(_run_stock)
-                fu_m = pool.submit(_run_market)
-                u_seq, loss_s, _ = fu_s.result()
-                r_t, m_t, loss_m, _ = fu_m.result()
+            # ---- CPU: sequential execution -------------------------- #
+            u_seq, loss_s, _ = self.stock_factor(prices_seq, active_mask)
+            r_t, m_t, loss_m, _ = self.market_factor(feat_seq, stockIDs, active_mask)
+
 
         # ---- return results ---------------------------------------- #
         return u_seq, r_t, m_t, loss_s, loss_m
