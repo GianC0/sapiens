@@ -115,7 +115,7 @@ class UMIModel(nn.Module):
 
     def initialize(self, data: Dict[str, DataFrame], **kwargs) -> None:
 
-        assert self._is_initialized == False
+        assert self._is_initialized is False
         """
         Initial training on historical data.
          
@@ -164,7 +164,7 @@ class UMIModel(nn.Module):
         self.log.info(f"[initialize] Complete. Best validation: {best_val:.6f}")
 
     # ---------------- fit -------------------------------------------- #
-    def fit(self, data: DataSource , warm_start: bool = True):
+    def fit(self, data: Dict[str, DataFrame] , warm_start: bool = True):
         """
         One-off training (train + valid).
         """
@@ -364,50 +364,6 @@ class UMIModel(nn.Module):
 
 
 
-    # --------------------------------------------------------------------------- #
-    #  Utility : build a panel tensor from the {stockID: dataframe} dict        #
-    # --------------------------------------------------------------------------- #
-    def _build_panel(data_dict: Dict[str, DataFrame], lookback: int) -> torch.Tensor:
-        """
-        Returns training data tensor of shape (T, I, F) sorted by timestamp ascending &
-        stocks alphabetically.
-        Returns
-        tensor : (T, I, F)
-        active : (I, T)  bool mask for active stocks
-        idx    : DatetimeIndex (UTC)
-        """
-
-        
-        # Set universe
-        universe = sorted(data_dict.keys())
-        self.log.info(f"[initialize] Universe: {len(universe)} stocks")
-        
-        
-        # --- harmonise indices -------------------------------------------------
-        for k, df in data_dict.items():
-            if not isinstance(df.index, pd.DatetimeIndex):
-                df.set_index("Date", inplace=True)
-            df.index = pd.to_datetime(df.index, utc=True)  
-
-        long = pd.concat([df[self.feature_dim].assign(stock=k) for k, df in data_dict.items()])
-
-        # ---------- proper pivot ---------------------------------------------- #
-        df_pivot = long.pivot_table(
-            values=self.feature_dim,      # every feature
-            index=long.index,             
-            columns="stock"
-        ).sort_index()
-
-        #  re-index columns ⇢ fill missing tickers with NaN so slots
-        if universe is not None:
-            df_pivot = df_pivot.reindex( pd.MultiIndex.from_product([self.feature_dim, keys]), axis=1 )
-
-        T, F, I = len(df_pivot), len(self.feature_dim), len(keys)
-        values = torch.tensor(df_pivot.values, dtype=torch.float32)
-        tensor = values.reshape(T, F, I).permute(0,2,1) # (T,I,F)
-        active = torch.isfinite(tensor).all(-1).transpose(0,1) # (I,T)
-
-        return tensor, active, df_pivot.index, universe  
 
     
     # ---------------- hyper-param defaults and suggest function--------------------------- #

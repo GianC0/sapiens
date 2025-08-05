@@ -8,6 +8,7 @@ import pandas as pd
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.model.data.bar import BarType   # public NT API
 import torch
+from torch.utils.data import Dataset
 import re
 from pandas.tseries.frequencies import to_offset
 from nautilus_trader.model.data.bar import BarSpecification           # Specification object
