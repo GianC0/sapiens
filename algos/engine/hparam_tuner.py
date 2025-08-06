@@ -22,7 +22,7 @@ class OptunaHparamsTuner:
         start: pd.Timestamp,                     # train start
         end: pd.Timestamp,                       # validation end
         logs_dir: str | Path = "logs",           # logs root directory 
-        train_dict: Dict[str, Any],              # {ticker: DataFrame, ...}
+        universe_dataframe: Dict[str, Any],              # {ticker: DataFrame, ...}
         model_params: Dict[str, Any],
         defaults: Dict[str, Any],                # default hp values
         search_space: Optional[Dict[str, Dict]], # parsed from YAML
@@ -32,7 +32,7 @@ class OptunaHparamsTuner:
         sampler: optuna.samplers.TPESampler | None = None,
     ):
         self.ModelClass   = ModelClass
-        self.train_dict  = train_dict
+        self.universe_dataframe  = universe_dataframe
         self.search_space = search_space
         self.model_params  = model_params
         self.defaults    = defaults
@@ -92,7 +92,7 @@ class OptunaHparamsTuner:
         trial_hparams = self._suggest(trial)
 
         model = self.ModelClass(**self.model_params, **trial_hparams)
-        score = model.initialize(self.train_dict)
+        score = model.initialize(self.universe_dataframe)
 
         # keep a pointer to the weights folder
         trial.set_user_attr("model_dir", str(model.model_dir))

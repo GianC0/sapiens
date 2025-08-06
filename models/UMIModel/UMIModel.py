@@ -165,7 +165,7 @@ class UMIModel(nn.Module):
         One-off training (train + valid).
         """
         
-        assert len(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
+        assert len(active_mask) == self.I, f"Active mask size must match the number of trained instruments ({self.I})"
 
         # set current time for end of training (no validation)
         # the model assumes that input cutoff of old data is done by strategy at current_time - training_offset
@@ -181,21 +181,19 @@ class UMIModel(nn.Module):
             return
 
         assert self._is_initialized
-        latest_path = self.model_dir / "latest.pt"
-        if latest_path.exists():
-            self.load_state_dict(torch.load(latest_path, map_location=self._device))
-        else:
-            raise ImportError(f"Could not find latest.pt warmed-up model in {self.model_dir}")
-        
+
         # Regular warm-start training
-        self.log.info(f"[fit] Warm-start training...")
+        self.log.info(f"[update] Warm-start training...")
         latest_path = self.model_dir / "latest.pt"
         if latest_path.exists():
-            self.log.info(f"[fit] Loading weights from {latest_path}")
+            self.log.info(f"[update] Loading weights from {latest_path}")
             try:
                 self.load_state_dict(torch.load(latest_path, map_location='cpu'))
             except Exception as e:
-                self.log.info(f"[fit] Failed to load weights: {e}, training from scratch")
+                self.log.info(f"[update] Failed to load weights: {e}, training from scratch")
+                self._is_initialized = False
+                self.initialize(data)
+                return
         else:
             raise ImportError("Could not find latest.pt warmed-up model in ", self.model_dir)
         
@@ -298,6 +296,76 @@ class UMIModel(nn.Module):
         # return as dict {stock: prediction}
         keys = sorted(data_dict.keys())
         return {k: float(preds[0, i].cpu()) for i, k in enumerate(keys)}
+
+    def predict(self, data_dict: Dict[str, DataFrame], active_mask: torch.Tensor = None, _retry: bool = False) -> Dict[str, float]:
+        """
+        Generate predictions for current market state.
+        
+        Args:
+            data_dict: Dict[ticker, DataFrame] with current market data
+            active_mask: Optional pre-computed mask for active instruments
+            
+        Returns:
+            Dict[ticker, prediction] for active instruments only
+        """
+        assert self._is_initialized, "Model must be initialized before prediction"
+        
+        # Build panel from current data
+        dataset = SlidingWindowDataset(
+            data_dict, 
+            self.L, 
+            self.pred_len, 
+            target_idx=self.close_idx,
+            universe_size=self.I
+        )
+        
+        # Get the last window for prediction
+        if len(dataset) == 0:
+            self.log.warning("Insufficient data for prediction")
+            return {}
+        
+        # Get last window
+        prices_seq, feat_seq, _, current_mask = dataset[-1]
+        
+        # Add batch dimension and move to device
+        prices_seq = prices_seq.unsqueeze(0).to(self._device)  # (1, L+1, I)
+        feat_seq = feat_seq.unsqueeze(0).to(self._device)      # (1, L+1, I, F)
+        
+        # Use provided mask or dataset mask
+        if active_mask is not None:
+            mask = active_mask.to(self._device)
+        else:
+            mask = current_mask.to(self._device)
+        
+        # Ensure mask has batch dimension
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)  # (1, I)
+        
+        # Forward pass
+        with torch.no_grad():
+            # Stage 1: Factor learning
+            u_seq, r_t, m_t, _, _ = self._stage1_forward(
+                prices_seq, feat_seq, mask
+            )
+            
+            # Stage 2: Prediction
+            preds, _, _ = self._stage2_forward(
+                feat_seq, u_seq, r_t, m_t, 
+                target=None, active_mask=mask
+            )
+            
+            # Extract predictions for active instruments
+            preds = preds.squeeze(0)  # Remove batch dimension
+            mask = mask.squeeze(0)
+        
+        # Return predictions as dict for active tickers only
+        tickers = sorted(data_dict.keys())
+        result = {}
+        for i, ticker in enumerate(tickers[:self.I]):
+            if i < len(mask) and mask[i]:
+                result[ticker] = float(preds[i].cpu())
+        
+        return result
 
     # ------------------------------------------------------------------ #
     # state-dict helpers (single-process save/load)                       #
@@ -437,9 +505,11 @@ class UMIModel(nn.Module):
         elif self.valid_end < self.train_end:
             raise ValueError(f"Validation end date: {self.valid_end} is earlier that end train end date {self.train_end}")
 
+        active_mask
+
         # Build training dataset
         train_dataset = SlidingWindowDataset(
-            train_data, self.L, self.pred_len, target_idx=self.close_idx
+            train_data, self.L, self.pred_len, target_idx=self.close_idx, feature_dim=self.F,
         )
         train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
         
@@ -448,7 +518,7 @@ class UMIModel(nn.Module):
         has_validation = len(valid_data) > 0
         if has_validation:
             valid_dataset = SlidingWindowDataset(
-                valid_data, self.L, self.pred_len, target_idx=self.close_idx
+                valid_data, self.L, self.pred_len, target_idx=self.close_idx, feature_dim=self.F,
             )
             valid_loader = DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=False)
         

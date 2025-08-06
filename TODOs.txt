@@ -1,7 +1,9 @@
-fix the imports and logic:
-lookback
-strategy
-run backtest
-dataloader
+check TODOs wherever they are
 
-fix the research notebook or change with tensorboard
+
+model masks size (I,)
+model predict
+strategy on_historical() to rolling add data
+dataloaer build_universe_dataframe to update cache to tensor(T,I,F) (actually building tensor
+sliding windo dataset always returning ret even if null (ensure )
+add pyportfolio opt and stock selection

@@ -2,7 +2,7 @@
 Generic long/short strategy for Nautilus Trader.
 
 * Consumes ANY model that follows interfaces.MarketModel
-* Data feed provided by CsvBarLoader (FeatureBarData + Bar)
+* Data feed provided by CsvBarLoader (Bar, FeatureBar)
 * Risk controls: draw-down, trailing stops, ADV cap, fee/slippage models
 """
 from __future__ import annotations
@@ -79,22 +79,39 @@ class BacktestLongShortStrategy(Strategy):
         self.retrain_delta = pd.DateOffset(days=cfg["training"]["retrain_delta"])
 
         # Model and data parameters
+        self.model: Optional[MarketModel] = None
         self.model_name = self.cfg["model_name"]
         self.bar_type = None  # Set in on_start
         self.bar_spec = freq2barspec(self.cfg["freq"])
         self.min_bars_required = self.cfg["window_len"] + self.cfg["pred_len"] + 100  # Safety margin
         
-        # State tracking
-        self.universe: List[str] = []  # Active universe
-        self.model: Optional[MarketModel] = None
-        self._last_prediction_time: Optional[pd.Timestamp] = None
-        self._position_qty: Dict[str, float] = {}  # Track position quantities
         
         # Loader for data access
         self.loader = CsvBarLoader(cfg=self.cfg)
 
+        # State tracking
+        
+        self.universe: List[str] = []  # Ordered list of instruments
+        self.universe_panel: Optional[torch.Tensor] = None  # (T, I, F)
+        self.active_mask: Optional[torch.Tensor] = None  # (I,)
+        self.timestamps: List[pd.Timestamp] = []  # Panel timestamp
+
+        self._last_prediction_time: Optional[pd.Timestamp] = None
+        self._last_retrain_time: Optional[pd.Timestamp] = None
+        self._last_bar_time: Optional[pd.Timestamp] = None
+        self._bars_since_prediction = 0
+
+
+
+
+
+
 
         #TODO: to add cfg["strategy"] as first dimension
+
+        # Position tracking
+        #self._position_qty: Dict[str, float] = {}
+        #self._target_weights: Dict[str, float] = {}
 
         # # 3) ---------------- optimiser --------------------------------
         # opt_name = str(self.cfg.get("optimizer", {}).get("name", "max_sharpe")).lower()
@@ -268,6 +285,45 @@ class BacktestLongShortStrategy(Strategy):
     # INTERNAL HELPERS
     # ================================================================= #
 
+    def _build_universe_dataframe(data: Dict[str, DataFrame], lookback: int) -> torch.Tensor:
+        """
+        Returns training data tensor of shape (T, I, F) sorted by timestamp ascending &
+        stocks alphabetically.
+        Returns
+        tensor : (T, I, F)
+        active : (I, T)  bool mask for active stocks
+        idx    : DatetimeIndex (UTC)
+        """
+
+        keys = self.universe 
+        
+        # --- harmonise indices -------------------------------------------------
+        for k, df in data.items():
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.set_index("Date", inplace=True)
+            df.index = pd.to_datetime(df.index, utc=True)  
+
+        feature_cols = self.cfg["feature_dim"]
+        
+
+        # ---------- proper pivot ---------------------------------------------- #
+        df_pivot = long.pivot_table(
+            values=feature_cols,     
+            index=long.index,         
+            columns="stock"
+        ).sort_index()
+
+        #  re-index columns ⇢ fill missing tickers with NaN so slots
+        if universe is not None:
+            df_pivot = df_pivot.reindex( pd.MultiIndex.from_product([feature_cols, keys]), axis=1 )
+
+        T, F, I = len(df_pivot), len(feature_cols), len(keys)
+        values = torch.tensor(df_pivot.values, dtype=torch.float32)
+        tensor = values.reshape(T, F, I).permute(0,2,1) # (T,I,F)
+        active = torch.isfinite(tensor).all(-1).transpose(0,1) # (I,T)
+
+        return tensor, active, df_pivot.index, universe 
+
     def _select_universe(self):
         """Select stocks active at walk-forward start with sufficient history."""
         candidate_universe = self.loader.universe
@@ -285,7 +341,7 @@ class BacktestLongShortStrategy(Strategy):
                 self.log.info(f"Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
                 continue
             
-            # Check 2: Active at walk-forward start (has data within 5 days)
+            # Check 2: Active at walk-forward start
             pred_window = df[(df.index >= self.walkfwd_start) ]
             if len(pred_window) < self.pred_len :
                 self.log.info(f"Skipping {ticker}: not active at walk-forward start")
