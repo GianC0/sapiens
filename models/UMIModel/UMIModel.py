@@ -165,7 +165,6 @@ class UMIModel(nn.Module):
         One-off training (train + valid).
         """
         
-
         assert len(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
 
         # set current time for end of training (no validation)
@@ -198,7 +197,7 @@ class UMIModel(nn.Module):
             except Exception as e:
                 self.log.info(f"[fit] Failed to load weights: {e}, training from scratch")
         else:
-            raise Exception("Could not find latest.pt warmed-up model in ", model_dir)
+            raise ImportError("Could not find latest.pt warmed-up model in ", self.model_dir)
         
         # Train
         _ = self._train(data, self.warm_training_epochs, active_mask)
@@ -268,7 +267,7 @@ class UMIModel(nn.Module):
 
         assert len(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
 
-        panel, active, idx = _build_panel(data_dict, universe=self._universe)   # (T,I_active,F) , (I_active,T)
+        panel, active = None
         assert panel.size(0) >= self.L + 1, "need L+1 bars for inference"
 
         prices_seq = panel[-self.L-1:, :, self.close_idx]    # (L+1,I)

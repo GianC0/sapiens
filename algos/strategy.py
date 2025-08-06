@@ -195,6 +195,7 @@ class BacktestLongShortStrategy(Strategy):
     def on_instrument(self, instrument: Instrument) -> None:
     def on_instrument_status(self, data: InstrumentStatus) -> None:
     def on_instrument_close(self, data: InstrumentClose) -> None:
+        # update the model mask and ensure the loader still provides same input shape to the model for prediction
     def on_historical_data(self, data: Data) -> None:
     def on_bar(self, bar: Bar):  
         # assuming on_timer happens before then on_bars are called first,
@@ -406,31 +407,6 @@ class BacktestLongShortStrategy(Strategy):
         else:
             raise ImportError(f"Could not find init.pt in {model_dir}")
         
-
-
-    # ----- model factory ----------------------------------------------
-    def _build_model(self) -> MarketModel:
-        name = str(self.cfg["model_name"]).lower()
-        mod = importlib.import_module(f"models.{name}.{name}")
-        ModelClass = getattr(mod, "Model", None) or getattr(mod, f"{name.upper()}Model")
-        if ModelClass is None:
-            raise ImportError(f"models.{name}.{name} must export a Model class")
-        
-        
-        first_df = next(iter(self.loader._frames.values()))
-        
-        model: MarketModel = ModelClass(
-            freq=self.cfg["freq"],
-            feature_dim=len(first_df.columns),
-            window_len=self.cfg["window_len"],
-            pred_len=self.cfg["pred_len"],
-            bar_type=self._bar_type,
-            end_train=self.cfg["train_end"],
-            end_valid=self.cfg["valid_end"],
-            **self.cfg.get("hparams", {}),
-        )
-        model.fit(self.loader._frames, n_epochs=self.cfg["training"]["n_epochs"])
-        return model
 
     # ----- weight optimiser ------------------------------------------
     def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
