@@ -40,7 +40,7 @@ training:
   patience:        3           # Early-stop patience 
   warm_start:      true        # Enable warm-start                           (common in finance live rolls)
   warm_training_epochs: 5      # Light fine-tune epochs
-  retrain_delta:   30B         # Retrain every (30 * freq) bars
+  retrain_offset:   30B         # Retrain every (30 * freq) bars
   save_backups: false          # whether to save backups during walk-forward
 
 

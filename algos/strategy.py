@@ -75,8 +75,10 @@ class BacktestLongShortStrategy(Strategy):
         self.backtest_end = pd.Timestamp(self.cfg["backtest_end"], tz="UTC")
         self.walkfwd_start = pd.Timestamp(self.cfg["walkfwd_start"], tz="UTC")
         self.pred_offset = to_offset(cfg["pred_offset"])
+        self.retrain_offset = to_offset(cfg["training"]["retrain_offset"])
+        self.train_offset = to_offset(cfg["training"]["train_offset"])
         self.pred_len = int(cfg["pred_len"])
-        self.retrain_delta = pd.DateOffset(days=cfg["training"]["retrain_delta"])
+
 
         # Model and data parameters
         self.model: Optional[MarketModel] = None
@@ -178,7 +180,7 @@ class BacktestLongShortStrategy(Strategy):
 
         self.clock.set_timer(
             name="retrain_timer",  
-            interval=self.retrain_delta,  # Timer interval
+            interval=self.retrain_offset,  # Timer interval
             callback=self.on_retrain,  # Custom callback function invoked on timer
         )
  
@@ -190,7 +192,7 @@ class BacktestLongShortStrategy(Strategy):
             # to pass self.clock.utc_now()
             # the logic should be the following:
             # update prediction for the next pred_len = now + holdout - holdout_start
-            # checks for stocks events (new or delisted) and retrain_delta and if nothing happens directly calls predict() method of the model (which should happen only if holdout period in bars is passed (otherwise do not do anything), and this variable is in the config.yaml); if retrain delta is passed without stocks event, it calls update() which runs a warm start fit() on the new training window and then the strategy calls predict(); if stock event happens then the strategy calls update() and then predict(). update() should manage the following: if delisting then just use the model active mask to cut off those stocks (so that future preds and training loss are not computed for these. the model is ready to predict after that) but if new stocks are added it checks for universe availability and enough history in the Cache for those new stocks and then calls an initialization. ensure that the most up to date mask is always set by update (or by initialize only at the start) so that the other functions use always the most up to date mask.
+            # checks for stocks events (new or delisted) and retrain_offset and if nothing happens directly calls predict() method of the model (which should happen only if holdout period in bars is passed (otherwise do not do anything), and this variable is in the config.yaml); if retrain delta is passed without stocks event, it calls update() which runs a warm start fit() on the new training window and then the strategy calls predict(); if stock event happens then the strategy calls update() and then predict(). update() should manage the following: if delisting then just use the model active mask to cut off those stocks (so that future preds and training loss are not computed for these. the model is ready to predict after that) but if new stocks are added it checks for universe availability and enough history in the Cache for those new stocks and then calls an initialization. ensure that the most up to date mask is always set by update (or by initialize only at the start) so that the other functions use always the most up to date mask.
             # Update training windows for walk-forward
             # self._last_fit_time = None                                                                 # last time fit() was called
             if self._last_fit_time:
@@ -285,44 +287,7 @@ class BacktestLongShortStrategy(Strategy):
     # INTERNAL HELPERS
     # ================================================================= #
 
-    def _build_universe_dataframe(data: Dict[str, DataFrame], lookback: int) -> torch.Tensor:
-        """
-        Returns training data tensor of shape (T, I, F) sorted by timestamp ascending &
-        stocks alphabetically.
-        Returns
-        tensor : (T, I, F)
-        active : (I, T)  bool mask for active stocks
-        idx    : DatetimeIndex (UTC)
-        """
 
-        keys = self.universe 
-        
-        # --- harmonise indices -------------------------------------------------
-        for k, df in data.items():
-            if not isinstance(df.index, pd.DatetimeIndex):
-                df.set_index("Date", inplace=True)
-            df.index = pd.to_datetime(df.index, utc=True)  
-
-        feature_cols = self.cfg["feature_dim"]
-        
-
-        # ---------- proper pivot ---------------------------------------------- #
-        df_pivot = long.pivot_table(
-            values=feature_cols,     
-            index=long.index,         
-            columns="stock"
-        ).sort_index()
-
-        #  re-index columns ⇢ fill missing tickers with NaN so slots
-        if universe is not None:
-            df_pivot = df_pivot.reindex( pd.MultiIndex.from_product([feature_cols, keys]), axis=1 )
-
-        T, F, I = len(df_pivot), len(feature_cols), len(keys)
-        values = torch.tensor(df_pivot.values, dtype=torch.float32)
-        tensor = values.reshape(T, F, I).permute(0,2,1) # (T,I,F)
-        active = torch.isfinite(tensor).all(-1).transpose(0,1) # (I,T)
-
-        return tensor, active, df_pivot.index, universe 
 
     def _select_universe(self):
         """Select stocks active at walk-forward start with sufficient history."""
@@ -367,6 +332,8 @@ class BacktestLongShortStrategy(Strategy):
             "feature_dim"=self.cfg["feature_dim"],
             "window_len"=self.cfg["window_len"],
             "pred_len"=self.cfg["pred_len"],
+            "train_offset"=self.train_offset,
+            "pred_offset"=self.pred_offset,
             "train_end"=self.train_end,
             "valid_end"=self.valid_end,
             "batch_size"=self.cfg["training"]["batch_size"],

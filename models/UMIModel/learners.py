@@ -353,14 +353,13 @@ class ForecastingLearning(nn.Module):
         rank_loss = torch.tensor(0.0, device=e_seq.device)
         if target is not None:
             target = target.squeeze(-1)  # (B,I)
-            if active_mask is not None:
-                mask = active_mask.float()                         # (B,I)
-                out = out * mask
-                #tgt_masked = target * mask
-            mse   = F.mse_loss(out, target)
+
+            mse   = F.mse_loss(out[mask],  target[mask])
             rank_loss = 1 - rank_ic(out, target)
             loss = mse + self.lambda_rankic * rank_loss
 
+        # bring to zero the prediction output of de-listed instruments
+        out = out * active_mask.float()
         return out, loss, {"rank_loss": rank_loss.detach()}
 
 

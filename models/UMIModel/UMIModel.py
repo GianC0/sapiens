@@ -24,7 +24,7 @@ import numpy as np
 
 from pandas import DataFrame, Timestamp
 
-from ..utils import SlidingWindowDataset
+from ..utils import SlidingWindowDataset, build_input_tensor, build_pred_tensor
 from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
 
 # --------------------------------------------------------------------------- #
@@ -42,10 +42,10 @@ class UMIModel(nn.Module):
         feature_dim: int,
         window_len: int,
         pred_len: int,
+        train_offset: pd.BaseOffset,
+        pred_offset: pd.BaseOffset,
         train_end: pd.Timestamp,
         valid_end: pd.Timestamp,
-        #retrain_delta: pd.DateOffset = pd.DateOffset(days=30),
-        #dynamic_universe_mult: float | int = 2,
         n_epochs: int = 20,
         batch_size: int = 64,
         patience:int=10,
@@ -72,8 +72,8 @@ class UMIModel(nn.Module):
         # time parameters
         self.freq           = freq                                                                  # e.g. "1d", "15m", "1h"  
         self.pred_len    = pred_len                                                                 # number of bars to predict
-        
-        #self.retrain_delta  = retrain_delta                                                        # time delta for retraining 
+        self.train_offset   = train_offset                                                          # time window for training
+        self.pred_offset    = pred_offset                                                           # time window for prediction
         self.train_end      = pd.Timestamp(train_end, tz="UTC")                                     # end of training date
         self.valid_end      = pd.Timestamp(valid_end, tz="UTC")                                     # end of validation date
         assert self.valid_end > self.valid_end, "Validation end date must be after training end date."
@@ -118,6 +118,8 @@ class UMIModel(nn.Module):
         self._global_epoch = 0                                                                      # global epoch counter for stats
     
 
+
+
     @property
     def is_initialized(self) -> bool:
         """Check if model has been initialized."""
@@ -158,7 +160,6 @@ class UMIModel(nn.Module):
         
         self.log.info(f"[initialize] Complete. Best validation: {best_val:.6f}")
         return best_val
-
 
     def update(self, data: Dict[str, DataFrame], current_time: Timestamp, active_mask: torch.Tensor):
         """
@@ -261,63 +262,30 @@ class UMIModel(nn.Module):
     #         self.fit(data_dict, warm_start=self.warm_start, n_epochs=self.warm_training_epochs)
 
 
-    def predict(self, data_dict: Dict[str, DataFrame],  active_mask: torch.Tensor, _retry: bool = False) -> Dict[str, float]:
-
-        assert len(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
-
-        panel, active = None
-        assert panel.size(0) >= self.L + 1, "need L+1 bars for inference"
-
-        prices_seq = panel[-self.L-1:, :, self.close_idx]    # (L+1,I)
-        feat_seq   = panel[-self.L-1:]                       # (L+1,I,F)
-        prices_seq = prices_seq.to(self._device)
-        feat_seq   = feat_seq.to(self._device)
-
-        # ---- build 1-D mask for the *current* bar (t = L) -------------
-        active_mask = active[:, -1]                          # (I_active) at last time step
-        pad = self.I - active_mask.size(0)
-        if pad>=0:                                              # keep same length as in training
-            active_mask = torch.cat([active_mask, torch.zeros(pad, dtype=torch.bool)])
-        else:
-            if _retry:
-                raise RuntimeError("Universe capacity still insufficient after one retrain.")
-            self.log.info("[warn] universe overflow – growing capacity and retraining once.")
-            # 2) full re-fit on the larger I
-            self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs )
-            # 3) recurse – now pad will be ≥ 0
-            return self.predict(data_dict, _retry=True)
-
-        active_mask = active_mask.to(self._device).unsqueeze(0)  # → (1, I)
-
-        with torch.no_grad():
-            u_seq, r_t, m_t, _ , _ = self._stage1_forward(prices_seq.unsqueeze(0), feat_seq.unsqueeze(0), active_mask=active_mask )
-            preds, _, _ = self._stage2_forward(feat_seq.unsqueeze(0), u_seq, r_t, m_t, target=None, active_mask=active_mask)
-            preds = preds[:, :self.I_active]
-        # return as dict {stock: prediction}
-        keys = sorted(data_dict.keys())
-        return {k: float(preds[0, i].cpu()) for i, k in enumerate(keys)}
-
-    def predict(self, data_dict: Dict[str, DataFrame], active_mask: torch.Tensor = None, _retry: bool = False) -> Dict[str, float]:
+    def predict(self, data: Dict[str, DataFrame], current_time: pd.Timestamp, active_mask: torch.Tensor) -> Dict[str, float]:
         """
         Generate predictions for current market state.
         
         Args:
             data_dict: Dict[ticker, DataFrame] with current market data
-            active_mask: Optional pre-computed mask for active instruments
+            current_time: pd.Timestamp indicating the current time
+            active_mask: pre-computed mask for active instruments for verification
             
         Returns:
             Dict[ticker, prediction] for active instruments only
         """
         assert self._is_initialized, "Model must be initialized before prediction"
+        assert len(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
         
         # Build panel from current data
-        dataset = SlidingWindowDataset(
-            data_dict, 
-            self.L, 
-            self.pred_len, 
-            target_idx=self.close_idx,
-            universe_size=self.I
-        )
+        timestamps = pd.date_range( start=current_time, end=current_time + self.pred_offset, freq=self.freq)
+        data_tensor, data_mask = build_pred_tensor(data, timestamps, feature_dim=self.F)
+        
+        # assertion on the universe size
+        assert data_mask == active_mask, "Active mask mismatch during prediction"
+        
+        dataset = SlidingWindowDataset(data_tensor: torch.Tensor, self.L, self.pred_len, self.close_idx, with_target: bool = False):
+        assert len(dataset) == 1, "Prediction dataset should contain exactly one window"
         
         # Get the last window for prediction
         if len(dataset) == 0:
@@ -325,9 +293,12 @@ class UMIModel(nn.Module):
             return {}
         
         # Get last window
-        prices_seq, feat_seq, _, current_mask = dataset[-1]
+        prices_seq, feat_seq, _, dataset_mask = dataset[0]
+        assert data_mask == dataset_mask, "Dataset mask different from build_pred_tensor input mask during prediction"
+        
         
         # Add batch dimension and move to device
+        # TODO: ensure that B=1 still works in this case and should not be expanded
         prices_seq = prices_seq.unsqueeze(0).to(self._device)  # (1, L+1, I)
         feat_seq = feat_seq.unsqueeze(0).to(self._device)      # (1, L+1, I, F)
         
@@ -337,33 +308,32 @@ class UMIModel(nn.Module):
         else:
             mask = current_mask.to(self._device)
         
-        # Ensure mask has batch dimension
-        if mask.dim() == 1:
-            mask = mask.unsqueeze(0)  # (1, I)
         
         # Forward pass
         with torch.no_grad():
             # Stage 1: Factor learning
-            u_seq, r_t, m_t, _, _ = self._stage1_forward(
-                prices_seq, feat_seq, mask
-            )
+            u_seq, r_t, m_t, _, _ = self._stage1_forward(prices_seq, feat_seq, mask)
             
             # Stage 2: Prediction
-            preds, _, _ = self._stage2_forward(
-                feat_seq, u_seq, r_t, m_t, 
-                target=None, active_mask=mask
-            )
+            preds, _, _ = self._stage2_forward(feat_seq, u_seq, r_t, m_t, target=None, active_mask=mask)
             
-            # Extract predictions for active instruments
-            preds = preds.squeeze(0)  # Remove batch dimension
-            mask = mask.squeeze(0)
+            # Extract predictions for instruments
+            preds = preds.squeeze(0)  # Remove batch dimension -> (I,)
+
+            #TODO: ensure to be able to pred for pred_len>1 :  preds = (I, self.pred_len)
         
         # Return predictions as dict for active tickers only
-        tickers = sorted(data_dict.keys())
+        #tickers = list(data.keys())
+        #result = {}
+        #for i, ticker in enumerate(tickers):
+        #    if i < len(mask) and mask[i]:
+        #        result[ticker] = float(preds[i].cpu())
+
+        # Return predictions as dict for ALL tickers
+        tickers = list(data.keys())
         result = {}
-        for i, ticker in enumerate(tickers[:self.I]):
-            if i < len(mask) and mask[i]:
-                result[ticker] = float(preds[i].cpu())
+        for i, ticker in enumerate(tickers):
+            result[ticker] = float(preds[i].cpu())
         
         return result
 
@@ -496,30 +466,26 @@ class UMIModel(nn.Module):
         # ═══════════════════════════════════════════════════════════════════════════════
         # 1. DATA PREPARATION
         # ═══════════════════════════════════════════════════════════════════════════════
-        
-        # Create train/valid split. if train_end == valid_end -> this is an update() cal, so no validation 
-        train_data = {k: df[df.index <= self.train_end ] for k, df in data.items()}
-        valid_data = {}
-        if self.valid_end > self.train_end:
-            valid_data = {k: df[(df.index > self.train_end) and (df.index <= self.valid_end) ] for k, df in data.items()}
-        elif self.valid_end < self.train_end:
+
+        if self.valid_end < self.train_end:
             raise ValueError(f"Validation end date: {self.valid_end} is earlier that end train end date {self.train_end}")
 
-        active_mask
+        # Create common timestamp index
+        timestamps = pd.date_range(start=self.valid_end - self.train_offset, end=self.valid_end, freq=self.freq)
+        
 
+        (train_tensor, train_mask) , (valid_tensor, valid_mask) = build_input_tensor(data=data, timestamps=timestamps, feature_dim=self.F, split_valid_timestamp=self.train_end )
+
+        assert valid_mask == active_mask, "Active mask mismatch during training"
         # Build training dataset
-        train_dataset = SlidingWindowDataset(
-            train_data, self.L, self.pred_len, target_idx=self.close_idx, feature_dim=self.F,
-        )
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+        train_dataset = SlidingWindowDataset(train_tensor, self.L, self.pred_len, target_idx=self.close_idx)
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=False)
         
         # Build validation dataset (if available)
         valid_loader = None
-        has_validation = len(valid_data) > 0
+        has_validation = len(valid_tensor) > 0
         if has_validation:
-            valid_dataset = SlidingWindowDataset(
-                valid_data, self.L, self.pred_len, target_idx=self.close_idx, feature_dim=self.F,
-            )
+            valid_dataset = SlidingWindowDataset(valid_tensor, self.L, self.pred_len, target_idx=self.close_idx)
             valid_loader = DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=False)
         
         # ═══════════════════════════════════════════════════════════════════════════════

@@ -226,9 +226,10 @@ def freq2pdoffset(freq_str: str):
 class SlidingWindowDataset(Dataset):
     """
     Yields tuples:
-      prices_seq : (L+1, I)
-      feat_seq   : (L+1, I, F)
-      target     : (I, 1)   -- next-bar return (t = L)  [optional]
+      seq : (L+1, I, F)    -- sequence of features for all instruments (L+1 timestamps)
+      prices   : (L+1, I)  -- prices at each timestamp in the window
+      ret     : (I, 1)     -- next-bar return (t = L)  [optional]
+      active_mask : (I,)   -- True if instrument is active at last timestamp in window
     """
     def __init__(
         self,
@@ -250,10 +251,159 @@ class SlidingWindowDataset(Dataset):
     def __getitem__(self, idx):
         seq = self.panel[idx : idx + self.L + 1]             # (L+1,I,F)
         prices = seq[..., self.target_idx]                   # (L+1,I)
-        ret = np.nan                                         # instrument return is NaN if this is walk-farward
+        ret = None                                         # instrument return is NaN if this is walk-farward
+        # Compute active mask for this window (based on last timestamp in window)
+        active_mask = ~torch.all(torch.isnan(seq[-1]), dim=1)  # (I,)
         if self.with_target:
             tgt_close = self.panel[idx + self.L : idx + self.L + self.pred,
                                     :, self.target_idx]       # (pred,I)
-            ret = (tgt_close[-1] - tgt_close[0]) / (tgt_close[0] + 1e-8)
-            ret = ret.unsqueeze(-1)                          # (I,1)
-        return prices, seq, ret
+            ret = (tgt_close[-1] - tgt_close[0]) / (tgt_close[0] + 1e-8)  # (I,)
+        return prices, seq, ret, active_mask
+
+
+def build_input_tensor(
+    data: Dict[str, pd.DataFrame],
+    timestamps: pd.DatetimeIndex,
+    feature_dim: int,
+    split_valid_timestamp: pd.Timestamp,
+) -> Tuple[torch.Tensor, torch.BoolTensor, pd.DatetimeIndex]:
+    """
+    Efficiently build aligned tensor from dict of DataFrames.
+    
+    Args:
+        data: Dict mapping ticker to DataFrame with features
+        timestamps: DatetimeIndex of all timestamps
+        universe: List of tickers to include (in order)
+        feature_dim: Number of features per instrument (e.g. 5 for OHLCV)
+        split_valid_timestamp: Timestamp to split training and validation data
+        
+    Returns 
+        tuple for training and validation:
+        - tensor: (T, I, F) tensor with NaN for missing data
+        - mask: (I,) boolean mask for last timestamp only (True = active)
+        
+        
+    Raises:
+        ValueError: If universe is empty or all timestamps are NaN
+    """
+    if not universe:
+        raise ValueError("Universe cannot be empty")
+    
+    universe = list(data.keys())
+    
+    # Pre-allocate array for efficiency
+    F = feature_dim
+    T = len(timestamps)
+    I = len(universe)
+    
+    # Use float32 to save memory (matches PyTorch default)
+    tensor_array = np.full((T, I, F), np.nan, dtype=np.float32)
+    
+    # Fill in data for each instrument
+    for i, ticker in enumerate(universe):
+        # Reindex to common timestamps (automatically fills NaN for missing)
+        assert data[ticker].shape == (T,F)
+        aligned = data[ticker].reindex(timestamps)
+        # Copy values into pre-allocated array
+        tensor_array[:, i, :] = aligned.values
+    
+    # Validate that we have at least some data
+    if np.all(np.isnan(tensor_array)):
+        raise ValueError("All data is NaN - no valid observations")
+    
+    # Check for completely empty timestamps
+    empty_timestamps = np.all(np.isnan(tensor_array), axis=(1, 2))
+    if np.any(empty_timestamps):
+        n_empty = np.sum(empty_timestamps)
+        first_empty = timestamps[np.where(empty_timestamps)[0][0]]
+        raise ValueError(
+            f"Found {n_empty} completely empty timestamps. "
+            f"First at {first_empty}. Check data alignment."
+        )
+    
+    
+
+    train_idx = timestamps <= split_valid_timestamp
+
+    # Instrument is active if it has ALL non-NaN value at last timestamp
+    # train tensor and mask
+    train_tensor = torch.from_numpy(tensor_array[train_idx])  # (T_train, I, F)
+    train_mask = torch.from_numpy(~np.all(np.isnan(train_tensor[-1, :, :]), axis=1))  # (I,)
+
+    # valid tensor and mask
+    valid_tensor = torch.tensor(0)
+    valid_mask = torch.tensor(0)
+    # Create train/valid split. if train_end == valid_end -> this is an update() cal, so no validation 
+    if split_valid_timestamp < timestamps[-1]:
+        valid_tensor = torch.from_numpy(tensor_array[~train_idx])  # (T_valid, I, F)
+        valid_mask = torch.from_numpy(~np.all(np.isnan(valid_tensor[-1, :, :]), axis=1))  # (I,)
+
+    return (train_tensor, train_mask), (valid_tensor, valid_mask)
+
+def build_pred_tensor(    
+    data: Dict[str, pd.DataFrame],
+    timestamps: pd.DatetimeIndex,
+    feature_dim: int,
+) -> Tuple[torch.Tensor, torch.BoolTensor, pd.DatetimeIndex]:
+    """
+    Efficiently build aligned tensor from dict of DataFrames.
+    
+    Args:
+        data: Dict mapping ticker to DataFrame with features
+        timestamps: DatetimeIndex of all timestamps
+        universe: List of tickers to include (in order)
+        feature_dim: Number of features per instrument (e.g. 5 for OHLCV)
+        split_valid_timestamp: Timestamp to split training and validation data
+        
+    Returns 
+        tuple for training and validation:
+        - tensor: (T, I, F) tensor with NaN for missing data
+        - mask: (I,) boolean mask for last timestamp only (True = active)
+        
+        
+    Raises:
+        ValueError: If universe is empty or all timestamps are NaN
+    """
+    if not universe:
+        raise ValueError("Universe cannot be empty")
+    
+    universe = list(data.keys())
+    
+    # Pre-allocate array for efficiency
+    F = feature_dim
+    T = len(timestamps)
+    I = len(universe)
+    
+    # Use float32 to save memory (matches PyTorch default)
+    tensor_array = np.full((T, I, F), np.nan, dtype=np.float32)
+    
+    # Fill in data for each instrument
+    for i, ticker in enumerate(universe):
+        # Reindex to common timestamps (automatically fills NaN for missing)
+        assert data[ticker].shape == (T,F)
+        aligned = data[ticker].reindex(timestamps)
+        # Copy values into pre-allocated array
+        tensor_array[:, i, :] = aligned.values
+    
+    # Validate that we have at least some data
+    if np.all(np.isnan(tensor_array)):
+        raise ValueError("All data is NaN - no valid observations")
+    
+    # Check for completely empty timestamps
+    empty_timestamps = np.all(np.isnan(tensor_array), axis=(1, 2))
+    if np.any(empty_timestamps):
+        n_empty = np.sum(empty_timestamps)
+        first_empty = timestamps[np.where(empty_timestamps)[0][0]]
+        raise ValueError(
+            f"Found {n_empty} completely empty timestamps. "
+            f"First at {first_empty}. Check data alignment."
+        )
+    
+    
+
+    # train tensor and mask
+    pred_tensor = torch.from_numpy(tensor_array)  # (T, I, F)
+    # Instrument is active if it has ALL non-NaN value at last timestamp
+    pred_mask = torch.from_numpy(~np.all(np.isnan(pred_tensor[-1, :, :]), axis=1))  # (I,)
+
+    return pred_tensor, pred_mask
