@@ -479,7 +479,7 @@ class UMIModel(nn.Module):
         assert valid_mask == active_mask, "Active mask mismatch during training"
         # Build training dataset
         train_dataset = SlidingWindowDataset(train_tensor, self.L, self.pred_len, target_idx=self.close_idx)
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
         
         # Build validation dataset (if available)
         valid_loader = None
