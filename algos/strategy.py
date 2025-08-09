@@ -95,54 +95,15 @@ class BacktestLongShortStrategy(Strategy):
         
         self.universe: List[str] = []  # Ordered list of instruments
         self.active_mask: Optional[torch.Tensor] = None  # (I,)
-        self.timestamps: List[pd.Timestamp] = []  # Panel timestamp
+        #self.data_dict: Dict[str, pd.DataFrame] = {}  # {symbol: DataFrame}
 
         self._last_prediction_time: Optional[pd.Timestamp] = None
         self._last_retrain_time: Optional[pd.Timestamp] = None
         self._last_bar_time: Optional[pd.Timestamp] = None
         self._bars_since_prediction = 0
 
+        # TODO: consider sharpe ration on (pred_ret - risk-free) / 
 
-
-
-
-
-
-        #TODO: to add cfg["strategy"] as first dimension
-
-        # Position tracking
-        #self._position_qty: Dict[str, float] = {}
-        #self._target_weights: Dict[str, float] = {}
-
-        # # 3) ---------------- optimiser --------------------------------
-        # opt_name = str(self.cfg.get("optimizer", {}).get("name", "max_sharpe")).lower()
-        # rf = (
-        #     float(self.loader.rf_series.iloc[-1])
-        #     if self.loader.rf_series is not None
-        #     else 0.0
-        # )
-        # self.optimizer = MaxSharpeRatioOptimizer(risk_free=rf) if opt_name == "max_sharpe" else None
-
-        # self.selector_k = int(self.cfg["selection"]["top_k"])
-
-        # # 4) ---------------- risk helpers -----------------------------
-        # self.trailing_stop_pct = float(self.cfg["risk"]["trailing_stop_pct"])
-        # self.drawdown_pct = float(self.cfg["risk"]["drawdown_pct"])
-        # self.max_w_abs = float(self.cfg["risk"]["max_weight_abs"])
-        # self.max_w_rel = float(self.cfg["risk"]["max_weight_rel"])
-        # self.target_vol = float(self.cfg["risk"]["target_vol_annual"])
-        # self.trailing_stops: Dict[str, float] = {}
-        # self.realised_returns: List[float] = []
-        # self.equity_peak_value: float = 0.0
-        # self.equity_analyzer = EquityCurveAnalyzer()
-
-        # # 5) ---------------- execution --------------------------------
-        # self.fee_model = CommissionModelBps(float(self.cfg["costs"]["fee_bps"]))
-        # self.slip_model = SlippageModelBps(float(self.cfg["costs"]["spread_bps"]))
-        # self.twap_slices = max(1, int(self.cfg["execution"]["twap_slices"]))
-        # self.parallel_orders = max(1, int(self.cfg["execution"]["parallel_orders"]))
-        # self.adv_lookback = int(self.cfg["liquidity"]["adv_lookback"])
-        # self.max_adv_pct = float(self.cfg["liquidity"]["max_adv_pct"])
 
     # ================================================================= #
     # Nautilus event handlers
@@ -179,36 +140,47 @@ class BacktestLongShortStrategy(Strategy):
 
     def on_update(self, event: TimeEvent):
         #TODO: does not account for insertion and delisting at the same time
-        if event.name == "update_timer":
-            now = self.clock.utc_now()
-            self.log.info(f"Update timer fired at {now}")
-            assert self.model.is_initialized()
+        if event.name != "update_timer":
+            return
 
-            
-            if self.universe == self.model._universe:
-                self.model.predict()
-            else:
+        now = self.clock.utc_now()
+        self.log.info(f"Update timer fired at {now}")
+        assert self.model.is_initialized()
 
+        data_dict = self._cache_to_dict(self.model.L + 1) # TODO: make it more generic for all models.
 
-            # the logic should be the following:
-            # new prediction up until re-optimize portfolio
-            # update prediction for the next pred_len = now + holdout - holdout_start
-            # checks for stocks events (new or delisted) and retrain_offset and if nothing happens directly calls predict() method of the model (which should happen only if holdout period in bars is passed (otherwise do not do anything), and this variable is in the config.yaml); if retrain delta is passed without stocks event, it calls update() which runs a warm start fit() on the new training window and then the strategy calls predict(); if stock event happens then the strategy calls update() and then predict(). update() should manage the following: if delisting then just use the model active mask to cut off those stocks (so that future preds and training loss are not computed for these. the model is ready to predict after that) but if new stocks are added it checks for universe availability and enough history in the Cache for those new stocks and then calls an initialization. ensure that the most up to date mask is always set by update (or by initialize only at the start) so that the other functions use always the most up to date mask.
-            # Update training windows for walk-forward
+        assert self.universe == self.model._universe, "Universe mismatch between strategy and model"
+        preds = self.model.predict(data=data_dict, current_time=now, active_mask=self.active_mask) #  preds: Dict[str, float]
+
+        # logic to handle orders and portfolio updates
+        ## LOGIC HERE
+
+        return 
+        # the logic should be the following:
+        # new prediction up until re-optimize portfolio
+        # update prediction for the next pred_len = now + holdout - holdout_start
+        # checks for stocks events (new or delisted) and retrain_offset and if nothing happens directly calls predict() method of the model (which should happen only if holdout period in bars is passed (otherwise do not do anything), and this variable is in the config.yaml); if retrain delta is passed without stocks event, it calls update() which runs a warm start fit() on the new training window and then the strategy calls predict(); if stock event happens then the strategy calls update() and then predict(). update() should manage the following: if delisting then just use the model active mask to cut off those stocks (so that future preds and training loss are not computed for these. the model is ready to predict after that) but if new stocks are added it checks for universe availability and enough history in the Cache for those new stocks and then calls an initialization. ensure that the most up to date mask is always set by update (or by initialize only at the start) so that the other functions use always the most up to date mask.
+        # Update training windows for walk-forward
             
 
     def on_retrain(self, event: TimeEvent):
-        elif event.name == "retrain_timer":
-    
+        if event.name != "retrain_timer":
+            return
+
+            
             
 
     # ================================================================= #
     # DATA handlers
     # ================================================================= #
     def on_instrument(self, instrument: Instrument) -> None:
+        """Handle new instrument events."""
+        # verify if delisted or new:
+        # update mask / trigger retrain + reset on_retrain timer
     def on_instrument_status(self, data: InstrumentStatus) -> None:
     def on_instrument_close(self, data: InstrumentClose) -> None:
         # update the model mask and ensure the loader still provides same input shape to the model for prediction
+        # remove from cache ??
     def on_historical_data(self, data: Data) -> None:
     def on_bar(self, bar: Bar):  
         # assuming on_timer happens before then on_bars are called first,
@@ -280,8 +252,6 @@ class BacktestLongShortStrategy(Strategy):
     # ================================================================= #
     # INTERNAL HELPERS
     # ================================================================= #
-
-
 
     def _select_universe(self):
         """Select stocks active at walk-forward start with sufficient history."""
@@ -424,19 +394,40 @@ class BacktestLongShortStrategy(Strategy):
         else:
             raise ImportError(f"Could not find init.pt in {model_dir}")
         
-    def _cache_to_dict_now(self, current_time: pd.Timestamp):
+    def _cache_to_dict(self, window: int) -> Dict[str, pd.DataFrame]:
         """
-        Returns a data dictionary of the format Dict[str, pd.Dataframe] for
-        all instruments traded within the cache (common to all strtegies)
+        Convert cache data to dictionary format expected by model.
+        Efficient implementation using cache's native methods.
         """
-        data = {}
-
+        data_dict = {}
+        
         for iid in self.cache.instrument_ids():
+            # ensure symbol is in universe
+            if iid.symbol.value not in self.universe:
+                continue
             bar_type = BarType(instrument_id=iid, bar_spec= self.bar_spec)
-                
-            bars = self.cache.bars(bar_type)
-
             
+            # Get bars from cache
+            bars = self.cache.bars(bar_type)[-window:]  # Get last 'window' bars
+            if not bars or len(bars) < self.min_bars_required:
+                self.log.warning(f"Insufficient bars for {symbol}: {len(bars)} < {self.min_bars_required}")
+                continue
+            # Convert bars to DataFrame
+            bar_data = {
+                "Date": [b.ts_event for b in bars],
+                "Open": [b.open for b in bars],
+                "High": [b.high for b in bars],
+                "Low": [b.low for b in bars],
+                "Close": [b.close for b in bars],
+                "Volume": [b.volume for b in bars],
+            }
+            df = pd.DataFrame(bar_data)
+            df.set_index("Date", inplace=True)
+            df.sort_index(inplace=True)  # Ensure chronological order
+            data_dict[iid.symbol.value] = df
+
+        return data_dict 
+
     # ----- weight optimiser ------------------------------------------
     def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
         mu = np.array([preds[s] for s in self.universe])

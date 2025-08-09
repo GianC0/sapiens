@@ -70,23 +70,30 @@ class StockLevelFactorLearning(nn.Module):
         # prices_seq : (B, L+1, I)
         B, L1, I = prices_seq.shape
         assert I == self.I
-        beta = self.beta * (~torch.eye(I, device=prices_seq.device).bool()).float()
-        attn = self.attn_weights.masked_fill(torch.eye(I, device=prices_seq.device).bool(), -1e9)
-        attn = F.softmax(attn, 1)
-        virt = prices_seq @ beta.t()            # (B,L+1,I)
-        u_seq = virt @ attn.t()                 # (B,L+1,I)
+        assert active_mask is None or active_mask.shape == (B, I), "active_mask must match batch and stock dimensions"
 
-        # ─── Masking out delisted/removed stocks ─────────────────────────────────────
-        if active_mask is not None:
-            m = active_mask.unsqueeze(1).unsqueeze(1)     # (B,1,1,I)
-            prices_seq = prices_seq * m
-            virt       = virt       * m
-            u_seq      = u_seq      * m
+        # ensure active_mask is a boolean tensor
+        if active_mask is None:
+            active_mask = torch.ones((B, I), device=e_seq.device, dtype=torch.bool)
+
+        # COMPUTE u_seq
+
+        # masking diagonal elements
+        im = ~torch.eye(I, device=prices_seq.device).bool()
+        beta_masked = self.beta * mask.float()
+
+        # For each stock i: weighted sum of other stocks j
+        virt = torch.einsum('btj,ij->bti', prices_seq, beta_masked)  # (B,L+1,I)
+
+        attn = self.attn_weights.masked_fill(~mask , -1e9)
+        attn = F.softmax(attn, dim=1)
+
+        u_seq = torch.einsum('bti,ij->btj', virt, attn)  # (B,L+1,I)
 
 
-        # ─── Losses ─────────────────────────────────────────────────────────────────
-        loss_beta = F.mse_loss(prices_seq, virt.detach())
-        loss_station = F.mse_loss(u_seq[:, 1:], self.rho * u_seq[:, :-1])
+        # ─── Masked-out Losses ─────────────────────────────────────────────────────────────────
+        loss_beta = F.mse_loss(prices_seq[active_mask], virt[active_mask].detach())
+        loss_station = F.mse_loss(u_seq[active_mask][:, 1:], self.rho * u_seq[active_mask][:, :-1])
         loss = loss_beta + self.lambda_ic * loss_station
         return u_seq, loss, {"loss_beta": loss_beta.detach(), "loss_station": loss_station.detach()}
 
@@ -137,7 +144,7 @@ class MarketLevelFactorLearning(nn.Module):
     @staticmethod
     def _weighted_mean(eta: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
         """Eq. 19   η-weighted market vector."""
-        return torch.einsum("bi,bid->bd", eta, r) / (eta.sum(1, keepdim=True) + 1e-6)
+        return torch.einsum("bi,bif->bf", eta, r) / (eta.sum(1, keepdim=True) + 1e-6)
 
     def _compute_m_t(
         self,
@@ -168,9 +175,9 @@ class MarketLevelFactorLearning(nn.Module):
             r_t    = torch.cat([e_t, r_hist], -1)                  # (B,I,2F)
 
             eta_in = self.W_iota(stockID_b) + r_t                    # (B,I,2F)
-            eta    = F.relu(torch.einsum("bid,d->bi", eta_in, self.w_eta))
+            eta    = F.relu(torch.einsum("bif,f->bi", eta_in, self.w_eta)) # (B,I)
 
-            m_t    = self._weighted_mean(eta, r_t)                 # (B,2F)
+            m_t    = self._weighted_mean(eta[active_mask], r_t[active_mask])                 # (B,2F)
             return r_t, m_t, eta
 
     def forward(
@@ -189,6 +196,11 @@ class MarketLevelFactorLearning(nn.Module):
         """
         B, T, I, f = e_seq.shape
         assert I == self.I and f == self.F
+        assert active_mask is None or active_mask.shape == (B, I), "active_mask must match batch and stock dimensions"
+
+        # ensure active_mask is a boolean tensor
+        if active_mask is None:
+            active_mask = torch.ones((B, I), device=e_seq.device, dtype=torch.bool)
 
         # expand stockID to batch
         stockID_b = stockID.unsqueeze(0).expand(B, -1, -1)      # (B,I,I)
@@ -206,22 +218,20 @@ class MarketLevelFactorLearning(nn.Module):
 
             Lτ = min(self.L, τ + 1)
             r_τ, m_τ, eta_τ= self._compute_m_t(e_seq[:, τ - Lτ + 1 : τ + 1], stockID_b, active_mask)  # (B,I,2F), (B,2F), (B,I,2F)
-            m1 = self._weighted_mean(eta_τ[:, S1], r_τ[:, S1])  # (B,2F)
-            m2 = self._weighted_mean(eta_τ[:, S2], r_τ[:, S2])  # (B,2F)
+            m1 = self._weighted_mean(eta_τ[active_mask][:, S1], r_τ[active_mask][:, S1])  # (B,2F)
+            m2 = self._weighted_mean(eta_τ[active_mask][:, S2], r_τ[active_mask][:, S2])  # (B,2F)
             m1_list.append(m1) ; m2_list.append(m2)
             period_ids.append(torch.full((B,), τ, device=e_seq.device, dtype=torch.long))
 
         feats   = torch.cat(m1_list + m2_list, 0)                         # (2B*T,2F)
         labels  = torch.cat(period_ids * 2,      0)                       # (2B*T)
-        loss_contrast = self.info_nce(feats, labels)
+        loss_contrast = self.info_nce(feats[active_mask], labels[active_mask])
 
         # ---------------- synchronism labels (Eq. 15) ----------------
         close = e_seq[..., close_idx]                      # (B,T,I)
-        if active_mask is not None:
-            close = close * active_mask.unsqueeze(1)
         ret   = torch.log(close[:, 1:] / (close[:, :-1] + 1e-8))  # (B,T-1,I)
         pos_ratio = (ret > 0).float().mean(-1)             # (B,T-1)
-        neg_ratio = (ret < 0).float().mean(-1)             # (B,T-1)
+        neg_ratio = (ret < 0).float().mean(-1)              # (B,T-1)
         sync_lbls = torch.where(
             pos_ratio >= self.sync_threshold, 0,
             torch.where(neg_ratio >= self.sync_threshold, 1, 2)
@@ -257,11 +267,11 @@ class ForecastingLearning(nn.Module):
     """
     Inputs
     -------
-    e_seq   : (B, L, I, F)    raw features
-    u_seq   : (B, L, I)       irrationality factor from stock module
-    r_t     : (B, I, 2F)      dynamic stock embeddings from market module
-    m_t     : (B, 2F)         market vector from market module
-    stockID : (I, I)          one-hot identity matrix
+    e_seq   : (B, L+1, I, F)    raw features
+    u_seq   : (B, L+1, I)       irrationality factor from stock module
+    r_t     : (B, I, 2F)        dynamic stock embeddings from market module
+    m_t     : (B, 2F)           market vector from market module
+    stockID : (I, I)            one-hot identity matrix
 
     Output
     ------
@@ -324,7 +334,11 @@ class ForecastingLearning(nn.Module):
     ):
         B, L, I, _ = e_seq.shape
         assert I == self.I, "stock dimension mismatch"
+        assert active_mask is None or active_mask.shape == (B, I), "active_mask must match batch and stock dimensions"
+        assert target is None or target.shape == (B, I), "target must match batch and stock dimensions"
 
+        if active_mask is None:
+            active_mask = torch.ones((B, I), device=e_seq.device, dtype=torch.bool)
         # ── 1. Encode g_t = [e_t ∥ u_t] ─────────────────────────────── #
         g = torch.cat([e_seq, u_seq.unsqueeze(-1)], -1)         # (B,L,I,D_enc)
         g_flat = g.reshape(B * I, L, -1)
@@ -337,11 +351,11 @@ class ForecastingLearning(nn.Module):
         # ── 2. Relation weights γ_{ij}  (Eq. 26) ───────────────────── #
         stockID_b = stockID.unsqueeze(0).expand(B, -1, -1)      # (B,I,I)
         h = self.W_gamma(r_t + self.W_iota(stockID_b))          # (B,I,2F)
-        rel_scores = torch.einsum("bid,bjd->bij", h, h) / math.sqrt(self.D_market)
+        rel_scores = torch.einsum("bif,bjf->bij", h, h) / math.sqrt(self.D_market)
         gamma_ij   = rel_scores.softmax(dim=2)                  # softmax over j
 
         # ── 3. Dependency vector d_t   (Eq. 27) ────────────────────── #
-        d_t = torch.einsum("bij,bjd->bid", gamma_ij, c_prev)    # (B,I,D_enc)
+        d_t = torch.einsum("bij,bjf->bif", gamma_ij, c_prev)    # (B,I,D_enc)
 
         # ── 4. Final prediction   (Eq. 28) ─────────────────────────── #
         m_expand = m_t.unsqueeze(1).expand(-1, I, -1)           # (B,I,2F)
@@ -352,8 +366,6 @@ class ForecastingLearning(nn.Module):
         loss      = torch.tensor(0.0, device=e_seq.device)
         rank_loss = torch.tensor(0.0, device=e_seq.device)
         if target is not None:
-            target = target.squeeze(-1)  # (B,I)
-
             mse   = F.mse_loss(out[mask],  target[mask])
             rank_loss = 1 - rank_ic(out, target)
             loss = mse + self.lambda_rankic * rank_loss

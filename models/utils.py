@@ -244,11 +244,16 @@ class SlidingWindowDataset(Dataset):
         self.pred = pred_len
         self.target_idx = target_idx
         self.with_target = with_target
+        self.n_windows = max(0, self.panel.size(0) - self.L - (self.pred if with_target else 0))
 
     def __len__(self):
-        return self.panel.size(0) - self.L - self.pred + 1
+        return self.n_windows
 
     def __getitem__(self, idx):
+
+        if idx >= self.n_windows:
+            raise IndexError(f"Index {idx} out of range for {self.n_windows} windows")
+
         seq = self.panel[idx : idx + self.L + 1]             # (L+1,I,F)
         prices = seq[..., self.target_idx]                   # (L+1,I)
         ret = None                                         # instrument return is NaN if this is walk-farward
@@ -261,12 +266,12 @@ class SlidingWindowDataset(Dataset):
         return prices, seq, ret, active_mask
 
 
-def build_input_tensor(
+def build_input_tensor( 
     data: Dict[str, pd.DataFrame],
     timestamps: pd.DatetimeIndex,
     feature_dim: int,
     split_valid_timestamp: pd.Timestamp,
-) -> Tuple[torch.Tensor, torch.BoolTensor, pd.DatetimeIndex]:
+    ) -> Tuple[torch.Tensor, torch.BoolTensor, pd.DatetimeIndex]:
     """
     Efficiently build aligned tensor from dict of DataFrames.
     
@@ -335,7 +340,7 @@ def build_input_tensor(
     valid_mask = torch.tensor(0)
     # Create train/valid split. if train_end == valid_end -> this is an update() cal, so no validation 
     if split_valid_timestamp < timestamps[-1]:
-        valid_tensor = torch.from_numpy(tensor_array[~train_idx])  # (T_valid, I, F)
+        valid_tensor = torch.from_numpy(tensor_array[~train_idx])  # (T - T_train, I, F)
         valid_mask = torch.from_numpy(~np.all(np.isnan(valid_tensor[-1, :, :]), axis=1))  # (I,)
 
     return (train_tensor, train_mask), (valid_tensor, valid_mask)
@@ -344,7 +349,7 @@ def build_pred_tensor(
     data: Dict[str, pd.DataFrame],
     timestamps: pd.DatetimeIndex,
     feature_dim: int,
-) -> Tuple[torch.Tensor, torch.BoolTensor, pd.DatetimeIndex]:
+    ) -> Tuple[torch.Tensor, torch.BoolTensor, pd.DatetimeIndex]:
     """
     Efficiently build aligned tensor from dict of DataFrames.
     
