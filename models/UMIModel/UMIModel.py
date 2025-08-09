@@ -102,7 +102,7 @@ class UMIModel(nn.Module):
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
         # stock universe
-        #self._universe: list[str] = []                                                              # stable “slot → ticker” mapping
+        self._universe: list[str] = []                                                               # list of ordered instruments the model is trained on
         #self.universe_mult = max(1, int(dynamic_universe_mult))                                     # over-allocation factor for dynamic universe
         
         self.close_idx = close_idx                                                                  # usually "close" is at index 3 in the dataframes
@@ -141,6 +141,9 @@ class UMIModel(nn.Module):
         self.I = len(data)
         active_mask = torch.ones(self.I, dtype=torch.bool)  # all stocks are active at initialization
         
+        # Register new universe
+        self._universe = list(data.keys())
+
         # Build submodules (learners)
         self._build_submodules()
 
@@ -167,6 +170,9 @@ class UMIModel(nn.Module):
         """
         
         assert len(active_mask) == self.I, f"Active mask size must match the number of trained instruments ({self.I})"
+
+        # Assert universe
+        assert self._universe == list(data.keys()), "Universe error!"
 
         # set current time for end of training (no validation)
         # the model assumes that input cutoff of old data is done by strategy at current_time - training_offset
@@ -212,55 +218,6 @@ class UMIModel(nn.Module):
 
         self.log.info(f"[update] Complete. Model up-to-date at: {current_time}")       
 
-    # ------------------------------------------------------------------ #
-    # update : decide if retrain_delta elapsed → refit on latest data    #
-    # ------------------------------------------------------------------ #
-    # def update(self, data_dict: Dict[str, DataFrame] ):
-    #     if self._last_fit_time is None:
-    #         raise RuntimeError("Call fit() before update().")
-
-    #     now = self._clock()        # <── the only place we read “time”
-
-    #     # ---------- build fresh activity mask at NOW ------------------
-
-    #     #  Add new tickers to the first free slots
-    #     for k in sorted(data_dict):
-    #         if k not in self._universe:
-    #             if len(self._universe) < self.I:        # capacity check
-    #                 self._universe.append(k)            # reserve slot
-    #                 self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
-    #                 return
-    #             else:
-    #                 self._universe.append(k)              # give the new stock a slot
-    #                 self.log.info(f"[info] universe full. Retraining …")
-    #                 self.fit(data_dict, warm_start=False, n_epochs=self.n_epochs)               # rebuild with larger I. fit will expand the universe
-    #                 return                                # early exit; retrain done
-
-    #     _, active, idx = _build_panel(data_dict, universe=self._universe)
-    #     new_mask = active[:, -1]                       # (I_active_now) mask for stocks that are live NOW
-    #     latest = idx[-1]
-    #     self.valid_end = latest
-    #     self.train_end = self.valid_end - pd.DateOffset(months=6)
-    #     pad = self.I - new_mask.size(0)
-    #     if pad:
-    #         new_mask = torch.cat([new_mask, torch.zeros(pad, dtype=torch.bool)])
-
-    #     # ---------- detect newly-delisted stocks ----------------------
-    #     was_live = self._active_mask[: new_mask.size(0)]
-    #     just_delisted = (was_live & (~new_mask)).any().item()   # True if at least one stock has disappeared since the last update, False otherwise.
-
-    #     # always store most-recent mask for later calls
-    #     with torch.no_grad():
-    #         self._active_mask.copy_(new_mask)
-
-    #     # ---------- decide whether to retrain -------------------------
-    #     # to remove last fit time
-    #     time_elapsed = now >= self._last_fit_time + self.retrain_delta
-    #     if time_elapsed or just_delisted:
-    #         reason = "time window" if time_elapsed else "delisting event"
-    #         self.log.info(f"Retraining triggered : {reason}.")
-    #         self.fit(data_dict, warm_start=self.warm_start, n_epochs=self.warm_training_epochs)
-
 
     def predict(self, data: Dict[str, DataFrame], current_time: pd.Timestamp, active_mask: torch.Tensor) -> Dict[str, float]:
         """
@@ -277,12 +234,15 @@ class UMIModel(nn.Module):
         assert self._is_initialized, "Model must be initialized before prediction"
         assert len(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
         
+        # Assert universe
+        assert self._universe == list(data.keys()), "Universe error!"
+
         # Build panel from current data
         timestamps = pd.date_range( start=current_time, end=current_time + self.pred_offset, freq=self.freq)
         data_tensor, data_mask = build_pred_tensor(data, timestamps, feature_dim=self.F)
         
         # assertion on the universe size
-        assert data_mask == active_mask, "Active mask mismatch during prediction"
+        assert torch.equal(data_mask, active_mask), "Active mask mismatch during prediction"
         
         dataset = SlidingWindowDataset(data_tensor: torch.Tensor, self.L, self.pred_len, self.close_idx, with_target: bool = False):
         assert len(dataset) == 1, "Prediction dataset should contain exactly one window"
@@ -294,7 +254,7 @@ class UMIModel(nn.Module):
         
         # Get last window
         prices_seq, feat_seq, _, dataset_mask = dataset[0]
-        assert data_mask == dataset_mask, "Dataset mask different from build_pred_tensor input mask during prediction"
+        assert torch.equal(data_mask, dataset_mask), "Dataset mask different from build_pred_tensor input mask during prediction"
         
         
         # Add batch dimension and move to device
@@ -476,7 +436,7 @@ class UMIModel(nn.Module):
 
         (train_tensor, train_mask) , (valid_tensor, valid_mask) = build_input_tensor(data=data, timestamps=timestamps, feature_dim=self.F, split_valid_timestamp=self.train_end )
 
-        assert valid_mask == active_mask, "Active mask mismatch during training"
+        assert torch.equal(valid_mask, active_mask) , "Active mask mismatch during training"
         # Build training dataset
         train_dataset = SlidingWindowDataset(train_tensor, self.L, self.pred_len, target_idx=self.close_idx)
         train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)

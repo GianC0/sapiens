@@ -2,7 +2,6 @@ check TODOs wherever they are
 
 
 model predict
-model dataloader shuffle=false training
 strategy on_historical() to rolling add data
 dataloaer build_universe_dataframe to update cache to tensor(T,I,F) (actually building tensor
 sliding windo dataset always returning ret even if null (ensure )

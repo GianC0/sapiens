@@ -94,7 +94,6 @@ class BacktestLongShortStrategy(Strategy):
         # State tracking
         
         self.universe: List[str] = []  # Ordered list of instruments
-        self.universe_panel: Optional[torch.Tensor] = None  # (T, I, F)
         self.active_mask: Optional[torch.Tensor] = None  # (I,)
         self.timestamps: List[pd.Timestamp] = []  # Panel timestamp
 
@@ -173,35 +172,30 @@ class BacktestLongShortStrategy(Strategy):
         )
 
         self.clock.set_timer(
-            name="holdout_timer",  
-            interval=freq2pdoffset(self.cfg["holdout"]),  # Timer interval
-            callback=self.on_holdout,  # Custom callback function invoked on timer
-        )
-
-        self.clock.set_timer(
             name="retrain_timer",  
             interval=self.retrain_offset,  # Timer interval
             callback=self.on_retrain,  # Custom callback function invoked on timer
         )
- 
 
     def on_update(self, event: TimeEvent):
         #TODO: does not account for insertion and delisting at the same time
         if event.name == "update_timer":
+            now = self.clock.utc_now()
+            self.log.info(f"Update timer fired at {now}")
+            assert self.model.is_initialized()
 
-            # to pass self.clock.utc_now()
+            
+            if self.universe == self.model._universe:
+                self.model.predict()
+            else:
+
+
             # the logic should be the following:
+            # new prediction up until re-optimize portfolio
             # update prediction for the next pred_len = now + holdout - holdout_start
             # checks for stocks events (new or delisted) and retrain_offset and if nothing happens directly calls predict() method of the model (which should happen only if holdout period in bars is passed (otherwise do not do anything), and this variable is in the config.yaml); if retrain delta is passed without stocks event, it calls update() which runs a warm start fit() on the new training window and then the strategy calls predict(); if stock event happens then the strategy calls update() and then predict(). update() should manage the following: if delisting then just use the model active mask to cut off those stocks (so that future preds and training loss are not computed for these. the model is ready to predict after that) but if new stocks are added it checks for universe availability and enough history in the Cache for those new stocks and then calls an initialization. ensure that the most up to date mask is always set by update (or by initialize only at the start) so that the other functions use always the most up to date mask.
             # Update training windows for walk-forward
-            # self._last_fit_time = None                                                                 # last time fit() was called
-            if self._last_fit_time:
-                time_shift = current_time - self._last_fit_time
-                self.train_end = self.train_end + time_shift
-                self.valid_end = self.valid_end + time_shift
-    def on_holdout(self, event: TimeEvent):
-        if event.name == "holdout_timer":
-            # new prediction up until re-optimize portfolio
+            
 
     def on_retrain(self, event: TimeEvent):
         elif event.name == "retrain_timer":
@@ -430,7 +424,19 @@ class BacktestLongShortStrategy(Strategy):
         else:
             raise ImportError(f"Could not find init.pt in {model_dir}")
         
+    def _cache_to_dict_now(self, current_time: pd.Timestamp):
+        """
+        Returns a data dictionary of the format Dict[str, pd.Dataframe] for
+        all instruments traded within the cache (common to all strtegies)
+        """
+        data = {}
 
+        for iid in self.cache.instrument_ids():
+            bar_type = BarType(instrument_id=iid, bar_spec= self.bar_spec)
+                
+            bars = self.cache.bars(bar_type)
+
+            
     # ----- weight optimiser ------------------------------------------
     def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
         mu = np.array([preds[s] for s in self.universe])
