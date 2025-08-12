@@ -4,6 +4,9 @@ Generic long/short strategy for Nautilus Trader.
 * Consumes ANY model that follows interfaces.MarketModel
 * Data feed provided by CsvBarLoader (Bar, FeatureBar)
 * Risk controls: draw-down, trailing stops, ADV cap, fee/slippage models
+
+Implementation reference:
+https://nautilustrader.io/docs/latest/concepts/strategies
 """
 from __future__ import annotations
 
@@ -21,10 +24,13 @@ from nautilus_trader.common.component import init_logging
 from nautilus_trader.common.component import Logger
 from nautilus_trader.common.component import Clock
 from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.model.events import OrderFilled
-from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.events import OrderFilled,TimeEvent
+from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose, Data
 from nautilus_trader.model.orders import MarketOrder
 from nautilus_trader.model.enums import OrderSide
+import torch
+from nautilus_trader.model.instruments import Instrument
+from nautilus_trader.model.position import Position
 
 # ----- project imports -----------------------------------------------------
 from .models.interfaces import MarketModel
@@ -98,6 +104,7 @@ class BacktestLongShortStrategy(Strategy):
         #self.data_dict: Dict[str, pd.DataFrame] = {}  # {symbol: DataFrame}
 
         self._last_prediction_time: Optional[pd.Timestamp] = None
+        self._last_update_time: Optional[pd.Timestamp] = None
         self._last_retrain_time: Optional[pd.Timestamp] = None
         self._last_bar_time: Optional[pd.Timestamp] = None
         self._bars_since_prediction = 0
@@ -138,50 +145,90 @@ class BacktestLongShortStrategy(Strategy):
             callback=self.on_retrain,  # Custom callback function invoked on timer
         )
 
+    # Not used ATM
+    def on_resume(self) -> None:
+        return
+    def on_reset(self) -> None:
+        return
+    def on_dispose(self) -> None:
+        return
+    def on_degrade(self) -> None:
+        return
+    def on_fault(self) -> None:
+        return
+    def on_save(self) -> dict[str, bytes]:  # Returns user-defined dictionary of state to be saved
+        return
+    def on_load(self, state: dict[str, bytes]) -> None:
+        return
+    
+    # Used
     def on_update(self, event: TimeEvent):
-        #TODO: does not account for insertion and delisting at the same time
         if event.name != "update_timer":
             return
 
-        now = self.clock.utc_now()
+        assert event.ts_event > self._last_update_time 
+
+        now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
         self.log.info(f"Update timer fired at {now}")
         assert self.model.is_initialized()
 
         data_dict = self._cache_to_dict(self.model.L + 1) # TODO: make it more generic for all models.
 
+        # TODO: superflous. consider removing compute active mask
+        assert torch.equal(self.active_mask, self._compute_active_mask(data_dict) ) , "Active mask mismatch between strategy and data engine"
+
         assert self.universe == self.model._universe, "Universe mismatch between strategy and model"
         preds = self.model.predict(data=data_dict, current_time=now, active_mask=self.active_mask) #  preds: Dict[str, float]
 
-        # logic to handle orders and portfolio updates
-        ## LOGIC HERE
+        assert preds is not None, "Model prediction returned None"
 
+        # Logic to handle orders and portfolio updates
+        weights = self._compute_target_weights(preds)
+        self._rebalance_portfolio(weights)
+
+        # update last updated time
+        self._last_update_time = now
         return 
         # the logic should be the following:
         # new prediction up until re-optimize portfolio
         # update prediction for the next pred_len = now + holdout - holdout_start
         # checks for stocks events (new or delisted) and retrain_offset and if nothing happens directly calls predict() method of the model (which should happen only if holdout period in bars is passed (otherwise do not do anything), and this variable is in the config.yaml); if retrain delta is passed without stocks event, it calls update() which runs a warm start fit() on the new training window and then the strategy calls predict(); if stock event happens then the strategy calls update() and then predict(). update() should manage the following: if delisting then just use the model active mask to cut off those stocks (so that future preds and training loss are not computed for these. the model is ready to predict after that) but if new stocks are added it checks for universe availability and enough history in the Cache for those new stocks and then calls an initialization. ensure that the most up to date mask is always set by update (or by initialize only at the start) so that the other functions use always the most up to date mask.
         # Update training windows for walk-forward
-            
-
     def on_retrain(self, event: TimeEvent):
+        """Periodic model retraining."""
         if event.name != "retrain_timer":
             return
-
+        
+        now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
+        
+        # Skip if too soon since last retrain
+        assert self._last_retrain_time and (now - self._last_retrain_time) < self.retrain_offset
+        
+        self.log.info(f"Starting model retrain at {now}")
+        
+        # Get updated data window
+        data_dict = self._cache_to_dict(window=None)  # Get all available data
+        if not data_dict:
+            return
+        
+        # Update active mask
+        self.active_mask = self._compute_active_mask(data_dict)
+        
+        # Retrain model with warm start
+        self.model.update(
+            data=data_dict,
+            current_time=now,
+            active_mask=self.active_mask
+        )
+        
+        self._last_retrain_time = now
+        self.log.info(f"Model retrain completed at {now}")
             
             
 
     # ================================================================= #
     # DATA handlers
     # ================================================================= #
-    def on_instrument(self, instrument: Instrument) -> None:
-        """Handle new instrument events."""
-        # verify if delisted or new:
-        # update mask / trigger retrain + reset on_retrain timer
-    def on_instrument_status(self, data: InstrumentStatus) -> None:
-    def on_instrument_close(self, data: InstrumentClose) -> None:
-        # update the model mask and ensure the loader still provides same input shape to the model for prediction
-        # remove from cache ??
-    def on_historical_data(self, data: Data) -> None:
     def on_bar(self, bar: Bar):  
         # assuming on_timer happens before then on_bars are called first,
         ts = bar.ts_event
@@ -208,6 +255,21 @@ class BacktestLongShortStrategy(Strategy):
         if not preds:
             return
 
+    def on_instrument(self, instrument: Instrument) -> None:
+        """Handle new instrument events."""
+        #TODO: should account for insertion and delisting at the same time. insertion needs portfolio selection
+        # verify if delisted or new:
+        # update mask / trigger retrain + reset on_retrain timer
+    def on_instrument_status(self, data: InstrumentStatus) -> None:
+    def on_instrument_close(self, data: InstrumentClose) -> None:
+        # update the model mask and ensure the loader still provides same input shape to the model for prediction
+        # remove from cache ??
+    def on_historical_data(self, data: Data) -> None:
+        """Process historical data for model training."""
+        # Historical data is loaded at startup via loader
+        pass
+
+
         # === weights =================================================
         weights = self._compute_target_weights(preds)
 
@@ -226,7 +288,10 @@ class BacktestLongShortStrategy(Strategy):
         # === model upkeep ===========================================
         self.model.update(self.cache)
 
-
+    def on_data(self, data: Data) -> None:  # Custom data passed to this handler
+        return
+    def on_signal(self, signal: Data) -> None:  # Custom signals passed to this handler
+        return
     # ================================================================= #
     # ORDER MANAGEMENT
     # ================================================================= #
@@ -408,26 +473,47 @@ class BacktestLongShortStrategy(Strategy):
             bar_type = BarType(instrument_id=iid, bar_spec= self.bar_spec)
             
             # Get bars from cache
-            bars = self.cache.bars(bar_type)[-window:]  # Get last 'window' bars
+            bars = self.cache.bars(bar_type)[:window]  # Get last 'window' bars (nautilus cache notation is opposite to pandas)
             if not bars or len(bars) < self.min_bars_required:
                 self.log.warning(f"Insufficient bars for {symbol}: {len(bars)} < {self.min_bars_required}")
                 continue
+            
+            # ensure there is at least one new bar after the last predition
+            assert bars[0].ts_event > self._last_update_time
+            
             # Convert bars to DataFrame
-            bar_data = {
-                "Date": [b.ts_event for b in bars],
-                "Open": [b.open for b in bars],
-                "High": [b.high for b in bars],
-                "Low": [b.low for b in bars],
-                "Close": [b.close for b in bars],
-                "Volume": [b.volume for b in bars],
-            }
-            df = pd.DataFrame(bar_data)
-            df.set_index("Date", inplace=True)
-            df.sort_index(inplace=True)  # Ensure chronological order
-            data_dict[iid.symbol.value] = df
+            for b in bars:
+                bar_data = {
+                    "Date": [b.ts_event],
+                    "Open": [b.open ],
+                    "High": [b.high],
+                    "Low": [b.low ],
+                    "Close": [b.close],    #TODO: verify if Close or CLose Adj
+                    "Volume": [b.volume],
+                }
+                df = pd.DataFrame(bar_data)
+                df.set_index("Date", inplace=True)
+                df.sort_index(inplace=True)  # Ensure chronological order
+                data_dict[iid.symbol.value] = df
 
         return data_dict 
 
+    # TODO: superflous. consider removing
+    def _compute_active_mask(self, data_dict: Dict[str, pd.DataFrame]) -> torch.Tensor:
+    """Compute mask for active instruments."""
+        mask = ~torch.ones(len(self.universe), dtype=torch.bool)
+        
+        for i, symbol in enumerate(self.universe):
+            df = data_dict[symbol]
+            # Check if data is recent enough
+            if len(df) > 0:
+                last_date = df.index[-1]
+                now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
+                if now < last_date
+                    mask[i] = True
+        
+        return mask
+    
     # ----- weight optimiser ------------------------------------------
     def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
         mu = np.array([preds[s] for s in self.universe])
