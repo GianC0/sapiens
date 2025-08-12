@@ -297,19 +297,19 @@ class BacktestLongShortStrategy(Strategy):
     # ORDER MANAGEMENT
     # ================================================================= #
 
-    # use the order_management python file
+    # TODO: use the order_management.py file
 
     # ================================================================= #
     # POSITION MANAGEMENT
     # ================================================================= #
-    def on_position_opened(self, event: PositionOpened) -> None:
-    def on_position_changed(self, event: PositionChanged) -> None:
-    def on_position_closed(self, event: PositionClosed) -> None:
-    def on_position_event(self, event: PositionEvent) -> None:  # All position event messages are eventually passed to this handler
+
+    # TODO: use the position_management.py file
+
     # ================================================================= #
     # ACCOUNT & PORTFOLIO 
     # ================================================================= #
 
+    # TODO: implement 
 
     # ================================================================= #
     # INTERNAL HELPERS
