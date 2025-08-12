@@ -13,7 +13,7 @@ class MaxSharpeRatioOptimizer:
     def optimize(self, mu: np.ndarray, cov: np.ndarray) -> np.ndarray:
         """
         Parameters
-        ----------
+        ----------  
         mu  : expected returns  (shape N)
         cov : covariance matrix (NxN)
 

@@ -160,6 +160,7 @@ strategy:
   #  Order Execution parameters
   # ---------------------------------------------------------------------------
   execution:
+    timing_force: DAY    #  Specifies how long the order will remain open or active before any remaining quantity is canceled.
     twap:
       horizon_secs: 10.0
       interval_secs: 2.5
