@@ -254,23 +254,7 @@ class BacktestLongShortStrategy(Strategy):
         preds = self.model.predict(self.cache)
         if not preds:
             return
-
-    def on_instrument(self, instrument: Instrument) -> None:
-        """Handle new instrument events."""
-        #TODO: should account for insertion and delisting at the same time. insertion needs portfolio selection
-        # verify if delisted or new:
-        # update mask / trigger retrain + reset on_retrain timer
-    def on_instrument_status(self, data: InstrumentStatus) -> None:
-    def on_instrument_close(self, data: InstrumentClose) -> None:
-        # update the model mask and ensure the loader still provides same input shape to the model for prediction
-        # remove from cache ??
-    def on_historical_data(self, data: Data) -> None:
-        """Process historical data for model training."""
-        # Historical data is loaded at startup via loader
-        pass
-
-
-        # === weights =================================================
+               # === weights =================================================
         weights = self._compute_target_weights(preds)
 
         # === place orders ============================================
@@ -288,27 +272,40 @@ class BacktestLongShortStrategy(Strategy):
         # === model upkeep ===========================================
         self.model.update(self.cache)
 
+    def on_instrument(self, instrument: Instrument) -> None:
+        """Handle new instrument events."""
+        #TODO: should account for insertion and delisting at the same time. insertion needs portfolio selection
+        # verify if delisted or new:
+        # update mask / trigger retrain + reset on_retrain timer
+    def on_instrument_status(self, data: InstrumentStatus) -> None:
+    def on_instrument_close(self, data: InstrumentClose) -> None:
+        # update the model mask and ensure the loader still provides same input shape to the model for prediction
+        # remove from cache ??
+    def on_historical_data(self, data: Data) -> None:
+        """Process historical data for model training."""
+        # Historical data is loaded at startup via loader
+        return
+
+
+    # Unused ATM
     def on_data(self, data: Data) -> None:  # Custom data passed to this handler
         return
     def on_signal(self, signal: Data) -> None:  # Custom signals passed to this handler
         return
+    
     # ================================================================= #
     # ORDER MANAGEMENT
     # ================================================================= #
 
-    def on_order_filled(self, event: OrderFilled): 
-        """Update position tracking on fills."""
-        
-        order = event.order
-        position = self.portfolio.position(order.instrument_id)
-        if position:
-            self._position_qty[order.instrument_id.symbol.value] = position.quantity
-
+    # use the order_management python file
 
     # ================================================================= #
     # POSITION MANAGEMENT
     # ================================================================= #
-
+    def on_position_opened(self, event: PositionOpened) -> None:
+    def on_position_changed(self, event: PositionChanged) -> None:
+    def on_position_closed(self, event: PositionClosed) -> None:
+    def on_position_event(self, event: PositionEvent) -> None:  # All position event messages are eventually passed to this handler
     # ================================================================= #
     # ACCOUNT & PORTFOLIO 
     # ================================================================= #
