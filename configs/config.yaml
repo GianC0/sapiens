@@ -4,7 +4,7 @@ model_name: "UMIModel"
 # ---------------------------------------------------------------------------
 #  Paths
 # ---------------------------------------------------------------------------
-data_dir:  "data/stocks/"     # Folder with per-ticker stocks CSVs        (general)
+data_dir:  "data/"            # Root Data folder containing subfolders with CSVs        (general)
 logs_dir: "logs/"             # Where checkpoints / logs are stored       (general)
 initial_cash: 20000           # portfolio initial cash                    (portfolio)
 currency: USD

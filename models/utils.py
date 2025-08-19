@@ -211,10 +211,11 @@ def build_input_tensor(
     Raises:
         ValueError: If universe is empty or all timestamps are NaN
     """
-    if not universe:
-        raise ValueError("Universe cannot be empty")
     
     universe = list(data.keys())
+
+    if not universe:
+        raise ValueError("Universe cannot be empty")
     
     # Pre-allocate array for efficiency
     F = feature_dim
@@ -227,7 +228,7 @@ def build_input_tensor(
     # Fill in data for each instrument
     for i, ticker in enumerate(universe):
         # Reindex to common timestamps (automatically fills NaN for missing)
-        assert data[ticker].shape == (T,F)
+        assert data[ticker].shape == (T,F)  #not correct during last batch or when validation is specified.
         aligned = data[ticker].reindex(timestamps)
         # Copy values into pre-allocated array
         tensor_array[:, i, :] = aligned.values

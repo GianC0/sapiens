@@ -78,7 +78,7 @@ class UMIModel(nn.Module):
         self.pred_offset    = pred_offset                                                           # time window for prediction
         self.train_end      = pd.Timestamp(train_end)                                               # end of training date
         self.valid_end      = pd.Timestamp(valid_end)                                               # end of validation date
-        assert self.valid_end > self.train_end, "Validation end date must be after training end date."
+        assert self.valid_end >= self.train_end, "Validation end date must be after training end date."
 
         self.logger         = logger                                                                # actions logger
         self.save_backups   = save_backups                                                          # whether to save backups during walk-forward
@@ -483,7 +483,7 @@ class UMIModel(nn.Module):
         # Create common timestamp index
         timestamps = pd.date_range(start=self.valid_end - self.train_offset, end=self.valid_end, freq=self.freq)
         
-
+        assert len(data) > 0
         (train_tensor, train_mask) , (valid_tensor, valid_mask) = build_input_tensor(data=data, timestamps=timestamps, feature_dim=self.F, split_valid_timestamp=self.train_end )
 
         assert torch.equal(valid_mask, active_mask) , "Active mask mismatch during training"

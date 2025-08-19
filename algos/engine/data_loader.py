@@ -119,11 +119,16 @@ class CsvBarLoader:
             venue=self.venue
         )
         
+        if self.cfg["currency"] == "USD":
+            currency = USD
+        elif self.cfg["currency"] == "EUR":
+            currency = EUR
+
         # TODO: double check price precision.
         return Equity(
             instrument_id=instrument_id,
-            native_symbol=Symbol(symbol),
-            currency=self.cfg["currency"],
+            raw_symbol=Symbol(symbol),
+            currency=currency,
             price_precision=2,  # Standard for US equities
             price_increment=Price.from_str("0.01"),
             lot_size=Quantity.from_int(1),
