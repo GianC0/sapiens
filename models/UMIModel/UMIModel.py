@@ -21,7 +21,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
-
+import mlflow
+import mlflow.pytorch
+from mlflow.tracking import MlflowClient
 from pandas import DataFrame, Timestamp
 
 from ..utils import SlidingWindowDataset, build_input_tensor, build_pred_tensor
@@ -162,6 +164,14 @@ class UMIModel(nn.Module):
         self._dump_model_metadata()
         
         self.log.info(f"[initialize] Complete. Best validation: {best_val:.6f}")
+
+        # setting up MLflow logging
+        self._setup_mlflow()
+        # Log final model to MLflow
+        mlflow.pytorch.log_model(self, "model")
+        mlflow.log_artifact(str(self.model_dir / "init.pt"))
+        mlflow.log_metric("best_validation_loss", best_val)
+
         return best_val
 
     def update(self, data: Dict[str, DataFrame], current_time: Timestamp, active_mask: torch.Tensor):
@@ -216,7 +226,11 @@ class UMIModel(nn.Module):
         # Save state
         torch.save(self.state_dict(), self.model_dir / "latest.pt")
 
-        self.log.info(f"[update] Complete. Model up-to-date at: {current_time}")       
+        self.log.info(f"[update] Complete. Model up-to-date at: {current_time}")
+        
+        # Log update metrics
+        mlflow.log_metric("update_timestamp", current_time.timestamp())
+        mlflow.log_artifact(str(self.model_dir / "latest.pt"))       
 
 
     def predict(self, data: Dict[str, DataFrame], current_time: pd.Timestamp, active_mask: torch.Tensor) -> Dict[str, float]:
@@ -366,6 +380,33 @@ class UMIModel(nn.Module):
         
         return
 
+    # MLflow logging function
+    def _setup_mlflow(self):
+        """Setup MLflow tracking for this model instance."""
+        mlflow.set_tracking_uri("file:./mlruns")  # Local file store
+        mlflow.set_experiment(f"UMI_{self.freq}")
+        
+        # Start a new run if not already in one
+        if mlflow.active_run() is None:
+            mlflow.start_run(run_name=f"UMI_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}")
+        
+        # Log model configuration
+        mlflow.log_params({
+            "model_name": "UMIModel",
+            "freq": self.freq,
+            "feature_dim": self.F,
+            "window_len": self.L,
+            "pred_len": self.pred_len,
+            "batch_size": self.batch_size,
+            "n_epochs": self.n_epochs,
+            "training_mode": self.training_mode,
+            "train_end": str(self.train_end),
+            "valid_end": str(self.valid_end),
+        })
+        
+        # Log hyperparameters
+        for key, value in self.hp.items():
+            mlflow.log_param(f"hp_{key}", value)
     # ---------------- metadata on memory size and params ------------- #
     def _dump_model_metadata(self):
         """
@@ -845,6 +886,16 @@ class UMIModel(nn.Module):
         
         self._epoch_logs.append(metrics)
         
+        # Log to MLflow
+        mlflow.log_metrics({
+            'train_loss_stock': loss_stock,
+            'train_loss_market': loss_market,
+            'train_loss_pred': loss_pred,
+            'val_loss': validation_loss if not pd.isna(validation_loss) else 0.0,
+            'total_loss': loss_stock + loss_market + loss_pred
+        }, step=epoch)
+
+
         # Save to CSV file
         log_file = self.model_dir / "train_losses.csv"
         pd.DataFrame([metrics]).to_csv(

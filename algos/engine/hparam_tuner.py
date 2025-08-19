@@ -7,6 +7,8 @@ import pandas as pd
 import torch.nn as nn
 from typing import Dict, List, Optional
 from pathlib import Path
+import mlflow
+from mlflow import MlflowClient
 
 
 class OptunaHparamsTuner:
@@ -91,27 +93,43 @@ class OptunaHparamsTuner:
     def _objective(self, trial: optuna.Trial) -> float:
         trial_hparams = self._suggest(trial)
 
-        model = self.ModelClass(**self.model_params, **trial_hparams)
-        score = model.initialize(self.universe_dataframe)
+        # Start MLflow run for this trial
+        with mlflow.start_run(nested=True, run_name=f"trial_{trial.number}"):
+            # Log trial hyperparameters
+            mlflow.log_params(trial_hparams)
+            mlflow.log_param("trial_number", trial.number)
 
-        # keep a pointer to the weights folder
-        trial.set_user_attr("model_dir", str(model.model_dir))
+            model = self.ModelClass(**self.model_params, **trial_hparams)
+            score = model.initialize(self.universe_dataframe)
 
-        # ------------- append to hp_trials.csv -----------------------
-        rec = {"trial": trial.number, "loss": score, **trial_hparams}
-        pd.DataFrame([rec]).to_csv(
-            self.hp_log,
-            mode   ="a",
-            header = not self.hp_log.exists(),
-            index  = False,
-        )
-        self.log.info("New HPO trial: {rec}")
+            # Log trial results
+            mlflow.log_metric("trial_loss", score)
+
+            # keep a pointer to the weights folder
+            trial.set_user_attr("model_dir", str(model.model_dir))
+
+            # ------------- append to hp_trials.csv -----------------------
+            rec = {"trial": trial.number, "loss": score, **trial_hparams}
+            pd.DataFrame([rec]).to_csv(
+                self.hp_log,
+                mode   ="a",
+                header = not self.hp_log.exists(),
+                index  = False,
+            )
+            self.log.info("New HPO trial: {rec}")
+
         return float(score)
 
     # ------------------------------------------------------------------ #
     # public API
     # ------------------------------------------------------------------ #
     def optimize(self) -> dict:
+        
+        # Setup MLflow for hyperparameter optimization
+        mlflow.set_tracking_uri("file:./mlruns")
+        mlflow.set_experiment(f"HPO_{self.ModelClass.__name__}")
+        self.mlflow_run = mlflow.start_run(run_name=f"HPO_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}")
+
         self.study.optimize(self._objective, n_trials=self.n_trials)
         best   = self.study.best_trial
         self.log.info(f"Best hparams: {best.params} \nBest model path: {best.user_attrs["model_dir"]}")

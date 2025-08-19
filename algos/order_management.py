@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Any
 from collections import defaultdict
 import numpy as np
 from datetime import datetime, timedelta
-
+from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
     OrderDenied, OrderEmulated, OrderEvent, OrderExpired,
@@ -105,7 +105,7 @@ class OrderManager:
     Manages order lifecycle, execution, and tracking for the strategy.
     """
     
-    def __init__(self, strategy, config: Dict[str, Any]):
+    def __init__(self, strategy Strategy, config: Dict[str, Any]):
         """
         Initialize the order manager.
         
@@ -342,6 +342,9 @@ class OrderManager:
             total_quantity: Total signed quantity to execute
             duration_seconds: Total duration for TWAP execution
         """
+
+        # TODO: should follow this implementation https://nautilustrader.io/docs/latest/concepts/execution/#twap-time-weighted-average-price
+        # _submit_twap_slice is specifying order type. this should be passed directly
         if total_quantity == 0:
             return
         
@@ -425,6 +428,7 @@ class OrderManager:
         Args:
             fill_event: Order fill event
         """
+        # TODO:
         # This would need reference price from when order was submitted
         # For now, we'll skip detailed slippage calculation
         # In production, you'd compare fill price to mid-price at submission
@@ -472,6 +476,7 @@ class OrderManager:
         """
         # Check if this fill is part of a TWAP execution
         # and update parent order tracking if needed
+        # TODO
         pass
     
     def get_order_metrics(self) -> Dict[str, Any]:
