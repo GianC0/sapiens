@@ -417,7 +417,7 @@ class BacktestLongShortStrategy(Strategy):
             best_hparams = defaults
 
         # Initialize model with best hyperparameters. It will have new model directory and trained on train + valid set
-        final_model_params = model_params.copy()
+        final_model_params = model_params
         final_model_params["train_end"] = self.valid_end
         final_model_params["valid_end"] = self.valid_end
 

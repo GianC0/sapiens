@@ -21,10 +21,9 @@ from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import Equity
 from nautilus_trader.model.objects import Price, Quantity, Money
-from nautilus_trader.model.c_enums import AssetClass, CurrencyType
 from nautilus_trader.model.currencies import USD,EUR
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
-from ....models.utils import freq2barspec
+from models.utils import freq2barspec
 #from nautilus_trader.model import Data  # base class for custom data
 
 

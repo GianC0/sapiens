@@ -7,14 +7,12 @@ from typing import Dict, List
 import pandas as pd
 import numpy as np
 from nautilus_trader.cache.cache import Cache
-from nautilus_trader.model.data.bar import BarType   # public NT API
 import torch
 from torch.utils.data import Dataset
 import re
 from pandas.tseries.frequencies import to_offset
-from nautilus_trader.model.data.bar import BarSpecification           # Specification object
-from nautilus_trader.model.c_enums.bar_aggregation import BarAggregation
-from nautilus_trader.model.c_enums.price_type import PriceType        # BID / ASK / MID / LAST …
+from nautilus_trader.model.data import BarSpecification, BarType, BarAggregation          
+from nautilus_trader.core.rust.model import PriceType       # Prince type =  BID / ASK / MID / LAST …
 
 
 def freq2barspec(freq: str,
