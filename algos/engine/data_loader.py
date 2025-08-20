@@ -86,8 +86,8 @@ class CsvBarLoader:
         self.venue = Venue(venue_name)
         self.cfg = cfg
 
-        stock_dir = self._root / "stocks"
-        bond_dir  = self._root / "bonds"
+        stock_dir = self._root / "stocks" / cfg["calendar"]
+        bond_dir  = self._root / "bonds" / cfg["calendar"]
         self._stock_files = sorted(stock_dir.glob("*.csv"))
         self._rf_file     = bond_dir / "DGS10.csv"
 
@@ -119,10 +119,12 @@ class CsvBarLoader:
             venue=self.venue
         )
         
+        assert self.cfg["currency"] in ("USD","EUR")
         if self.cfg["currency"] == "USD":
             currency = USD
         elif self.cfg["currency"] == "EUR":
             currency = EUR
+
 
         # TODO: double check price precision.
         return Equity(
@@ -257,7 +259,7 @@ class CsvBarLoader:
         universe: List[str],
         end_time: pd.Timestamp,
         train_offset: pd.DateOffset,
-        freq: str = "1B",
+        freq: str = "1D",
         feature_dim: int = 5,
     ) -> (torch.Tensor, torch.Tensor, List[pd.Timestamp]):
         """

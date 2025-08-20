@@ -3,6 +3,7 @@ Helpers that extract a `{ticker: DataFrame}` snapshot from the
 Nautilus Trader runtime `Cache`.
 """
 from __future__ import annotations
+from sqlite3.dbapi2 import Timestamp
 from typing import Dict, List
 import pandas as pd
 import numpy as np
@@ -114,7 +115,8 @@ def freq2pdoffset(freq_str: str):
         "d":  "D",             # calendar days
         "B":  "B",             # business days
         "w":  "W",             # weeks (Mon-Sun anchored via suffix – see tips below)
-        "M":  "M",             # month-end
+        "M":  "ME",            # month-end
+        "ME":  "ME",           # month-end
         "MS": "MS",            # month-start
         "Q":  "Q",             # quarter-end
         "QS": "QS",            # quarter-start
@@ -128,7 +130,7 @@ def freq2pdoffset(freq_str: str):
         raise ValueError(f"Bad frequency syntax: {freq_str!r}")
 
     count, unit = m.groups()
-    unit = unit.lower() if unit not in ("B", "M", "MS", "Q", "QS", "Y", "YS") else unit  # preserve case where required
+    unit = unit.lower() if unit not in ("B", "M", "MS","ME", "Q", "QS", "Y", "YS") else unit  # preserve case where required
 
     if unit not in _FREQ_MAP:
         raise ValueError(f"Unknown frequency unit {unit!r}")
@@ -227,11 +229,9 @@ def build_input_tensor(
     
     # Fill in data for each instrument
     for i, ticker in enumerate(universe):
-        # Reindex to common timestamps (automatically fills NaN for missing)
         assert data[ticker].shape == (T,F)  #not correct during last batch or when validation is specified.
-        aligned = data[ticker].reindex(timestamps)
         # Copy values into pre-allocated array
-        tensor_array[:, i, :] = aligned.values
+        tensor_array[:, i, :] = data[ticker].values
     
     # Validate that we have at least some data
     if np.all(np.isnan(tensor_array)):
@@ -241,10 +241,8 @@ def build_input_tensor(
     empty_timestamps = np.all(np.isnan(tensor_array), axis=(1, 2))
     if np.any(empty_timestamps):
         n_empty = np.sum(empty_timestamps)
-        first_empty = timestamps[np.where(empty_timestamps)[0][0]]
         raise ValueError(
             f"Found {n_empty} completely empty timestamps. "
-            f"First at {first_empty}. Check data alignment."
         )
     
     

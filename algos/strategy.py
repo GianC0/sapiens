@@ -11,6 +11,7 @@ https://nautilustrader.io/docs/latest/concepts/strategies
 from __future__ import annotations
 
 import asyncio
+import calendar
 import importlib
 import math
 from datetime import datetime
@@ -80,10 +81,10 @@ class BacktestLongShortStrategy(Strategy):
         self.valid_end = pd.Timestamp(self.cfg["valid_end"], tz="UTC")
         self.backtest_end = pd.Timestamp(self.cfg["backtest_end"], tz="UTC")
         self.walkfwd_start = pd.Timestamp(self.cfg["walkfwd_start"], tz="UTC")
-        self.pred_offset = to_offset(cfg["pred_offset"])
-        self.retrain_offset = to_offset(cfg["training"]["retrain_offset"])
-        self.train_offset = to_offset(cfg["training"]["train_offset"])
-        self.pred_len = int(cfg["pred_len"])
+        self.pred_offset = to_offset(self.cfg["pred_offset"])
+        self.retrain_offset = to_offset(self.cfg["training"]["retrain_offset"])
+        self.train_offset = to_offset(self.cfg["training"]["train_offset"])
+        self.pred_len = int(self.cfg["pred_len"])
 
 
         # Model and data parameters
@@ -354,25 +355,26 @@ class BacktestLongShortStrategy(Strategy):
             raise ImportError(f"Could not find model class in models.{self.model_name}")
 
         model_params = {
-            "freq"=self.cfg["freq"],
-            "feature_dim"=self.cfg["feature_dim"],
-            "window_len"=self.cfg["window_len"],
-            "pred_len"=self.cfg["pred_len"],
-            "train_offset"=self.train_offset,
-            "pred_offset"=self.pred_offset,
-            "train_end"=self.train_end,
-            "valid_end"=self.valid_end,
-            "batch_size"=self.cfg["training"]["batch_size"],
-            "n_epochs"=self.cfg["training"]["n_epochs"],
-            "patience"=self.cfg["training"]["patience"],
-            "pretrain_epochs"=self.cfg["training"]["pretrain_epochs"],
-            "training_mode"=self.cfg["training"]["training_mode"],
-            "close_idx"=self.cfg["training"]["target_idx"],
-            "warm_start"=self.cfg["training"]["warm_start"],
-            "warm_training_epochs"=self.cfg["training"]["warm_training_epochs"],
-            "save_backups"= self.cfg["training"]["save_backups"],
-            "data_dir"=self.cfg["data_dir"],
-            "logger"=self.log,  # Pass logger to model
+            "freq":self.cfg["freq"],
+            "feature_dim":self.cfg["feature_dim"],
+            "window_len":self.cfg["window_len"],
+            "pred_len":self.cfg["pred_len"],
+            "train_offset":self.train_offset,
+            "pred_offset":self.pred_offset,
+            "train_end":self.train_end,
+            "valid_end":self.valid_end,
+            "batch_size":self.cfg["training"]["batch_size"],
+            "n_epochs":self.cfg["training"]["n_epochs"],
+            "patience":self.cfg["training"]["patience"],
+            "pretrain_epochs":self.cfg["training"]["pretrain_epochs"],
+            "training_mode":self.cfg["training"]["training_mode"],
+            "close_idx":self.cfg["training"]["target_idx"],
+            "warm_start":self.cfg["training"]["warm_start"],
+            "warm_training_epochs":self.cfg["training"]["warm_training_epochs"],
+            "save_backups" : self.cfg["training"]["save_backups"],
+            "data_dir":self.cfg["data_dir"],
+            "logger":self.log,  # Pass logger to model
+            "calendar":self.cfg["calendar"]   #Equity market calendar
         }
 
         
@@ -399,12 +401,12 @@ class BacktestLongShortStrategy(Strategy):
                 start = self.backtest_start,
                 end = self.valid_end,
                 logs_dir    = Path(self.cfg.get("logs_dir", "logs")),
-                train_dict  = train_data,
+                data  = train_data,
                 model_params= model_params,
                 defaults    = defaults,           # default values of hparams
                 search_space= search_space,       # search sapce of hparams
                 n_trials    = n_trials,
-                logger = self.log
+                log = self.log
             )
             
             best = tuner.optimize()
@@ -436,12 +438,12 @@ class BacktestLongShortStrategy(Strategy):
             start = self.backtest_start,
             end = self.valid_end,
             logs_dir    = Path(self.cfg.get("logs_dir", "logs")),
-            train_dict  = final_train_data,
+            data  = final_train_data,
             model_params= final_model_params,
             defaults    = best_hparams,       # Use best hyperparameters
             search_space= None,               # empty search space: use defaults and 1 trial only
             n_trials    = 1,
-            logger = self.log
+            log = self.log,
         )
         
         _ , model_dir = tuner.optimize()

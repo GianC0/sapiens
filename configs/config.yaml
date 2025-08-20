@@ -8,19 +8,20 @@ data_dir:  "data/"            # Root Data folder containing subfolders with CSVs
 logs_dir: "logs/"             # Where checkpoints / logs are stored       (general)
 initial_cash: 20000           # portfolio initial cash                    (portfolio)
 currency: USD
+calendar: NYSE                # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
 
 # ---------------------------------------------------------------------------
-#  Calendar 
+#  Dates 
 # ---------------------------------------------------------------------------
 backtest_start: 2021-07-01  # First bar the strategy trades. 
-train_offset:   6M          # Length in Datetime of training set
-valid_offset:   30B         # Validation set (early stopping / Optuna) if enabled
+train_offset:   6M          # Length in Datetime of training set (6 months-end)
+valid_offset:   30D         # Validation set (early stopping / Optuna) if enabled
 backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= backtest_start + train_offset [+ valid_offset] + test_offset + pred_len
 
 # ---------------------------------------------------------------------------
 #  Universe / data granularity
 # ---------------------------------------------------------------------------
-freq: 1B                      # 1 business-day bars ( offset )
+freq: 1D                      # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
 window_len: 60                # L : look-back window length (UMI paper)   (sliding-window features)
 pred_len:   1                 # H : prediction horizon (next bar)         (one-step forecast)
 dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+univers_mult (in this case ↑20%)       

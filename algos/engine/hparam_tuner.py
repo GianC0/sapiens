@@ -24,7 +24,7 @@ class OptunaHparamsTuner:
         start: pd.Timestamp,                     # train start
         end: pd.Timestamp,                       # validation end
         logs_dir: str | Path = "logs",           # logs root directory 
-        universe_dataframe: Dict[str, Any],              # {ticker: DataFrame, ...}
+        data: Dict[str, Any],                    # {ticker: DataFrame, ...}
         model_params: Dict[str, Any],
         defaults: Dict[str, Any],                # default hp values
         search_space: Optional[Dict[str, Dict]], # parsed from YAML
@@ -34,7 +34,7 @@ class OptunaHparamsTuner:
         sampler: optuna.samplers.TPESampler | None = None,
     ):
         self.ModelClass   = ModelClass
-        self.universe_dataframe  = universe_dataframe
+        self.data  = data
         self.search_space = search_space
         self.model_params  = model_params
         self.defaults    = defaults
@@ -100,7 +100,7 @@ class OptunaHparamsTuner:
             mlflow.log_param("trial_number", trial.number)
 
             model = self.ModelClass(**self.model_params, **trial_hparams)
-            score = model.initialize(self.universe_dataframe)
+            score = model.initialize(self.data)
 
             # Log trial results
             mlflow.log_metric("trial_loss", score)

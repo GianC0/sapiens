@@ -25,6 +25,7 @@ import mlflow
 import mlflow.pytorch
 from mlflow.tracking import MlflowClient
 from pandas import DataFrame, Timestamp
+import pandas_market_calendars as market_calendars
 
 from ..utils import SlidingWindowDataset, build_input_tensor, build_pred_tensor
 from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
@@ -62,6 +63,8 @@ class UMIModel(nn.Module):
         data_dir: Path = Path("data/stocks"),
         model_dir: Path = Path("logs/UMIModel"),
         logger: Optional[Any] = None,
+        calendar: str = 'NYSE',
+
         **hparams,
     ):
 
@@ -72,6 +75,7 @@ class UMIModel(nn.Module):
         self._device        = torch.device("cuda" if torch.cuda.is_available() else "cpu")         # device for training
         
         # time parameters
+        self.market_calendar = market_calendars.get_calendar(calendar)
         self.freq           = freq                                                                  # e.g. "1d", "15m", "1h"  
         self.pred_len    = pred_len                                                                 # number of bars to predict
         self.train_offset   = train_offset                                                          # time window for training
@@ -261,7 +265,9 @@ class UMIModel(nn.Module):
         assert self._universe == list(data.keys()), "Universe error!"
 
         # Build panel from current data
-        timestamps = pd.date_range( start=current_time, end=current_time + self.pred_offset, freq=self.freq)
+        # https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars
+        days_range = self.market_calendar.schedule(start_date=current_time, end_date=current_time + self.pred_offset)
+        timestamps = market_calendars.date_range(days_range, frequency=self.freq)
         data_tensor, data_mask = build_pred_tensor(data, timestamps, feature_dim=self.F)
         
         # assertion on the universe size
@@ -481,7 +487,8 @@ class UMIModel(nn.Module):
             raise ValueError(f"Validation end date: {self.valid_end} is earlier that end train end date {self.train_end}")
 
         # Create common timestamp index
-        timestamps = pd.date_range(start=self.valid_end - self.train_offset, end=self.valid_end, freq=self.freq)
+        days_range = self.market_calendar.schedule(start_date=self.valid_end - self.train_offset, end_date=self.valid_end)
+        timestamps = market_calendars.date_range(days_range, frequency=self.freq)
         
         assert len(data) > 0
         (train_tensor, train_mask) , (valid_tensor, valid_mask) = build_input_tensor(data=data, timestamps=timestamps, feature_dim=self.F, split_valid_timestamp=self.train_end )
