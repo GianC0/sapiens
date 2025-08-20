@@ -94,7 +94,7 @@ class OptunaHparamsTuner:
         trial_hparams = self._suggest(trial)
 
         # Start MLflow run for this trial
-        with mlflow.start_run(nested=True, run_name=f"trial_{trial.number}"):
+        with mlflow.start_run(nested=True, run_name=f"trial_{trial.number}") as trial_run:
             # Log trial hyperparameters
             mlflow.log_params(trial_hparams)
             mlflow.log_param("trial_number", trial.number)
@@ -107,6 +107,7 @@ class OptunaHparamsTuner:
 
             # keep a pointer to the weights folder
             trial.set_user_attr("model_dir", str(model.model_dir))
+            trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
 
             # ------------- append to hp_trials.csv -----------------------
             rec = {"trial": trial.number, "loss": score, **trial_hparams}
