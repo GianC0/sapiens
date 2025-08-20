@@ -193,6 +193,7 @@ def build_input_tensor(
     timestamps: pd.DatetimeIndex,
     feature_dim: int,
     split_valid_timestamp: pd.Timestamp,
+    device: torch.device,
     ) -> Tuple[torch.Tensor, torch.BoolTensor, pd.DatetimeIndex]:
     """
     Efficiently build aligned tensor from dict of DataFrames.
@@ -225,20 +226,20 @@ def build_input_tensor(
     I = len(universe)
     
     # Use float32 to save memory (matches PyTorch default)
-    tensor_array = np.full((T, I, F), np.nan, dtype=np.float32)
+    tensor_array = torch.full((T, I, F), float('nan'), dtype=torch.float32, device=device)
     
     # Fill in data for each instrument
     for i, ticker in enumerate(universe):
         assert data[ticker].shape == (T,F)  #not correct during last batch or when validation is specified.
         # Copy values into pre-allocated array
-        tensor_array[:, i, :] = data[ticker].values
+        tensor_array[:, i, :] = torch.tensor(data[ticker].values, dtype=torch.float32, device=device)
     
     # Validate that we have at least some data
-    if np.all(np.isnan(tensor_array)):
+    if torch.isnan(tensor_array).all():
         raise ValueError("All data is NaN - no valid observations")
     
     # Check for completely empty timestamps
-    empty_timestamps = np.all(np.isnan(tensor_array), axis=(1, 2))
+    empty_timestamps = torch.isnan(tensor_array).all(dim=2).all(dim=1)  # (T,)
     if np.any(empty_timestamps):
         n_empty = np.sum(empty_timestamps)
         raise ValueError(
@@ -246,21 +247,21 @@ def build_input_tensor(
         )
     
     
-
-    train_idx = timestamps <= split_valid_timestamp
+    # move to torch tensor
+    train_idx = torch.as_tensor(timestamps <= split_valid_timestamp, dtype=torch.bool, device=device)
 
     # Instrument is active if it has ALL non-NaN value at last timestamp
     # train tensor and mask
-    train_tensor = torch.from_numpy(tensor_array[train_idx])  # (T_train, I, F)
-    train_mask = torch.from_numpy(~np.all(np.isnan(train_tensor[-1, :, :]), axis=1))  # (I,)
-
+    train_tensor = tensor_array[train_idx]  # (T_train, I, F)
+    train_mask = ~torch.all(torch.isnan(train_tensor[-1, :, :]), dim=1)  # (I,)
+    
     # valid tensor and mask
     valid_tensor = torch.tensor(0)
     valid_mask = torch.tensor(0)
     # Create train/valid split. if train_end == valid_end -> this is an update() cal, so no validation 
     if split_valid_timestamp < timestamps[-1]:
-        valid_tensor = torch.from_numpy(tensor_array[~train_idx])  # (T - T_train, I, F)
-        valid_mask = torch.from_numpy(~np.all(np.isnan(valid_tensor[-1, :, :]), axis=1))  # (I,)
+        valid_tensor = tensor_array[~train_idx]  # (T - T_train, I, F)
+        valid_mask = ~torch.all(torch.isnan(valid_tensor[-1, :, :]), dim=1)  # (I,)
 
     return (train_tensor, train_mask), (valid_tensor, valid_mask)
 
@@ -268,6 +269,7 @@ def build_pred_tensor(
     data: Dict[str, pd.DataFrame],
     timestamps: pd.DatetimeIndex,
     feature_dim: int,
+    device: torch.device,
     ) -> Tuple[torch.Tensor, torch.BoolTensor, pd.DatetimeIndex]:
     """
     Efficiently build aligned tensor from dict of DataFrames.
@@ -288,10 +290,12 @@ def build_pred_tensor(
     Raises:
         ValueError: If universe is empty or all timestamps are NaN
     """
+
+    universe = list(data.keys())
+
+
     if not universe:
         raise ValueError("Universe cannot be empty")
-    
-    universe = list(data.keys())
     
     # Pre-allocate array for efficiency
     F = feature_dim
@@ -299,35 +303,30 @@ def build_pred_tensor(
     I = len(universe)
     
     # Use float32 to save memory (matches PyTorch default)
-    tensor_array = np.full((T, I, F), np.nan, dtype=np.float32)
+    tensor_array = torch.full((T, I, F), float('nan'), dtype=torch.float32, device=device)
     
     # Fill in data for each instrument
     for i, ticker in enumerate(universe):
         # Reindex to common timestamps (automatically fills NaN for missing)
         assert data[ticker].shape == (T,F)
-        aligned = data[ticker].reindex(timestamps)
         # Copy values into pre-allocated array
-        tensor_array[:, i, :] = aligned.values
+        tensor_array[:, i, :] = torch.tensor(data[ticker].values, dtype=torch.float32, device=device)
     
     # Validate that we have at least some data
-    if np.all(np.isnan(tensor_array)):
+    if torch.isnan(tensor_array).all():
         raise ValueError("All data is NaN - no valid observations")
     
     # Check for completely empty timestamps
-    empty_timestamps = np.all(np.isnan(tensor_array), axis=(1, 2))
+    empty_timestamps = torch.isnan(tensor_array).all(dim=2).all(dim=1)  # (T,)
     if np.any(empty_timestamps):
         n_empty = np.sum(empty_timestamps)
-        first_empty = timestamps[np.where(empty_timestamps)[0][0]]
         raise ValueError(
             f"Found {n_empty} completely empty timestamps. "
-            f"First at {first_empty}. Check data alignment."
         )
-    
     
 
     # train tensor and mask
-    pred_tensor = torch.from_numpy(tensor_array)  # (T, I, F)
+    pred_tensor = tensor_array  # (T, I, F)
     # Instrument is active if it has ALL non-NaN value at last timestamp
-    pred_mask = torch.from_numpy(~np.all(np.isnan(pred_tensor[-1, :, :]), axis=1))  # (I,)
-
+    pred_mask = ~torch.all(torch.isnan(pred_tensor[-1, :, :]), dim=1)  # (I,)
     return pred_tensor, pred_mask

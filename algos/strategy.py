@@ -96,7 +96,9 @@ class BacktestLongShortStrategy(Strategy):
         
         
         # Loader for data access
-        self.loader = CsvBarLoader(cfg=self.cfg)
+        # TODO: cols to load should be extended for features added by qlib/libraries. maybe it should include feat_dim
+        cols_to_load = ['Open', 'High', 'Low', 'Adj Close', 'Volume']
+        self.loader = CsvBarLoader(cfg=self.cfg, columns_to_load=cols_to_load)
 
         # State tracking
         

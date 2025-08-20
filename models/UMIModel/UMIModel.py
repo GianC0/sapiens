@@ -27,7 +27,7 @@ from mlflow.tracking import MlflowClient
 from pandas import DataFrame, Timestamp
 import pandas_market_calendars as market_calendars
 
-from ..utils import SlidingWindowDataset, build_input_tensor, build_pred_tensor
+from ..utils import SlidingWindowDataset, build_input_tensor, build_pred_tensor, freq2pdoffset
 from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
 
 # --------------------------------------------------------------------------- #
@@ -265,10 +265,9 @@ class UMIModel(nn.Module):
         assert self._universe == list(data.keys()), "Universe error!"
 
         # Build panel from current data
-        # https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars
         days_range = self.market_calendar.schedule(start_date=current_time, end_date=current_time + self.pred_offset)
-        timestamps = market_calendars.date_range(days_range, frequency=self.freq)
-        data_tensor, data_mask = build_pred_tensor(data, timestamps, feature_dim=self.F)
+        timestamps = market_calendars.date_range(days_range, frequency=self.freq).normalize()
+        data_tensor, data_mask = build_pred_tensor(data, timestamps, feature_dim=self.F, device=self._device)
         
         # assertion on the universe size
         assert torch.equal(data_mask, active_mask), "Active mask mismatch during prediction"
@@ -486,12 +485,13 @@ class UMIModel(nn.Module):
         if self.valid_end < self.train_end:
             raise ValueError(f"Validation end date: {self.valid_end} is earlier that end train end date {self.train_end}")
 
-        # Create common timestamp index
-        days_range = self.market_calendar.schedule(start_date=self.valid_end - self.train_offset, end_date=self.valid_end)
-        timestamps = market_calendars.date_range(days_range, frequency=self.freq)
+        # Create common timestamp index. This solves the start= -1 bar problem
+        start_date = self.valid_end - self.train_offset + freq2pdoffset(self.freq)
+        days_range = self.market_calendar.schedule(start_date= start_date, end_date=self.valid_end)
+        timestamps = market_calendars.date_range(days_range, frequency=self.freq).normalize()
         
         assert len(data) > 0
-        (train_tensor, train_mask) , (valid_tensor, valid_mask) = build_input_tensor(data=data, timestamps=timestamps, feature_dim=self.F, split_valid_timestamp=self.train_end )
+        (train_tensor, train_mask) , (valid_tensor, valid_mask) = build_input_tensor(data=data, timestamps=timestamps, feature_dim=self.F, split_valid_timestamp=self.train_end, device=self._device )
 
         assert torch.equal(valid_mask, active_mask) , "Active mask mismatch during training"
         # Build training dataset
