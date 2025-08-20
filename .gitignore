@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Added by Gian
+logs/
+mlruns/
+
 # C extensions
 *.so
 

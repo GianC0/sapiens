@@ -74,26 +74,30 @@ class StockLevelFactorLearning(nn.Module):
 
         # ensure active_mask is a boolean tensor
         if active_mask is None:
-            active_mask = torch.ones((B, I), device=e_seq.device, dtype=torch.bool)
+            active_mask = torch.ones((B, I), device=prices_seq.device, dtype=torch.bool)
 
         # COMPUTE u_seq
 
         # masking diagonal elements
         im = ~torch.eye(I, device=prices_seq.device).bool()
-        beta_masked = self.beta * mask.float()
+        beta_masked = self.beta * im.float()
 
         # For each stock i: weighted sum of other stocks j
         virt = torch.einsum('btj,ij->bti', prices_seq, beta_masked)  # (B,L+1,I)
 
-        attn = self.attn_weights.masked_fill(~mask , -1e9)
+        attn = self.attn_weights.masked_fill(im , -1e9)
         attn = F.softmax(attn, dim=1)
 
         u_seq = torch.einsum('bti,ij->btj', virt, attn)  # (B,L+1,I)
 
 
         # ─── Masked-out Losses ─────────────────────────────────────────────────────────────────
-        loss_beta = F.mse_loss(prices_seq[active_mask], virt[active_mask].detach())
-        loss_station = F.mse_loss(u_seq[active_mask][:, 1:], self.rho * u_seq[active_mask][:, :-1])
+        active_mask = active_mask.unsqueeze(1)           # (B,1,I)
+        m_beta = active_mask.expand(-1, L1, -1)          # (B,T,I)
+        m_stat = active_mask.expand(-1, L1 - 1, -1)      # (B,T-1,I)
+
+        loss_beta = F.mse_loss(prices_seq[m_beta], virt[m_beta].detach())
+        loss_station = F.mse_loss(u_seq[:, 1:][m_stat], self.rho * u_seq[:, :-1][m_stat])
         loss = loss_beta + self.lambda_ic * loss_station
         return u_seq, loss, {"loss_beta": loss_beta.detach(), "loss_station": loss_station.detach()}
 
@@ -151,7 +155,7 @@ class MarketLevelFactorLearning(nn.Module):
         e_window: torch.Tensor,   # (B,Lτ,I,F)
         stockID_b: torch.Tensor,    # (B,I,I) one-hot matrix
         active_mask: Optional[torch.Tensor] = None,  # (B,I) mask for active stocks
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """
             Returns (r_t , m_t) for a given window ending at τ.
             r_t : (B,I,2F)   — dynamic stock embedding
@@ -164,6 +168,8 @@ class MarketLevelFactorLearning(nn.Module):
                 # zero out dead columns before any linear or attention op
                 m = active_mask.unsqueeze(1).unsqueeze(-1)        # (B,1,I,1)
                 e_window = e_window * m
+            else:
+                active_mask = torch.ones(self.I, dtype=torch.bool).unsqueeze(0).expand(B,-1)   # (B,I)
             e_t   = e_window[:, -1]                     # (B,I,F)
             k_win = self.W_s(e_window)                  # (B,Lτ,I,F)
             q_t   = self.W_s(e_t)                       # (B,I,F)
@@ -177,7 +183,7 @@ class MarketLevelFactorLearning(nn.Module):
             eta_in = self.W_iota(stockID_b) + r_t                    # (B,I,2F)
             eta    = F.relu(torch.einsum("bif,f->bi", eta_in, self.w_eta)) # (B,I)
 
-            m_t    = self._weighted_mean(eta[active_mask], r_t[active_mask])                 # (B,2F)
+            m_t    = self._weighted_mean(eta[:, active_mask[1]], r_t[:, active_mask[1]])  #(1)               # (B,2F)
             return r_t, m_t, eta
 
     def forward(
@@ -218,14 +224,14 @@ class MarketLevelFactorLearning(nn.Module):
 
             Lτ = min(self.L, τ + 1)
             r_τ, m_τ, eta_τ= self._compute_m_t(e_seq[:, τ - Lτ + 1 : τ + 1], stockID_b, active_mask)  # (B,I,2F), (B,2F), (B,I,2F)
-            m1 = self._weighted_mean(eta_τ[active_mask][:, S1], r_τ[active_mask][:, S1])  # (B,2F)
-            m2 = self._weighted_mean(eta_τ[active_mask][:, S2], r_τ[active_mask][:, S2])  # (B,2F)
+            m1 = self._weighted_mean(eta_τ[:, active_mask[1]][:, S1], r_τ[:, active_mask[1], :][:, S1])  # (B,2F)
+            m2 = self._weighted_mean(eta_τ[:, active_mask[1]][:, S2], r_τ[:, active_mask[1], :][:, S2])  # (B,2F)
             m1_list.append(m1) ; m2_list.append(m2)
             period_ids.append(torch.full((B,), τ, device=e_seq.device, dtype=torch.long))
 
         feats   = torch.cat(m1_list + m2_list, 0)                         # (2B*T,2F)
         labels  = torch.cat(period_ids * 2,      0)                       # (2B*T)
-        loss_contrast = self.info_nce(feats[active_mask], labels[active_mask])
+        loss_contrast = self.info_nce(feats, labels)
 
         # ---------------- synchronism labels (Eq. 15) ----------------
         close = e_seq[..., close_idx]                      # (B,T,I)

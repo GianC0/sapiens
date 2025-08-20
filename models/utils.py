@@ -240,8 +240,8 @@ def build_input_tensor(
     
     # Check for completely empty timestamps
     empty_timestamps = torch.isnan(tensor_array).all(dim=2).all(dim=1)  # (T,)
-    if np.any(empty_timestamps):
-        n_empty = np.sum(empty_timestamps)
+    if torch.any(empty_timestamps):
+        n_empty = torch.sum(empty_timestamps)
         raise ValueError(
             f"Found {n_empty} completely empty timestamps. "
         )
@@ -258,7 +258,7 @@ def build_input_tensor(
     # valid tensor and mask
     valid_tensor = torch.tensor(0)
     valid_mask = torch.tensor(0)
-    # Create train/valid split. if train_end == valid_end -> this is an update() cal, so no validation 
+    # Create train/valid split. if train_end == valid_end -> this is an update() call, or no validation 
     if split_valid_timestamp < timestamps[-1]:
         valid_tensor = tensor_array[~train_idx]  # (T - T_train, I, F)
         valid_mask = ~torch.all(torch.isnan(valid_tensor[-1, :, :]), dim=1)  # (I,)
@@ -318,8 +318,8 @@ def build_pred_tensor(
     
     # Check for completely empty timestamps
     empty_timestamps = torch.isnan(tensor_array).all(dim=2).all(dim=1)  # (T,)
-    if np.any(empty_timestamps):
-        n_empty = np.sum(empty_timestamps)
+    if torch.any(empty_timestamps):
+        n_empty = torch.sum(empty_timestamps)
         raise ValueError(
             f"Found {n_empty} completely empty timestamps. "
         )

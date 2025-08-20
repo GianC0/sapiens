@@ -186,7 +186,7 @@ class UMIModel(nn.Module):
         One-off training (train + valid).
         """
         
-        assert len(active_mask) == self.I, f"Active mask size must match the number of trained instruments ({self.I})"
+        assert torch.numel(active_mask) == self.I, f"Active mask size must match the number of trained instruments ({self.I})"
 
         # Assert universe
         assert self._universe == list(data.keys()), "Universe error!"
@@ -259,7 +259,7 @@ class UMIModel(nn.Module):
             Dict[ticker, prediction] for active instruments only
         """
         assert self._is_initialized, "Model must be initialized before prediction"
-        assert len(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
+        assert torch.numel(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
         
         # Assert universe
         assert self._universe == list(data.keys()), "Universe error!"
@@ -493,14 +493,18 @@ class UMIModel(nn.Module):
         assert len(data) > 0
         (train_tensor, train_mask) , (valid_tensor, valid_mask) = build_input_tensor(data=data, timestamps=timestamps, feature_dim=self.F, split_valid_timestamp=self.train_end, device=self._device )
 
-        assert torch.equal(valid_mask, active_mask) , "Active mask mismatch during training"
+        # empty tensor has size 1 with Null object
+        has_validation = torch.numel(valid_tensor) > 1
+        if has_validation:
+            assert torch.equal(valid_mask, active_mask) , "Active mask mismatch during training"
+        else:
+            assert torch.equal(train_mask, active_mask), "Active mask mismatch during training"
         # Build training dataset
         train_dataset = SlidingWindowDataset(train_tensor, self.L, self.pred_len, target_idx=self.close_idx)
         train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
         
         # Build validation dataset (if available)
         valid_loader = None
-        has_validation = len(valid_tensor) > 0
         if has_validation:
             valid_dataset = SlidingWindowDataset(valid_tensor, self.L, self.pred_len, target_idx=self.close_idx)
             valid_loader = DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=False)
@@ -938,7 +942,8 @@ class UMIModel(nn.Module):
     def _stage1_forward(self, prices_seq, feat_seq, active_mask):
         """Run stock-level & market-level factor learning *concurrently*."""
 
-        assert active_mask.ndim == 2 and active_mask.shape == (self.batch_size, self.I), f"active_mask must be (B, I); got {list(active_mask.shape)}"
+        assert active_mask.ndim == 2 , f"active_mask must be of size ({B},{I}); got {list(active_mask.shape)}"
+        # assert active_mask.shape == (self.batch_size, self.I)  NOT TRUE for last batch with batch_size smaller
         stockIDs = self._eye.to(prices_seq.device)
         if torch.cuda.is_available():
             # ---- GPU: two independent CUDA streams ------------------- #
