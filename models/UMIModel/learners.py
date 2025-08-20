@@ -289,7 +289,7 @@ class ForecastingLearning(nn.Module):
         num_stocks: int,
         feature_dim: int,
         u_dim: int,
-        W_iota: nn.Linear,                # shared projector from market block
+        #W_iota: nn.Linear,                passed as tensor, not as learnable parameter
         pred_len: int = 1,
         lambda_rankic: float = 0.1,
     ):
@@ -312,7 +312,7 @@ class ForecastingLearning(nn.Module):
             TransformerEncoderLayer(d_model=self.D_enc, nhead=self.nheads, batch_first=True), num_layers=2, norm=nn.LayerNorm(self.D_enc))
 
         # ───── Stock-relation parameters  (Eq. 26) ───── #
-        self.W_iota  = W_iota                       # shared weights
+        #self.W_iota  = W_iota                       # W_iota passed in the forward() function as tensor
         self.W_gamma = nn.Linear(self.D_market, self.D_market, bias=False)
 
         # ───── Prediction head  (Eq. 28) ───── #
@@ -330,6 +330,7 @@ class ForecastingLearning(nn.Module):
 
     def forward(
         self,
+        W_iota_weight: torch.Tensor,     # 
         e_seq: torch.Tensor,      # (B,L,I,F)
         u_seq: torch.Tensor,      # (B,L,I)
         r_t:   torch.Tensor,      # (B,I,2F)
@@ -356,7 +357,11 @@ class ForecastingLearning(nn.Module):
 
         # ── 2. Relation weights γ_{ij}  (Eq. 26) ───────────────────── #
         stockID_b = stockID.unsqueeze(0).expand(B, -1, -1)      # (B,I,I)
-        h = self.W_gamma(r_t + self.W_iota(stockID_b))          # (B,I,2F)
+            
+        # Apply W_iota transformation manually using the passed weight tensor
+        # W_iota_weight shape: (2*feature_dim, num_stocks) for Linear(num_stocks, 2*feature_dim)
+        W_iota_output = torch.einsum('bij,kj->bik', stockID_b, W_iota_weight)  # (B,I,2F)
+        h = self.W_gamma(r_t + W_iota_output)          # (B,I,2F)
         rel_scores = torch.einsum("bif,bjf->bij", h, h) / math.sqrt(self.D_market)
         gamma_ij   = rel_scores.softmax(dim=2)                  # softmax over j
 
@@ -372,7 +377,7 @@ class ForecastingLearning(nn.Module):
         loss      = torch.tensor(0.0, device=e_seq.device)
         rank_loss = torch.tensor(0.0, device=e_seq.device)
         if target is not None:
-            mse   = F.mse_loss(out[mask],  target[mask])
+            mse   = F.mse_loss(out[active_mask],  target[active_mask])
             rank_loss = 1 - rank_ic(out, target)
             loss = mse + self.lambda_rankic * rank_loss
 

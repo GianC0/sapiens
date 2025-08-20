@@ -167,7 +167,7 @@ class UMIModel(nn.Module):
         self._is_initialized = True
         
         # Dump metadata
-        self._dump_model_metadata()
+        #self._dump_model_metadata()
         
         if self.logger:
             self.logger.info(f"[initialize] Complete. Best validation: {best_val:.6f}")
@@ -386,7 +386,6 @@ class UMIModel(nn.Module):
 
         self.forecaster = ForecastingLearning(
             I, self.F, u_dim=1,
-            W_iota=self.market_factor.W_iota,
             pred_len=self.pred_len,
             lambda_rankic=self.hp["lambda_rankic"],
         ).to(self._device)
@@ -421,47 +420,47 @@ class UMIModel(nn.Module):
         for key, value in self.hp.items():
             mlflow.log_param(f"hp_{key}", value)
     # ---------------- metadata on memory size and params ------------- #
-    def _dump_model_metadata(self):
-        """
-        Persists:
-        • param_inventory.csv   – per-tensor shape / #params / bytes
-        • run_meta.json         – run-time settings + totals
-        """
+    # def _dump_model_metadata(self):
+    #     """
+    #     Persists:
+    #     • param_inventory.csv   – per-tensor shape / #params / bytes
+    #     • run_meta.json         – run-time settings + totals
+    #     """
         
-        records, total_p, total_b = [], 0, 0
-        sd = self.state_dict()
-        for blk, obj in sd.items():
-            if isinstance(obj, dict):           # sub-module dict
-                for n, t in obj.items():
-                    numel = t.numel(); bytes_ = numel * t.element_size()
-                    records.append(dict(tensor=f"{blk}.{n}",
-                                        shape=list(t.shape),
-                                        numel=numel, bytes=bytes_))
-                    total_p += numel; total_b += bytes_
-            else:                               # flat tensor
-                numel = obj.numel(); bytes_ = numel * obj.element_size()
-                records.append(dict(tensor=blk, shape=list(obj.shape),
-                                    numel=numel, bytes=bytes_))
-                total_p += numel; total_b += bytes_
+    #     records, total_p, total_b = [], 0, 0
+    #     sd = self.state_dict()
+    #     for blk, obj in sd.items():
+    #         if isinstance(obj, dict):           # sub-module dict
+    #             for n, t in obj.items():
+    #                 numel = t.numel(); bytes_ = numel * t.element_size()
+    #                 records.append(dict(tensor=f"{blk}.{n}",
+    #                                     shape=list(t.shape),
+    #                                     numel=numel, bytes=bytes_))
+    #                 total_p += numel; total_b += bytes_
+    #         else:                               # flat tensor
+    #             numel = torch.numel(obj); bytes_ = numel * obj.element_size()
+    #             records.append(dict(tensor=blk, shape=list(obj.shape),
+    #                                 numel=numel, bytes=bytes_))
+    #             total_p += numel; total_b += bytes_
 
-        pd.DataFrame(records).to_csv(self.model_dir / "param_inventory.csv",
-                                    index=False)
+    #     pd.DataFrame(records).to_csv(self.model_dir / "param_inventory.csv",
+    #                                 index=False)
 
-        # some model params information
-        some = dict(
-            freq=self.freq, feature_dim=self.F, window_len=self.L,
-            pred_len=self.pred_len, train_end=str(self.train_end),
-            valid_end=str(self.valid_end), n_epochs=self.n_epochs,
-            #dynamic_universe_mult=self.universe_mult, 
-            total_params=total_p,
-            approx_size_mb=round(total_b / 1024 / 1024, 3),
-        )
-        # adding hparams
-        some.update(self.hp)
+    #     # some model params information
+    #     some = dict(
+    #         freq=self.freq, feature_dim=self.F, window_len=self.L,
+    #         pred_len=self.pred_len, train_end=str(self.train_end),
+    #         valid_end=str(self.valid_end), n_epochs=self.n_epochs,
+    #         #dynamic_universe_mult=self.universe_mult, 
+    #         total_params=total_p,
+    #         approx_size_mb=round(total_b / 1024 / 1024, 3),
+    #     )
+    #     # adding hparams
+    #     some.update(self.hp)
 
-        # storing all params infos
-        with open(self.model_dir / "all_params.json", "w") as fp:
-            json.dump(some, fp, indent=2)
+    #     # storing all params infos
+    #     with open(self.model_dir / "all_params.json", "w") as fp:
+    #         json.dump(some, fp, indent=2)
 
     # ----------------------------------------------------------------- #
     # ---------------- training utilities ----------------------------- #
@@ -757,6 +756,10 @@ class UMIModel(nn.Module):
         self.stock_factor.requires_grad_(False)
         self.market_factor.requires_grad_(False)
         self.forecaster.requires_grad_(True)
+
+        # This ensures shared parameter is trained only by MarketForecaster
+        for param in self.market_factor.W_iota.parameters():
+            param.requires_grad_(False)
         
         # Reinitialize forecaster optimizer
         optimizer_forecaster = torch.optim.AdamW(
@@ -965,8 +968,17 @@ class UMIModel(nn.Module):
         return u_seq, r_t, m_t, loss_s, loss_m
 
     def _stage2_forward(self, feat_seq, u_seq, r_t, m_t, target, active_mask):
-        assert active_mask.ndim == 2 and active_mask.shape == (self.batch_size, self.I), f"active_mask must be (B, I); got {list(active_mask.shape)}"
+        assert active_mask.ndim == 2 , f"active_mask must be of size ({B},{I}); got {list(active_mask.shape)}"
+        # assert active_mask.shape == (self.batch_size, self.I) not correct since batch_size for last batch is smaller
         stockIDs = self._eye.to(feat_seq.device)
+
+        # Get W_iota weight from market factor
+        W_iota_weight = self.market_factor.W_iota.weight.detach()  # Shape: (2F, I)
+        
+        # Control gradient flow based on training phase
+        # if not any(p.requires_grad for p in self.market_factor.parameters()):
+        #     # Phase 2 (market factor frozen): detach to prevent gradients flowing back to market factor
+        #     W_iota_weight = W_iota_weight.detach()
         return self.forecaster(
-            feat_seq, u_seq, r_t, m_t, stockIDs, target, active_mask
+            W_iota_weight, feat_seq, u_seq, r_t, m_t, stockIDs, target, active_mask
         )
