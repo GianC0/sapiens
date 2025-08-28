@@ -6,6 +6,8 @@ __pycache__/
 # Added by Gian
 logs/
 mlruns/
+.env
+.vscode
 
 # C extensions
 *.so

@@ -27,6 +27,7 @@ from mlflow.tracking import MlflowClient
 from pandas import DataFrame, Timestamp
 import pandas_market_calendars as market_calendars
 
+
 from ..utils import SlidingWindowDataset, build_input_tensor, build_pred_tensor, freq2pdoffset
 from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
 
@@ -265,7 +266,10 @@ class UMIModel(nn.Module):
         assert self._universe == list(data.keys()), "Universe error!"
 
         # Build panel from current data
-        days_range = self.market_calendar.schedule(start_date=current_time, end_date=current_time + self.pred_offset)
+        lookback_periods = self.L + 1  # Need L+1 bars for prediction
+        # Calculate the start date for the historical window
+        start_date = current_time - freq2pdoffset(self.freq) * lookback_periods
+        days_range = self.market_calendar.schedule(start_date=start_date, end_date=current_time)
         timestamps = market_calendars.date_range(days_range, frequency=self.freq).normalize()
         data_tensor, data_mask = build_pred_tensor(data, timestamps, feature_dim=self.F, device=self._device)
         
@@ -273,7 +277,7 @@ class UMIModel(nn.Module):
         assert torch.equal(data_mask, active_mask), "Active mask mismatch during prediction"
         
         dataset = SlidingWindowDataset(data_tensor, self.L, self.pred_len, self.close_idx, with_target = False)
-        assert len(dataset) == 1, "Prediction dataset should contain exactly one window"
+        assert len(dataset) == 1, f"Prediction dataset should contain exactly one window, found instead {len(dataset)}"
         
         # Get the last window for prediction
         if len(dataset) == 0:

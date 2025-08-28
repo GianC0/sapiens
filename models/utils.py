@@ -308,7 +308,7 @@ def build_pred_tensor(
     # Fill in data for each instrument
     for i, ticker in enumerate(universe):
         # Reindex to common timestamps (automatically fills NaN for missing)
-        assert data[ticker].shape == (T,F), f"tiker dataframe size mismatch"
+        assert data[ticker].shape == (T,F), f"tiker dataframe size mismatch. Expected ({T},{F}), got {data[ticker].shape}"
         # Copy values into pre-allocated array
         tensor_array[:, i, :] = torch.tensor(data[ticker].values, dtype=torch.float32, device=device)
     

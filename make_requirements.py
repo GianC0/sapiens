@@ -17,7 +17,7 @@ from collections import defaultdict
 from importlib import metadata
 
 # ────────────────────────────────────────────────────────────────────
-HERE        = Path.cwd()
+HERE        = Path.cwd()Jupyter
 SCRIPT_PATH = Path(__file__).resolve()
 REQ_PATH    = HERE / "requirements.txt"
 
