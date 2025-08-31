@@ -1,130 +1,150 @@
-# MODEL
-model_name: "UMIModel"
+# !!!!!!!!!! STRUCTURE !!!!!!!!!!!!!
+# 1) model:
+#     - params
+#     - hparams
+# 2) strategy:
+#     - params
+#     - hparams
 
 # ---------------------------------------------------------------------------
-#  Paths
+#  MODEL
 # ---------------------------------------------------------------------------
-data_dir:  "data/"            # Root Data folder containing subfolders with CSVs        (general)
-logs_dir: "logs/"             # Where checkpoints / logs are stored       (general)
-initial_cash: 20000           # portfolio initial cash                    (portfolio)
-currency: USD
-calendar: NYSE                # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
+MODEL:
+  PARAMS:
+    model_name: "UMIModel"
 
-# ---------------------------------------------------------------------------
-#  Dates 
-# ---------------------------------------------------------------------------
-backtest_start: 2021-07-01  # First bar the strategy trades. 
-train_offset:   6M          # Length in Datetime of training set (6 months-end)
-valid_offset:   30D         # Validation set (early stopping / Optuna) if enabled
-backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= backtest_start + train_offset [+ valid_offset] + test_offset + pred_len
+    #  Model Logs
+    logs_dir: "logs/models/"      # Where checkpoints / logs are stored       (general)
+    
+    #  
+    pred_len:   1                 # H : prediction horizon (next bar)         (one-step forecast)
+    dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+univers_mult (in this case ↑20%)       
+    feature_dim: 5                # OHLCV + extra features for L1 market data. To be changed if higher level data is avail
+    feature_names: "candles"     # candles = OHLCV
 
-# ---------------------------------------------------------------------------
-#  Universe / data granularity
-# ---------------------------------------------------------------------------
-freq: 1D                      # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
-window_len: 60                # L : look-back window length (UMI paper)   (sliding-window features)
-pred_len:   1                 # H : prediction horizon (next bar)         (one-step forecast)
-dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+univers_mult (in this case ↑20%)       
-feature_dim: 5                # OHLCV + extra features for L1 market data. To be changed if higher level data is avail
-
-# ---------------------------------------------------------------------------
-#  Training schedule & hyper-param search
-# ---------------------------------------------------------------------------
-training:
-  target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
-  tune_hparams:    false       # Use Optuna Bayesian search. Every trial lands inside <logs_root>/optuna/<start>-<end>/<model_name>/<time_now>_<hp_id>               
-  n_trials:        20          # Optuna trials for each run
-  n_epochs:        20          # Epochs on train+valid after hp tuning and rolling initialization
-  batch_size:      64          # Mini-batch size for AdamW                 
-  training_mode:   sequential  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) → Stage-1 + Stage-2
-  pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
-  patience:        3           # Early-stop patience 
-  warm_start:      true        # Enable warm-start                           (common in finance live rolls)
-  warm_training_epochs: 5      # Light fine-tune epochs
-  retrain_offset:   30B         # Retrain every (30 * freq) bars
-  save_backups: false          # whether to save backups during walk-forward
+    #  Training schedule & hyper-param search
+    target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
+    n_epochs:        20          # Epochs on train+valid after hp tuning and rolling initialization
+    tune_hparams:    true        # Use Optuna Bayesian search.            
+    n_trials:        20          # Optuna trials for each run. Used only if tune_hparams is true
+    batch_size:      64          # Mini-batch size for AdamW                 
+    training_mode:   sequential  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) → Stage-1 + Stage-2
+    pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
+    patience:        3           # Early-stop patience 
+    warm_start:      true        # Enable warm-start                           (common in finance live rolls)
+    warm_training_epochs: 5      # Light fine-tune epochs
+    save_backups: false          # whether to save backups during walk-forward
 
 
 
-# ---------------------------------------------------------------------------
-#  Default hyper-parameters (UMI paper, Table 2) – Optuna overwrites them
-# ---------------------------------------------------------------------------
-hparams:  # optuna_type: categorical, low-high (assumed float), int_low-high, log_low-high
+  # ---------------------------------------------------------------------------
+  #  Default hyper-parameters defined by model are overwritten by this Optuna configuration
+  # ---------------------------------------------------------------------------
+  HPARAMS:  # optuna_type: categorical, low-high (assumed float), int_low-high, log_low-high
+    
+    window_len:  # L : look-back window length (UMI paper)   (sliding-window features)
+      default: 60
+      optuna:
+        optuna_type: categorical
+        choices: [7, 30, 60, 150, 365]
 
-  # λ_IC   : independence loss weight
-  lambda_ic:        
-    default: 0.5
-    optuna:            
-      optuna_type: categorical
-      choices: [0, 0.25, 0.5, 0.75, 1]
+    # λ_IC   : independence loss weight
+    lambda_ic:        
+      default: 0.5
+      optuna:            
+        optuna_type: categorical
+        choices: [0, 0.25, 0.5, 0.75, 1]
 
-  # λ_sync : synchronous factor loss 
-  lambda_sync:
-    default: 1.0
-    optuna:
-      optuna_type: categorical
-      choices: [0, 0.5, 1, 1.5, 2]
+    # λ_sync : synchronous factor loss 
+    lambda_sync:
+      default: 1.0
+      optuna:
+        optuna_type: categorical
+        choices: [0, 0.5, 1, 1.5, 2]
 
-  # λ_rank : rank-IC regulariser
-  lambda_rankic:     
-    default: 0.1
-    optuna:
-      optuna_type: categorical
-      choices: [0, 0.05, 0.1, 0.15, 0.2]
+    # λ_rank : rank-IC regulariser
+    lambda_rankic:     
+      default: 0.1
+      optuna:
+        optuna_type: categorical
+        choices: [0, 0.05, 0.1, 0.15, 0.2]
 
-  # τ : attention temperature
-  temperature:
-    default: 0.07
-    optuna:
-      optuna_type: low-high
-      low: 0.03
-      high: 0.2
-  
-  # θ_sync : threshold for stock synchrony
-  sync_thr:
-    default: 0.6
-    optuna:
-      optuna_type: low-high
-      low: 0.5
-      high: 0.8
+    # τ : attention temperature
+    temperature:
+      default: 0.07
+      optuna:
+        optuna_type: low-high
+        low: 0.03
+        high: 0.2
+    
+    # θ_sync : threshold for stock synchrony
+    sync_thr:
+      default: 0.6
+      optuna:
+        optuna_type: low-high
+        low: 0.5
+        high: 0.8
 
-  # α₁: learning-rate Stage-1 (AdamW)
-  lr_stage1:
-    default: 0.001
-    optuna:
-      optuna_type: log_low-high
-      low: 0.0001
-      high: 0.005
+    # α₁: learning-rate Stage-1 (AdamW)
+    lr_stage1:
+      default: 0.001
+      optuna:
+        optuna_type: log_low-high
+        low: 0.0001
+        high: 0.005
 
-  # α₁^ft  : LR when fine-tuning Stage-1 in hybrid mode
-  lr_stage1_ft:
-    default: 0.0001
-    optuna:
-      optuna_type: log_low-high
-      low: 0.0001
-      high: 0.005
+    # α₁^ft  : LR when fine-tuning Stage-1 in hybrid mode
+    lr_stage1_ft:
+      default: 0.0001
+      optuna:
+        optuna_type: log_low-high
+        low: 0.0001
+        high: 0.005
 
-  # α₂: learning-rate Forecasting head
-  lr_stage2:
-    default: 0.0001
-    optuna:
-      optuna_type: log_low-high
-      low: 0.00001
-      high: 0.001
+    # α₂: learning-rate Forecasting head
+    lr_stage2:
+      default: 0.0001
+      optuna:
+        optuna_type: log_low-high
+        low: 0.00001
+        high: 0.001
 
-  # stays frozen withouyt specifying the optuna values for hp optimization
-  weight_decay: 
-    default: 0.0       
+    # stays frozen withouyt specifying the optuna values for hp optimization
+    weight_decay: 
+      default: 0.0       
 
 # ---------------------------------------------------------------------------
 #  Allocation targets
 # ---------------------------------------------------------------------------
+STRATEGY:
+  PARAMS:
+    strategy_name: "LongShortStrategy"
+
+    #  Backtest
+    backtest_start: 2021-07-01  # First bar the strategy trades.
+    backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= backtest_start + train_offset [+ valid_offset] + test_offset + pred_len
+    calendar: NYSE              # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
+    initial_cash: 20000         # portfolio initial cash                    (portfolio)
+    currency: USD
+    data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
+    logs_dir: "logs/strategies/"
+
+    holdout: 1B              # holdout period in days. NOTE: ensure pred_len < holdout
+    allocation:
+      gross_leverage: 2.0   # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
+      net_exposure:   0.0   # Σwᵢ ≈ 0 (market-neutral)
+
+
+
+  HPARAMS:
+    #  Training windows 
+    train_offset:   6M          # Length in Datetime of training set (6 months-end)
+    valid_offset:   30D         # Validation set (early stopping / Optuna) if enabled
+    freq: 1D                    # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
+    retrain_offset:   30B        # Retrain every (30 * freq) bars
 
 strategy:
-  holdout: 1B              # holdout period in days. NOTE: ensure pred_len < holdout
-  allocation:
-    gross_leverage: 2.0   # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
-    net_exposure:   0.0   # Σwᵢ ≈ 0 (market-neutral)
+
 
   selection:
     top_k: 30            # sell the worst 30 and buy the best the 30 stocks 

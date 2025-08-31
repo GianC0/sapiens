@@ -36,7 +36,7 @@ from nautilus_trader.model.position import Position
 # ----- project imports -----------------------------------------------------
 from .models.interfaces import MarketModel
 from .engine.data_loader import CsvBarLoader, FeatureBarData
-from ..models.utils import freq2pandas, freq2barspec
+from ..models.utils import freq2pdoffset, freq2barspec
 from .engine.hparam_tuner import split_hparam_cfg, OptunaHparamsTuner
 
 #  risk / execution helpers (same modules you used before)
@@ -48,7 +48,7 @@ from .engine.analyzers import EquityCurveAnalyzer
 # ========================================================================== #
 # Strategy
 # ========================================================================== #
-class BacktestLongShortStrategy(Strategy):
+class LongShortStrategy(Strategy):
     """
     Long/short equity strategy, model-agnostic & frequency-agnostic.
 
@@ -74,6 +74,8 @@ class BacktestLongShortStrategy(Strategy):
         super().__init__()  
 
         self.cfg = config
+
+        model_params = self.cfg["MODELS"]["PARAMS"]
         
         # Core timing parameters
         self.backtest_start = pd.Timestamp(self.cfg["backtest_start"], tz="UTC")
@@ -92,12 +94,17 @@ class BacktestLongShortStrategy(Strategy):
         self.model_name = self.cfg["model_name"]
         self.bar_type = None  # Set in on_start
         self.bar_spec = freq2barspec(self.cfg["freq"])
-        self.min_bars_required = self.cfg["window_len"] + self.cfg["pred_len"] + 100  # Safety margin
+        self.min_bars_required = self.cfg["window_len"] + self.cfg["pred_len"]  # Safety margin
         
         
         # Loader for data access
         # TODO: cols to load should be extended for features added by qlib/libraries. maybe it should include feat_dim
-        cols_to_load = ['Open', 'High', 'Low', 'Adj Close', 'Volume']
+        cols_to_load = []
+        if model_params["feature_names"] == "candles":
+            cols_to_load = ['Open', 'High', 'Low', 'Adj Close', 'Volume']
+        else:
+            raise Exception(f"FEATURES {model_params["feature_names"]} NOT SUPPORTED")
+        
         self.loader = CsvBarLoader(cfg=self.cfg, columns_to_load=cols_to_load)
 
         # State tracking
@@ -448,14 +455,14 @@ class BacktestLongShortStrategy(Strategy):
             log = self.log,
         )
         
-        _ , model_dir = tuner.optimize()
+        _ , model_dir = final_tuner.optimize()
         
 
         # reload the model to use for walk-forward steps
         self.model = ModelClass(**final_model_params, **best_hparams)
 
         if (model_dir / "init.pt").exists():
-                state_dict = torch.load(saved_state_path, map_location='cpu')
+                state_dict = torch.load(model_dir / "init.pt", map_location='cpu')
                 self.model.load_state_dict(state_dict)
         else:
             raise ImportError(f"Could not find init.pt in {model_dir}")

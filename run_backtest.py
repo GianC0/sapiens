@@ -19,7 +19,7 @@ from nautilus_trader.model.enums import OmsType, AccountType
 from models.utils import freq2barspec, freq2pdoffset
 
 
-from algos.strategy import BacktestLongShortStrategy
+from algos.strategy import LongShortStrategy
 from ..models.utils import freq2pdoffset
 from algos.engine.hparam_tuner import OptunaHparamsTuner, split_hparam_cfg
 from algos.engine.data_loader import CsvBarLoader
@@ -67,7 +67,7 @@ def main():
     
     engine = BacktestEngine(
         config=BacktestEngineConfig(
-            strategies=[BacktestLongShortStrategy(config=cfg)],
+            strategies=[LongShortStrategy(config=cfg)],
             trader_id="TESTER-001",
         ),
         data_configs=[
