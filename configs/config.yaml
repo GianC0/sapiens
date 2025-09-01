@@ -1,72 +1,62 @@
-# !!!!!!!!!! STRUCTURE !!!!!!!!!!!!!
-# 1) model:
-#     - params
-#     - hparams
-# 2) strategy:
-#     - params
-#     - hparams
-
 # ---------------------------------------------------------------------------
-#  MODEL
+#  MODEL CONFIGURATION
 # ---------------------------------------------------------------------------
 MODEL:
+  # Fixed parameters (not optimized)
   PARAMS:
     model_name: "UMIModel"
 
-    #  Model Logs
+    #  Model Paths
     logs_dir: "logs/models/"      # Where checkpoints / logs are stored       (general)
-    
-    #  
+
+    # Model architecture  
     pred_len:   1                 # H : prediction horizon (next bar)         (one-step forecast)
     dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+univers_mult (in this case ↑20%)       
     feature_dim: 5                # OHLCV + extra features for L1 market data. To be changed if higher level data is avail
-    feature_names: "candles"     # candles = OHLCV
+    feature_names: "candles"      # candles = OHLCV
 
-    #  Training schedule & hyper-param search
+    # Training
     target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
     n_epochs:        20          # Epochs on train+valid after hp tuning and rolling initialization
-    tune_hparams:    true        # Use Optuna Bayesian search.            
-    n_trials:        20          # Optuna trials for each run. Used only if tune_hparams is true
     batch_size:      64          # Mini-batch size for AdamW                 
-    training_mode:   sequential  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) → Stage-1 + Stage-2
+    training_mode: "sequential"  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) → Stage-1 + Stage-2
     pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
     patience:        3           # Early-stop patience 
     warm_start:      true        # Enable warm-start                           (common in finance live rolls)
     warm_training_epochs: 5      # Light fine-tune epochs
     save_backups: false          # whether to save backups during walk-forward
 
+    # Hyperparameter tuning settings
+    tune_hparams:    true        # Use Optuna Bayesian search.            
+    n_trials:        20          # Optuna trials for each run. Used only if tune_hparams is true
 
-
-  # ---------------------------------------------------------------------------
-  #  Default hyper-parameters defined by model are overwritten by this Optuna configuration
-  # ---------------------------------------------------------------------------
-  HPARAMS:  # optuna_type: categorical, low-high (assumed float), int_low-high, log_low-high
-    
-    window_len:  # L : look-back window length (UMI paper)   (sliding-window features)
+  # Default hyper-parameters defined by model are overwritten by this Optuna configuration
+  HPARAMS:  # optuna_type: "categorical", low-high (assumed float), int_low-high, log_low-high
+    window_len:  # L : look-back window length   (sliding-window features)
       default: 60
       optuna:
-        optuna_type: categorical
+        optuna_type: "categorical"
         choices: [7, 30, 60, 150, 365]
 
     # λ_IC   : independence loss weight
     lambda_ic:        
       default: 0.5
       optuna:            
-        optuna_type: categorical
+        optuna_type: "categorical"
         choices: [0, 0.25, 0.5, 0.75, 1]
 
     # λ_sync : synchronous factor loss 
     lambda_sync:
       default: 1.0
       optuna:
-        optuna_type: categorical
+        optuna_type: "categorical"
         choices: [0, 0.5, 1, 1.5, 2]
 
     # λ_rank : rank-IC regulariser
     lambda_rankic:     
       default: 0.1
       optuna:
-        optuna_type: categorical
+        optuna_type: "categorical"
         choices: [0, 0.05, 0.1, 0.15, 0.2]
 
     # τ : attention temperature
@@ -113,91 +103,152 @@ MODEL:
     weight_decay: 
       default: 0.0       
 
-# ---------------------------------------------------------------------------
-#  Allocation targets
-# ---------------------------------------------------------------------------
+# ===============================================================================
+#  STRATEGY CONFIGURATION
+# ===============================================================================
+
 STRATEGY:
+  # Fixed parameters (not optimized)
   PARAMS:
     strategy_name: "LongShortStrategy"
 
     #  Backtest
-    backtest_start: 2021-07-01  # First bar the strategy trades.
-    backtest_end:   2023-07-01  # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= backtest_start + train_offset [+ valid_offset] + test_offset + pred_len
-    calendar: NYSE              # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
-    initial_cash: 20000         # portfolio initial cash                    (portfolio)
+    freq: 1B                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
+    backtest_start: 2021-07-01   # First bar the strategy trades.
+    backtest_end:   2023-07-01   # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= backtest_start + train_offset [+ valid_offset] + test_offset + pred_len
+    calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
+    initial_cash: 20000          # portfolio initial cash                    (portfolio)
     currency: USD
+
+    # Paths
     data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
     logs_dir: "logs/strategies/"
 
-    holdout: 1B              # holdout period in days. NOTE: ensure pred_len < holdout
-    allocation:
-      gross_leverage: 2.0   # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
-      net_exposure:   0.0   # Σwᵢ ≈ 0 (market-neutral)
+    # Engine settings
+    engine:
+      cache:
+        bar_capacity: 4096       # ≥ L + pred_len + some safety margin
 
 
+    # Hyperparameter tuning settings
+    tune_hparams: true
+    n_trials: 10
 
+    # Data and training windows
+    # holdout: 1B              # holdout period in days. NOTE: ensure pred_len < holdout
+    # allocation:
+    #   gross_leverage: 2.0    # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
+    #   net_exposure:   0.0    # Σwᵢ ≈ 0 (market-neutral)
+
+    # Trading friction costs
+    costs:
+      fee_bps:    0.5          # One-way commission in basis-points of notional    (Tcost literature)
+      prob_slippage: 0.2       # Simulates the probability of experiencing price slippage when executing market orders. When triggered, moves fill price one tick against your order direction
+      prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
+
+    # Order execution algorithm
+    execution:
+      timing_force: "DAY"      #  Specifies how long the order will remain open or active before any remaining quantity is canceled.
+      twap:                    # Split parent order into 4 TWAP child orders, each after 2.5 seconds 
+        horizon_secs: 10.0
+        interval_secs: 2.5
+
+    # Liquidity constraints   
+    liquidity:
+      adv_lookback: 30     # Look-back window to compute Average Daily Volume (ADV)
+      max_adv_pct:  0.05   # Max trade size = 5 % ADV 
+
+
+  # Hyperparameters to optimize
   HPARAMS:
-    #  Training windows 
-    train_offset:   6M          # Length in Datetime of training set (6 months-end)
-    valid_offset:   30D         # Validation set (early stopping / Optuna) if enabled
-    freq: 1D                    # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
-    retrain_offset:   30B        # Retrain every (30 * freq) bars
+    #  Training window 
+    train_offset:             # Length in Datetime of training set (6 months-end)
+      default: "6BME"         # BME = business months end.
+      optuna:
+        optuna_type: "categorical"
+        choices: ["3BME", "6BME", "12BME"]
 
-strategy:
+    # Validation set (early stopping / Optuna) if enabled
+    valid_offset:            
+      default: "30B"                    # B = business day
+      optuna:
+        optuna_type: "categorical"
+        choices: ["14B", "30B", "60B"]
 
+    retrain_offset:
+      default: "30B"                    # B = business day
+      optuna:
+        optuna_type: "categorical"
+        choices: ["14B", "30B", "60B"]
 
-  selection:
-    top_k: 30            # sell the worst 30 and buy the best the 30 stocks 
+    # Portfolio selection
+    selection_top_k:
+      default: 30
+      optuna:
+        optuna_type: int_low-high
+        low: 10
+        high: 50
+    
+    # Optimizer settings
+    optimizer_name:
+      default: "max_sharpe"          # maximize sharpe ratio
+      optuna:
+        optuna_type: categorical
+        choices: ["max_sharpe"] # , "min_variance", "equal_weight"
+    
+    optimizer_lookback_days:
+      default: "60B"
+      optuna:
+        optuna_type: categorical
+        choices: ["30B", "60B", "90B", "120B"]
+    
+    # Risk management overlays
+    risk_trailing_stop_pct:           # % trailing stop from HWM/LWM 5%
+      default: 0.05
+      optuna:
+        optuna_type: low-high
+        low: 0.02
+        high: 0.10
+    
+    risk_target_vol_annual:           # Volatility target (Hull, risk parity) 15 %
+      default: 0.15
+      optuna:
+        optuna_type: low-high
+        low: 0.10
+        high: 0.25
+    
+    risk_drawdown_pct:                # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
+      default: 0.15
+      optuna:
+        optuna_type: low-high
+        low: 0.10
+        high: 0.25
+    
+    risk_max_weight_abs:              # Max 3 % NAV per single position        (concentration limit)
+      default: 0.03
+      optuna:
+        optuna_type: low-high
+        low: 0.02
+        high: 0.05
+    
+    risk_max_weight_rel:              # Max 20 % of gross exposure in one name
+      default: 0.20
+      optuna:
+        optuna_type: low-high
+        low: 0.15
+        high: 0.30
 
-  optimizer:
-    name: max_sharpe               # maximize sharpe ratio
-    lookback_days: 60              # history window to build the Σ matrix
-  #  allow_short:  true             # set false if you ever run long-only
-
-  # ---------------------------------------------------------------------------
-  #  Dataset n_bars loader
-  # ---------------------------------------------------------------------------
-  engine:
-    cache:
-      bar_capacity: 4096   # ≥ L + pred_len + some safety margin
-
-
-  # ---------------------------------------------------------------------------
-  #  Trading frictions
-  # ---------------------------------------------------------------------------
-  costs:
-    fee_bps:    0.5          # One-way commission in basis-points of notional    (Tcost literature)
-    prob_slippage: 0.2       # Simulates the probability of experiencing price slippage when executing market orders. When triggered, moves fill price one tick against your order direction
-    prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
-
-  # ---------------------------------------------------------------------------
-  #  Liquidity constraints
-  # ---------------------------------------------------------------------------
-  liquidity:
-    adv_lookback: 30     # Look-back window to compute Average Daily Volume (ADV)
-    max_adv_pct:  0.05   # Max trade size = 5 % ADV 
-
-  # ---------------------------------------------------------------------------
-  #  Order Execution parameters
-  # ---------------------------------------------------------------------------
-  execution:
-    timing_force: DAY    #  Specifies how long the order will remain open or active before any remaining quantity is canceled.
-    twap:
-      horizon_secs: 10.0
-      interval_secs: 2.5
-      # Split parent order into 4 TWAP child orders, each after 2.5 seconds        
-
-  # ---------------------------------------------------------------------------
-  #  Risk management overlays
-  # ---------------------------------------------------------------------------
-  risk:
-    trailing_stop_pct: 0.05      # 5 % trailing stop from HWM/LWM         
-    target_vol_annual: 0.15      # Volatility target (Hull, risk parity) 15 %
-    drawdown_pct:      0.15      # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
-    max_weight_abs:    0.03      # Max 3 % NAV per single position        (concentration limit)
-    max_weight_rel:    0.20      # Max 20 % of gross exposure in one name
-#    beta_neutral:                # Optional index-beta hedge 
-#      enabled: false
-#      benchmark: SPY            # Proxy for market factor (S&P 500 ETF)
-#      lookback_days: 60         # Regression window for beta estimation
-#      beta_tol: 0.02            # Allow residual β in ±0.02 band
+    # Allocation constraints
+    allocation_gross_leverage:        # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
+      default: 2.0
+      optuna:
+        optuna_type: low-high
+        low: 1.0
+        high: 3.0
+    
+    allocation_net_exposure:          # Σwᵢ ≈ 0 (market-neutral)
+      default: 0.0
+      optuna:
+        optuna_type: low-high
+        low: -0.2
+        high: 0.2

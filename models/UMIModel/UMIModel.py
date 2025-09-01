@@ -61,7 +61,6 @@ class UMIModel(nn.Module):
         warm_start : bool= False,
         warm_training_epochs: int = 5,
         save_backups: bool = False,         # Flag for saving backups during walk-forward
-        data_dir: Path = Path("data/stocks"),
         model_dir: Path = Path("logs/UMIModel"),
         logger: Optional[Any] = None,
         calendar: str = 'NYSE',
@@ -97,7 +96,6 @@ class UMIModel(nn.Module):
         self.n_epochs       = n_epochs                                                             # number of epochs for training
         self.pretrain_epochs = pretrain_epochs                                                     # epochs for Stage-1 pre-training (hybrid mode)
         self.training_mode = training_mode                                                         # "hybrid" or "sequential"
-        self.data_dir       = data_dir                                                             # directory where the data is stored      
          
         hp_id =   f"lamic{hparams.get('lambda_ic',0):.3f}_"\
                 + f"lamsync{hparams.get('lambda_sync',0):.3f}_"\
