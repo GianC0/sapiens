@@ -1,77 +1,162 @@
+"""
+Backtest Hyperparameter Tuner
+==============================
+
+Orchestrates two-phase hyperparameter optimization:
+1. Model hyperparameters (using model.initialize())  
+2. Strategy hyperparameters (using full backtest)
+
+Each phase gets its own Optuna study and MLflow experiment.
+"""
+
 from __future__ import annotations
+from math import exp
 from pathlib import Path
-from typing   import Callable, Dict, Any
+from typing import Callable, Dict, Any, Optional, Tuple
+from unittest import loader
 import optuna
 from optuna.storages import RDBStorage
 import pandas as pd
 import torch.nn as nn
-from typing import Dict, List, Optional
-from pathlib import Path
 import mlflow
 from mlflow import MlflowClient
+import yaml
+from datetime import datetime
+import importlib
+import logging
+logger = logging.getLogger(__name__)
+import pandas_market_calendars as market_calendars
+
+from nautilus_trader.backtest.engine import BacktestEngine
+
+
+from algos.strategy import LongShortStrategy
+from algos.engine.data_loader import CsvBarLoader
+from models.utils import freq2pdoffset
 
 
 class OptunaHparamsTuner:
     """
-    Generic Optuna wrapper.
+    Two-phase hyperparameter tuner for model + strategy optimization.
+    
+    Phase 1: Optimize model hyperparameters using model.initialize()
+    Phase 2: Optimize strategy hyperparameters using best model from Phase 1
     """
-
+    
     def __init__(
         self,
-        *,
-        model_name: str,
-        ModelClass: nn.Module,                   # class  – NOT an instance
-        start: pd.Timestamp,                     # train start
-        end: pd.Timestamp,                       # validation end
-        logs_dir: str | Path = "logs",           # logs root directory 
-        data: Dict[str, Any],                    # {ticker: DataFrame, ...}
-        model_params: Dict[str, Any],
-        defaults: Dict[str, Any],                # default hp values
-        search_space: Optional[Dict[str, Dict]], # parsed from YAML
-        n_trials: int,
-        log: Any,                                # logger
-        direction: str = "minimize",
-        sampler: optuna.samplers.TPESampler | None = None,
+        cfg: Dict[str, Any],
+        run_timestamp: pd.Timestamp,
+        run_dir: Path = Path("logs/backtests/"),
+        seed: int = 2025,
     ):
-        self.ModelClass   = ModelClass
-        self.data  = data
-        self.search_space = search_space
-        self.model_params  = model_params
-        self.defaults    = defaults
-        self.n_trials    = n_trials
-        self.log = log
+        """
+        Initialize the backtest hyperparameter tuner.
+        
+        Args:
+            cfg: Configuration dictionary
+            model_train_data: Train data for hp optimization of model
+            strategy_train_data: Train data for hp optimization of strategy
+            logs_dir: Root directory for logs
+            n_model_trials: Override for model HP trials (None = use config)
+            n_strategy_trials: Override for strategy HP trials (None = use config)
+            seed: Seed for reproducibility of hp tuning runs
+        """
+        # Load configuration
+        self.config = cfg
 
-        # directories storing models and hp tuning data
-        start_str = start.strftime('%Y-%m-%d_%X')
-        end_str = end.strftime('%Y-%m-%d_%X')
-        base_dir   = Path(logs_dir).expanduser().resolve() / "optuna" / f"{start_str}_{end_str}"/ model_name
-        self.model_params["model_dir"] = base_dir
+        # Log Path
+        self.run_timestamp = run_timestamp.strftime("%Y.%m.%d_%H%M%S")
+        self.run_dir = run_dir / self.run_timestamp
+        
+        
+        # Parse configuration sections
+        self.model_config = self.config.get('MODEL', {})
+        self.strategy_config = self.config.get('STRATEGY', {})
+        
+        # Extract params and hparams for each component
+        self.model_params = self.model_config.get('PARAMS', {})
+        self.model_hparams = self.model_config.get('HPARAMS', {})
+        self.strategy_params = self.strategy_config.get('PARAMS', {})
+        self.strategy_hparams = self.strategy_config.get('HPARAMS', {})
+        
+        # Sync shared params
+        self.model_params["freq"] = self.strategy_params["freq"]
+        self.model_params["calendar"] = self.strategy_params["calendar"]
 
-        study_name = model_name.lower()
-        db_path = base_dir / f"{model_name}_hpo.db"                              # trials database
-        self.hp_log    = base_dir / "hp_trials.csv"                              # logs/optuna/models/<model>/hp_trials.csv
-        storage = RDBStorage(f"sqlite:///{db_path}")
+        # Split hparams into defaults and search spaces
+        self.model_defaults, self.model_search = self._split_hparam_cfg(self.model_hparams)
+        self.strategy_defaults, self.strategy_search = self._split_hparam_cfg(self.strategy_hparams)
+        self.seed = seed
 
-        self.study = optuna.create_study(
-            study_name     = study_name,
-            storage        = storage,
-            direction      = direction,
-            sampler        = sampler,
-            load_if_exists = True,
+        # --- Data Loader and Data Augmentation setup -------------------------------------------
+        # TODO: proper data augmentation
+        cols = []
+        if self.model_params["features_to_load"] == "candles":
+            cols = ['Open', 'High', 'Low', 'Adj Close', 'Volume']
+        loader_cfg = {k: v for k, v in self.strategy_params.items() if k in ["freq", "calendar", "data_dir", "currency"]}
+        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name="SIM", columns_to_load=cols)
+        
+
+        # Setup MLflow
+        self._setup_mlflow()
+        
+        # Optimization Best Parameters 
+        self.best_model_params = None
+        self.best_model_path = None
+        self.best_strategy_hparams = None
+        self.results = {}
+
+        # TODO: ensure that when no optim is run, then this still works
+    
+    def _setup_mlflow(self):
+        """Setup MLflow tracking with hierarchical experiments."""
+        mlflow.set_tracking_uri("file:logs/mlruns")
+        
+        # Create parent experiment for this optimization run
+        model_name = self.model_params.get('model_name', 'Unknown')
+        strategy_name = self.strategy_params.get('strategy_name', 'Unknown')
+        exp_name = f"Backtest_{model_name}_{strategy_name}"
+        mlflow.set_experiment(exp_name)
+        
+        # Start parent run
+        self.parent_run = mlflow.start_run(
+            run_name=f"{self.run_timestamp}",
+            nested=False
         )
-
-    # ------------------------------------------------------------------ #
-    # private helpers
-    # ------------------------------------------------------------------ #
-    def _suggest(self, trial: optuna.Trial) -> Dict[str, Any]:
-        """Translate YAML search-space into Optuna API calls."""
+        
+        # Log configuration
+        mlflow.log_params({
+            "model_params": self.model_params,
+            "strategy_params": self.strategy_params,
+        })
+    
+    def _split_hparam_cfg(self, hp_cfg: dict) -> Tuple[dict, dict]:
+        """
+        Split hyperparameter config into defaults and search space.
+        
+        Returns:
+            defaults: Dict of default values
+            search_space: Dict of Optuna search configurations
+        """
+        defaults, search = {}, {}
+        for k, v in hp_cfg.items():
+            if isinstance(v, dict) and "default" in v:
+                defaults[k] = v["default"]
+                if "optuna" in v:
+                    search[k] = v["optuna"]
+            else:
+                # Scalar value = fixed default
+                defaults[k] = v
+        return defaults, search
+    
+    def _suggest_params(self, trial: optuna.Trial, defaults: dict, search_space: dict) -> dict:
+        """Convert search space definition to Optuna suggestions."""
         params = {}
         
-        # Process all parameters
-        for name, default_value in self.defaults.items():
-            if self.search_space and name in self.search_space:
-                # Use Optuna to suggest value
-                cfg = self.search_space[name]
+        for name, default_value in defaults.items():
+            if search_space and name in search_space:
+                cfg = search_space[name]
                 opt_t = cfg["optuna_type"]
                 
                 if opt_t == "low-high":
@@ -85,75 +170,385 @@ class OptunaHparamsTuner:
                 else:
                     raise ValueError(f"Unknown optuna_type '{opt_t}' for parameter '{name}'")
             else:
-                # Use default value - Python preserves the type from YAML parsing
+                # Use default value as categorical (fixed)
                 params[name] = trial.suggest_categorical(name, [default_value])
         
         return params
-
-    def _objective(self, trial: optuna.Trial) -> float:
-        trial_hparams = self._suggest(trial)
-
-        # Start MLflow run for this trial
-        with mlflow.start_run(nested=True, run_name=f"trial_{trial.number}") as trial_run:
-            # Log trial hyperparameters
-            mlflow.log_params(trial_hparams)
-            mlflow.log_param("trial_number", trial.number)
-
-            model = self.ModelClass(**self.model_params, **trial_hparams)
-            score = model.initialize(self.data)
-
-            # Log trial results
-            mlflow.log_metric("trial_loss", score)
-
-            # keep a pointer to the weights folder
-            trial.set_user_attr("model_dir", str(model.model_dir))
-            trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
-
-            # ------------- append to hp_trials.csv -----------------------
-            rec = {"trial": trial.number, "loss": score, **trial_hparams}
-            pd.DataFrame([rec]).to_csv(
-                self.hp_log,
-                mode   ="a",
-                header = not self.hp_log.exists(),
-                index  = False,
-            )
-            self.log.info("New HPO trial: {rec}")
-
-        return float(score)
-
-    # ------------------------------------------------------------------ #
-    # public API
-    # ------------------------------------------------------------------ #
-    def optimize(self) -> dict:
+    
+    def optimize_model(self) -> Dict[str, Any]:
+        """
+        Phase 1: Optimize model hyperparameters.
         
-        # Setup MLflow for hyperparameter optimization
-        mlflow.set_tracking_uri("file:./mlruns")
-        mlflow.set_experiment(f"HPO_{self.ModelClass.__name__}")
-        self.mlflow_run = mlflow.start_run(run_name=f"HPO_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}")
+        Returns:
+            Dictionary with best hyperparameters and model directory
+        """
+        logger.info(f"\n{'='*60}")
+        logger.info("PHASE 1: MODEL HYPERPARAMETER OPTIMIZATION")
+        logger.info(f"{'='*60}\n")
+        
+        # Create MLflow experiment for model optimization
+        with mlflow.start_run(
+            run_name="Model_Optimization",
+            nested=True,
+            parent_run_id=self.parent_run.info.run_id
+        ) as model_opt_run:
+            
+            # Setup Optuna study for model
+            model_study_name = f"model_{self.model_params['model_name']}"
+            model_name = self.model_params['model_name']
+            model_db_path = self.run_dir / "model_hpo.db"
+            storage = RDBStorage(f"sqlite:///{model_db_path}")
+            
+            study = optuna.create_study(
+                study_name=model_study_name,
+                storage=storage,
+                direction='minimize',
+                sampler=optuna.samplers.TPESampler(seed=self.seed),
+                load_if_exists=True,
+            )
 
-        self.study.optimize(self._objective, n_trials=self.n_trials)
-        best   = self.study.best_trial
-        self.log.info(f"Best hparams: {best.params} \nBest model path: {best.user_attrs["model_dir"]}")
+            # Initialize Model Class
+            mod = importlib.import_module(f"models.{model_name}.{model_name}")
+            ModelClass = getattr(mod, model_name, None) or getattr(mod, "Model")
+            if ModelClass is None:
+                raise ImportError(f"Could not find model class in models.{model_name}")
+
+            
+            # Define objective function for model
+            def model_objective(trial: optuna.Trial) -> float:
+                trial_hparams = self._suggest_params(trial, self.model_defaults, self.model_search)
+                
+                # setting train_offset and model_dir to model flatten config dictionary
+                # adding train_offset here to avoid type overwite later  (pandas.offset -> str)
+                train_offset = trial_hparams.get("train_offset")
+                model_dir = self.run_dir / "model" /  f"trial_{trial.number}"
+                model_params_flat  = self._add_dates(self.model_params, train_offset ) # merged dictionary
+                model_params_flat["model_dir"] = model_dir
+
+                # init data timestamps for data loader
+                # Initialize calendar. NOTE: calendar and freq already added un OptunaHparamTuner __init__
+                
+                start = model_params_flat["train_start"]
+                end = model_params_flat["valid_end"]
+                data_dict = self._get_data(start=start, end=end)
+
+                # Start MLflow run for this trial
+                with mlflow.start_run(
+                    run_name=f"{model_name}_trial_{trial.number}",
+                    nested=True,
+                    parent_run_id=model_opt_run.info.run_id
+                ) as trial_run:
+                    # Log trial parameters
+                    mlflow.log_params(trial_hparams)
+                    mlflow.log_param("train_offset", train_offset)
+                    mlflow.log_param("trial_number", trial.number)
+                    
+                    # storing the model yaml config for reproducibility
+                    with open(model_dir / 'config.yaml', 'w', encoding="utf-8") as f:
+                        yaml.dump(model_params_flat, f, sort_keys=False)
+                    mlflow.log_artifact(str(model_dir / 'config.yaml'))
+                    
+                    
+                    # Initialize and train model TODO: ensure train data has validation set as well
+                    # leave this order to make train_offset be overwritten by flat params type
+                    model = ModelClass(**trial_hparams, **model_params_flat)
+                    # Validation is run automatically if valid_end is set
+                    score = model.initialize(data_dict)
+                    
+                    # Log results
+                    epochs_metrics = model._epoch_logs
+                    for m in epochs_metrics:
+                        epoch = m.pop("epoch")
+                        mlflow.log_metrics(m, step=epoch)
+                    mlflow.log_metric("best_validation_loss", score)
+                    mlflow.pytorch.log_model( model , str(model_dir / "init.pt"))
+                    
+                    # Store model directory in trial
+                    trial.set_user_attr("model_path", str(model_dir / "init.pt"))
+                    trial.set_user_attr("best_model_params_flat", trial_hparams | model_params_flat )
+                    trial.set_system_attr("best_model_hparams", trial_hparams)
+                    trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
+                    
+                    logger.info(f"  Trial {trial.number}: loss = {score:.6f}")
+                    
+                return score
+            
+            # Run optimization
+            # TODO: define case when no hp tuning is needed
+            logger.info(f"Running {self.model_params["n_trials"]} model trials...")
+
+            # Handle case without optimization
+            n_trials = self.model_params["n_trials"]
+            if self.model_params["tune_hparams"] is False or n_trials < 1:
+                n_trials = 1
+            study.optimize(model_objective, n_trials=n_trials)
+            
+            # Get best trial
+            best_trial = study.best_trial
+            self.best_model_params = best_trial.user_attrs["best_model_params_flat"]
+            self.best_model_path = Path(best_trial.user_attrs["model_path"])
+            
+            # Log best results
+            mlflow.log_param("best_hparams", best_trial.user_attrs["best_model_hparams"] )
+            
+            if best_trial is None:
+                raise Exception("Could not compute hp optimization of model")
+            
+            mlflow.log_metric("best_model_loss", best_trial.value)
+            
+            logger.info(f"\nBest model trial: {best_trial.number}")
+            logger.info(f"Best model loss: {best_trial.value:.6f}")
+            logger.info(f"Best model hparams: {best_trial.user_attrs["best_model_hparams"]}")
+        
         return {
-            "hparams"    : best.params,
-            "model_dir" : Path(best.user_attrs["model_dir"]),   # ← contains init.pt
+            "hparams": self.best_model_params,
+            "model_path": self.best_model_path,
         }
+    
+    # TODO: review and finish
+    def optimize_strategy(self) -> Dict[str, Any]:
+        """
+        Phase 2: Optimize strategy hyperparameters using best model.
+        
+        Returns:
+            Dictionary with best strategy hyperparameters and performance metrics
+        """
+        logger.info(f"\n{'='*60}")
+        logger.info("PHASE 2: STRATEGY HYPERPARAMETER OPTIMIZATION")
+        logger.info(f"{'='*60}\n")
+        
+        if self.best_model_params is None or self.best_model_path is None:
+            raise ValueError("Must run optimize_model() before optimize_strategy()")
+        
+        # Create MLflow experiment for strategy optimization
+        with mlflow.start_run(
+            run_name="Strategy_Optimization",
+            nested=True,
+            parent_run_id=self.parent_run.info.run_id
+        ):
+            
+            # Setup Optuna study for strategy
+            strategy_study_name = f"strategy_{self.strategy_params['strategy_name']}"
+            strategy_db_path = self.run_dir / "strategy_hpo.db"
+            storage = RDBStorage(f"sqlite:///{strategy_db_path}")
+            
+            study = optuna.create_study(
+                study_name=strategy_study_name,
+                storage=storage,
+                direction="maximize",  # Maximize strategy performance (e.g., Portfolio return)
+                sampler=optuna.samplers.TPESampler(seed=self.seed),
+                load_if_exists=True,
+            )
+            
+            # Define objective function for strategy
+            def strategy_objective(trial: optuna.Trial) -> float:
+                trial_hparams = self._suggest_params(trial, self.strategy_defaults, self.strategy_search)
+                
+                # Start MLflow run for this trial
+                with mlflow.start_run(
+                    run_name=f"strategy_trial_{trial.number}",
+                    nested=True
+                ):
+                    # Log trial parameters
+                    mlflow.log_params(trial_hparams)
+                    mlflow.log_param("trial_number", trial.number)
+                    mlflow.log_param("phase", "strategy_optimization")
+                    mlflow.log_param("model_dir", str(self.best_model_path))
+                    
+                    # Run backtest with these strategy parameters
+                    metrics = self._run_backtest(
+                        model_dir=self.best_model_path,
+                        model_hparams=self.best_model_params,
+                        strategy_hparams=trial_hparams,
+                        trial_number=trial.number
+                    )
+                    
+                    # Log all metrics
+                    for metric_name, metric_value in metrics.items():
+                        mlflow.log_metric(metric_name, metric_value)
+                    
+                    # Use Sharpe ratio as objective (or another metric)
+                    score = metrics.get('sharpe_ratio', 0.0)
+                    
+                    logger.info(f"  Trial {trial.number}: Sharpe = {score:.4f}")
+                    
+                return score
+            
+            # Run optimization
+            logger.info(f"Running {self.n_strategy_trials} strategy trials...")
+            study.optimize(strategy_objective, n_trials=self.n_strategy_trials)
+            
+            # Get best trial
+            best_trial = study.best_trial
+            self.best_strategy_hparams = best_trial.params
+            
+            # Log best results
+            mlflow.log_params({
+                f"best_strategy_{k}": v for k, v in self.best_strategy_hparams.items()
+            })
+            mlflow.log_metric("best_strategy_sharpe", best_trial.value)
+            
+            logger.info(f"\nBest strategy trial: {best_trial.number}")
+            logger.info(f"Best strategy Sharpe: {best_trial.value:.4f}")
+            logger.info(f"Best strategy hparams: {self.best_strategy_hparams}")
+            
+            # Save strategy optimization results
+            strategy_results = {
+                "best_trial": best_trial.number,
+                "best_sharpe": best_trial.value,
+                "best_hparams": self.best_strategy_hparams,
+                "all_trials": [
+                    {
+                        "number": t.number,
+                        "value": t.value,
+                        "params": t.params,
+                        "state": str(t.state),
+                    }
+                    for t in study.trials
+                ]
+            }
+            
+            results_path = self.run_dir / "strategy_optimization_results.yaml"
+            with open(results_path, 'w') as f:
+                yaml.dump(strategy_results, f)
+            mlflow.log_artifact(str(results_path))
+        
+        return {
+            "hparams": self.best_strategy_hparams,
+            "sharpe_ratio": best_trial.value
+        }
+    
+    # TODO: review and finish
+    def _run_backtest(
+        self,
+        model_dir: Path,
+        model_hparams: dict,
+        strategy_hparams: dict,
+        trial_number: int
+    ) -> Dict[str, float]:
+        """
+        Run a full backtest with given model and strategy hyperparameters.
+        
+        Returns:
+            Dictionary of performance metrics
+        """
+        # This is a simplified version - you'll need to adapt to your actual backtest engine
 
+        
+        # Create modified config with strategy hparams
+        config = self.config.copy()
+        config['MODEL']['HPARAMS'] = {k: v for k, v in model_hparams.items()}
+        config['STRATEGY']['HPARAMS'] = {k: v for k, v in strategy_hparams.items()}
+        config['MODEL']['PARAMS']['model_dir'] = str(model_dir)
+        config['MODEL']['PARAMS']['tune_hparams'] = False  # Skip tuning, use provided params
+        
+        # Run backtest (simplified - adapt to your setup)
+        # You'll need to implement the actual backtest execution here
+        # For now, returning dummy metrics
+        
+        # TODO: Implement actual backtest execution
+        # engine = BacktestEngine(...)
+        # strategy = LongShortStrategy(config=config)
+        # engine.run()
+        # metrics = engine.get_performance_metrics()
+        
+        # Dummy metrics for illustration
+        import random
+        metrics = {
+            'sharpe_ratio': random.uniform(0.5, 2.5),
+            'total_return': random.uniform(-0.1, 0.3),
+            'max_drawdown': random.uniform(-0.2, -0.05),
+            'win_rate': random.uniform(0.4, 0.6),
+        }
+        
+        return metrics
+    
+    def get_best_config(self) -> Dict:
+        """
+        Generate a config file with the best hyperparameters found.
+        
+        Returns:
+            Complete configuration with optimized hyperparameters
+        """
+        if not self.results:
+            raise ValueError("Must run optimization before getting best config")
+        
+        # Create optimized config
+        optimized_config = self.config.copy()
+        
+        # Update model hyperparameters
+        for param, value in self.best_model_params.items():
+            if param in optimized_config['MODEL']['HPARAMS']:
+                optimized_config['MODEL']['HPARAMS'][param] = {
+                    'default': value,
+                    # Remove optuna section since we have the best value
+                }
+        
+        # Update strategy hyperparameters
+        for param, value in self.best_strategy_hparams.items():
+            if param in optimized_config['STRATEGY']['HPARAMS']:
+                optimized_config['STRATEGY']['HPARAMS'][param] = {
+                    'default': value,
+                    # Remove optuna section since we have the best value
+                }
+        
+        # Disable hyperparameter tuning flags
+        optimized_config['MODEL']['PARAMS']['tune_hparams'] = False
+        optimized_config['STRATEGY']['PARAMS']['tune_hparams'] = False
+        
+        # Save optimized config
+        optimized_config_path = self.run_dir / "optimized_config.yaml"
+        with open(optimized_config_path, 'w') as f:
+            yaml.dump(optimized_config, f)
+        
+        logger.info(f"Optimized config saved to: {optimized_config_path}")
+        
+        return optimized_config
+    
+    def _add_dates(self, cfg, offset) -> Dict:
+        # TODO: to verify this is also working for strategy
+        # take some params from strategy
+        
+        # trial HPARAMS -> model PARAMS 
+        # Calculate proper date ranges
+        train_start = pd.Timestamp(self.strategy_params["train_start"], tz="UTC")
+        train_offset = freq2pdoffset(offset)
+        train_end = train_start + train_offset
+        valid_split = self.strategy_params["valid_split"]
+        valid_offset = (train_end - train_start) / (1 - valid_split) * valid_split
+        valid_start = train_end + pd.Timedelta("1ns")
+        valid_end = train_end + valid_offset
+        backtest_start = valid_end + pd.Timedelta("1ns")
+        backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC")
 
-# utility function to collect hparams and their default values from config.yaml
-def split_hparam_cfg(hp_cfg: dict):
-    """
-    Returns
-    -------
-    defaults      : {name: value}        (always passed to the model)
-    search_space  : {name: optuna_dict}  (only when tuning is on)
-    """
-    defaults, search = {}, {}
-    for k, v in hp_cfg.items():
-        if isinstance(v, dict) and "default" in v:        # new structure
-            defaults[k] = v["default"]
-            if "optuna" in v:
-                search[k] = v["optuna"]
-        else:                                             # old scalar style
-            defaults[k] = v
-    return defaults, search
+        # This should always be true even if validation is not run
+        assert backtest_end > backtest_start, f"Backtest start {backtest_start} must come before backtest end {backtest_end}"
+        
+        # Update config with correct data types
+        cfg["train_start"] = train_start
+        cfg["train_offset"] = train_offset
+        cfg["train_end"] = train_end
+        cfg["valid_start"] = valid_start
+        cfg["valid_end"] = valid_end
+        cfg["backtest_start"] = backtest_start
+        cfg["backtest_end"] = backtest_end
+
+        return cfg
+    
+    def _get_data(self, start, end) -> Dict[str, pd.DataFrame]:
+        # Create data dictionary for selected stocks
+        calendar = market_calendars.get_calendar(self.model_params["calendar"])
+        days_range = calendar.schedule(start_date=start, end_date=end)
+        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"]).normalize()
+
+        # init train+valid data
+        data = {}
+        for ticker in self.loader.universe:
+            if ticker in self.loader._frames:
+                df = self.loader._frames[ticker]
+                # Get data up to validation end for initial training
+                # TODO: this has to change in order to manage data from different timezones/market hours
+                df.index = df.index.normalize()
+                data[ticker] = df.reindex(timestamps).dropna()
+                #logger.info(f"  {ticker}: {len(data[ticker])} bars")
+        return data

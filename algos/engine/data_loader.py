@@ -123,18 +123,13 @@ class CsvBarLoader:
             venue=self.venue
         )
         
-        assert self.cfg["currency"] in ("USD","EUR")
-        if self.cfg["currency"] == "USD":
-            currency = USD
-        elif self.cfg["currency"] == "EUR":
-            currency = EUR
-
+        assert self.cfg["currency"] in (USD,EUR)
 
         # TODO: double check price precision.
         return Equity(
             instrument_id=instrument_id,
             raw_symbol=Symbol(symbol),
-            currency=currency,
+            currency=self.cfg["currency"],
             price_precision=2,  # Standard for US equities
             price_increment=Price.from_str("0.01"),
             lot_size=Quantity.from_int(1),
@@ -257,56 +252,3 @@ class CsvBarLoader:
         rf.set_index("Date", inplace=True)
         rf["DGS10"] = pd.to_numeric(rf["DGS10"], errors="coerce") / 100.0
         return rf["DGS10"].asfreq("B").ffill()
-    
-    # def build_universe_dataframe(
-    #     self,
-    #     universe: List[str],
-    #     end_time: pd.Timestamp,
-    #     train_offset: pd.DateOffset,
-    #     freq: str = "1D",
-    #     feature_dim: int = 5,
-    # ) -> (torch.Tensor, torch.Tensor, List[pd.Timestamp]):
-    #     """
-    #     Build aligned universe DataFrame as tensor.
-        
-    #     Returns:
-    #         panel: torch.Tensor of shape (T, I, F)
-    #         active_mask: torch.Tensor of shape (T, I) indicating active instruments
-    #         timestamps: List of timestamps for each T
-    #     """
-    #     I = len(universe)
-    #     F = feature_dim
-        
-    #     # Build time index
-    #     end_time = pd.Timestamp(end_time, tz='UTC')
-    #     start_time = end_time - train_offset
-    #     timestamps = pd.date_range(end=end_time, start=start_time, freq=freq, tz=self.tz)
-    #     T = len(timestamps)
-
-        
-    #     # Initialize tensors
-    #     panel = torch.zeros(T, I, F, dtype=torch.float32)
-    #     active_mask = torch.zeros(T, I, dtype=torch.bool)
-        
-    #     # Fill data for each instrument in universe order
-    #     for i, symbol in enumerate(universe):
-    #         if symbol not in self._frames:
-    #             continue
-                
-    #         df = self._frames[symbol]
-            
-    #         for t, ts in enumerate(timestamps):
-    #             # Find closest available data point (forward fill logic)
-    #             mask = df.index <= ts
-    #             if mask.any():
-    #                 # Get most recent data up to this timestamp
-    #                 idx = df.index[mask][-1]
-    #                 row = df.loc[idx]
-                    
-    #                 # Check if data is stale (more than 5 business days old)
-    #                 days_old = (ts - idx).days
-    #                 if days_old <= 7:  # Allow up to 1 week of staleness
-    #                     panel[t, i, :] = torch.tensor(row.values, dtype=torch.float32)
-    #                     active_mask[t, i] = True
-        
-    #     return panel, active_mask, timestamps.tolist()

@@ -20,12 +20,9 @@ from pandas.tseries.offsets import BaseOffset
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-import numpy as np
-import mlflow
-import mlflow.pytorch
-from mlflow.tracking import MlflowClient
 from pandas import DataFrame, Timestamp
 import pandas_market_calendars as market_calendars
+from logging import Logger
 
 
 from ..utils import SlidingWindowDataset, build_input_tensor, build_pred_tensor, freq2pdoffset
@@ -47,7 +44,6 @@ class UMIModel(nn.Module):
         window_len: int,
         pred_len: int,
         train_offset: BaseOffset,
-        pred_offset: BaseOffset,
         train_end: pd.Timestamp,
         valid_end: pd.Timestamp,
         n_epochs: int = 20,
@@ -57,15 +53,16 @@ class UMIModel(nn.Module):
         training_mode: str="sequential",    # hybrid/sequential:
                                             # hybrid -> stage1 factors for few epochs, then stage2 altogether
                                             # sequential -> stage1 first until early stopping, then stage2
-        close_idx: int = 3,  # usually "close" is at index 3
+        target_idx: int = 3,  # usually "close" is at index 3
         warm_start : bool= False,
         warm_training_epochs: int = 5,
         save_backups: bool = False,         # Flag for saving backups during walk-forward
         model_dir: Path = Path("logs/UMIModel"),
-        logger: Optional[Any] = None,
+        logger: Logger = Logger("INFO"),
         calendar: str = 'NYSE',
 
         **hparams,
+        #**kwargs,  TODO: to ensure that kwargs make the model init not fail if unused args are passed
     ):
 
         super().__init__()
@@ -79,7 +76,6 @@ class UMIModel(nn.Module):
         self.freq           = freq                                                                  # e.g. "1d", "15m", "1h"  
         self.pred_len    = pred_len                                                                 # number of bars to predict
         self.train_offset   = train_offset                                                          # time window for training
-        self.pred_offset    = pred_offset                                                           # time window for prediction
         self.train_end      = pd.Timestamp(train_end)                                               # end of training date
         self.valid_end      = pd.Timestamp(valid_end)                                               # end of validation date
         assert self.valid_end >= self.train_end, "Validation end date must be after training end date."
@@ -91,26 +87,20 @@ class UMIModel(nn.Module):
 
         # model parameters
         self.F              = feature_dim                                                          # number of features per stock
-        self.L              = window_len                                                           # length of the sliding window (L+1 bars)
+        self.L              = window_len                                                          # length of the sliding window (L+1 bars)
         self.I              = None                                                                 # number of stocks/instruments. here it is just initialized
         self.n_epochs       = n_epochs                                                             # number of epochs for training
         self.pretrain_epochs = pretrain_epochs                                                     # epochs for Stage-1 pre-training (hybrid mode)
         self.training_mode = training_mode                                                         # "hybrid" or "sequential"
-         
-        hp_id =   f"lamic{hparams.get('lambda_ic',0):.3f}_"\
-                + f"lamsync{hparams.get('lambda_sync',0):.3f}_"\
-                + f"lamrankic{hparams.get('lambda_rankic',0):.3f}"\
-                + f"syncthres{hparams.get('sync_thr',0):.3f}"
-        time = pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')
         
-        self.model_dir = (model_dir / freq / f"{time}_{hp_id}").resolve()                             # model directory with timestamp and hparams
+        self.model_dir =  model_dir                              # model directory with timestamp and hparams
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
         # stock universe
         self._universe: list[str] = []                                                               # list of ordered instruments the model is trained on
         #self.universe_mult = max(1, int(dynamic_universe_mult))                                     # over-allocation factor for dynamic universe
         
-        self.close_idx = close_idx                                                                  # usually "close" is at index 3 in the dataframes
+        self.target_idx = target_idx                                                                  # usually "close" is at index 3 in the dataframes
         
         # training parameters
         self._is_initialized = False
@@ -130,7 +120,7 @@ class UMIModel(nn.Module):
         """Check if model has been initialized."""
         return self._is_initialized
     
-    def initialize(self, data: Dict[str, DataFrame], **kwargs) -> float:
+    def initialize(self, data: Dict[str, DataFrame]) -> float:
         """
         Initial training on historical data.
          
@@ -170,13 +160,6 @@ class UMIModel(nn.Module):
         
         if self.logger:
             self.logger.info(f"[initialize] Complete. Best validation: {best_val:.6f}")
-
-        # setting up MLflow logging
-        self._setup_mlflow()
-        # Log final model to MLflow
-        mlflow.pytorch.log_model(self, "model")
-        mlflow.log_artifact(str(self.model_dir / "init.pt"))
-        mlflow.log_metric("best_validation_loss", best_val)
 
         return best_val
 
@@ -241,8 +224,9 @@ class UMIModel(nn.Module):
             self.logger.info(f"[update] Complete. Model up-to-date at: {current_time}")
         
         # Log update metrics
-        mlflow.log_metric("update_timestamp", current_time.timestamp())
-        mlflow.log_artifact(str(self.model_dir / "latest.pt"))       
+        # TODO: verify during strategy execution
+        # mlflow.log_metric("update_timestamp", current_time.timestamp())
+        # mlflow.log_artifact(str(self.model_dir / "latest.pt"))       
 
 
     def predict(self, data: Dict[str, DataFrame], current_time: pd.Timestamp, active_mask: torch.Tensor) -> Dict[str, float]:
@@ -274,7 +258,7 @@ class UMIModel(nn.Module):
         # assertion on the universe size
         assert torch.equal(data_mask, active_mask), "Active mask mismatch during prediction"
         
-        dataset = SlidingWindowDataset(data_tensor, self.L, self.pred_len, self.close_idx, with_target = False)
+        dataset = SlidingWindowDataset(data_tensor, self.L, self.pred_len, self.target_idx, with_target = False)
         assert len(dataset) == 1, f"Prediction dataset should contain exactly one window, found instead {len(dataset)}"
         
         # Get the last window for prediction
@@ -371,6 +355,7 @@ class UMIModel(nn.Module):
     
     # ---------------- sub-module builder ----------------------------- #
     def _build_submodules(self):
+        assert self.I is not None
         I = self.I
         if not hasattr(self, "_eye"):
             self._eye = torch.eye(I, dtype=torch.float32)
@@ -394,75 +379,6 @@ class UMIModel(nn.Module):
         
         return
 
-    # MLflow logging function
-    def _setup_mlflow(self):
-        """Setup MLflow tracking for this model instance."""
-        mlflow.set_tracking_uri("file:./mlruns")  # Local file store
-        mlflow.set_experiment(f"UMI_{self.freq}")
-        
-        # Start a new run if not already in one
-        if mlflow.active_run() is None:
-            mlflow.start_run(run_name=f"UMI_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}")
-        
-        # Log model configuration
-        mlflow.log_params({
-            "model_name": "UMIModel",
-            "freq": self.freq,
-            "feature_dim": self.F,
-            "window_len": self.L,
-            "pred_len": self.pred_len,
-            "batch_size": self.batch_size,
-            "n_epochs": self.n_epochs,
-            "training_mode": self.training_mode,
-            "train_end": str(self.train_end),
-            "valid_end": str(self.valid_end),
-        })
-        
-        # Log hyperparameters
-        for key, value in self.hp.items():
-            mlflow.log_param(f"hp_{key}", value)
-    # ---------------- metadata on memory size and params ------------- #
-    # def _dump_model_metadata(self):
-    #     """
-    #     Persists:
-    #     • param_inventory.csv   – per-tensor shape / #params / bytes
-    #     • run_meta.json         – run-time settings + totals
-    #     """
-        
-    #     records, total_p, total_b = [], 0, 0
-    #     sd = self.state_dict()
-    #     for blk, obj in sd.items():
-    #         if isinstance(obj, dict):           # sub-module dict
-    #             for n, t in obj.items():
-    #                 numel = t.numel(); bytes_ = numel * t.element_size()
-    #                 records.append(dict(tensor=f"{blk}.{n}",
-    #                                     shape=list(t.shape),
-    #                                     numel=numel, bytes=bytes_))
-    #                 total_p += numel; total_b += bytes_
-    #         else:                               # flat tensor
-    #             numel = torch.numel(obj); bytes_ = numel * obj.element_size()
-    #             records.append(dict(tensor=blk, shape=list(obj.shape),
-    #                                 numel=numel, bytes=bytes_))
-    #             total_p += numel; total_b += bytes_
-
-    #     pd.DataFrame(records).to_csv(self.model_dir / "param_inventory.csv",
-    #                                 index=False)
-
-    #     # some model params information
-    #     some = dict(
-    #         freq=self.freq, feature_dim=self.F, window_len=self.L,
-    #         pred_len=self.pred_len, train_end=str(self.train_end),
-    #         valid_end=str(self.valid_end), n_epochs=self.n_epochs,
-    #         #dynamic_universe_mult=self.universe_mult, 
-    #         total_params=total_p,
-    #         approx_size_mb=round(total_b / 1024 / 1024, 3),
-    #     )
-    #     # adding hparams
-    #     some.update(self.hp)
-
-    #     # storing all params infos
-    #     with open(self.model_dir / "all_params.json", "w") as fp:
-    #         json.dump(some, fp, indent=2)
 
     # ----------------------------------------------------------------- #
     # ---------------- training utilities ----------------------------- #
@@ -501,13 +417,13 @@ class UMIModel(nn.Module):
         else:
             assert torch.equal(train_mask, active_mask), "Active mask mismatch during training"
         # Build training dataset
-        train_dataset = SlidingWindowDataset(train_tensor, self.L, self.pred_len, target_idx=self.close_idx)
+        train_dataset = SlidingWindowDataset(train_tensor, self.L, self.pred_len, target_idx=self.target_idx)
         train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
         
         # Build validation dataset (if available)
         valid_loader = None
         if has_validation:
-            valid_dataset = SlidingWindowDataset(valid_tensor, self.L, self.pred_len, target_idx=self.close_idx)
+            valid_dataset = SlidingWindowDataset(valid_tensor, self.L, self.pred_len, target_idx=self.target_idx)
             valid_loader = DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=False)
         
         # ═══════════════════════════════════════════════════════════════════════════════
@@ -916,23 +832,14 @@ class UMIModel(nn.Module):
         
         metrics = {
             'epoch': epoch,
-            'loss_stock': loss_stock,
-            'loss_market': loss_market, 
-            'loss_pred': loss_pred,
-            'val_pred': validation_loss
+            'train_loss_stock': loss_stock,
+            'train_loss_market': loss_market, 
+            'train_loss_pred': loss_pred,
+            'total_loss': loss_stock + loss_market + loss_pred,
+            'valid_loss_pred': validation_loss
         }
         
         self._epoch_logs.append(metrics)
-        
-        # Log to MLflow
-        mlflow.log_metrics({
-            'train_loss_stock': loss_stock,
-            'train_loss_market': loss_market,
-            'train_loss_pred': loss_pred,
-            'val_loss': validation_loss if not pd.isna(validation_loss) else 0.0,
-            'total_loss': loss_stock + loss_market + loss_pred
-        }, step=epoch)
-
 
         # Save to CSV file
         log_file = self.model_dir / "train_losses.csv"
@@ -943,11 +850,12 @@ class UMIModel(nn.Module):
             index=False
         )
         self._global_epoch += 1
+    
     # ---------------- stage1 / stage2 wrappers ----------------------- #
     def _stage1_forward(self, prices_seq, feat_seq, active_mask):
         """Run stock-level & market-level factor learning *concurrently*."""
 
-        assert active_mask.ndim == 2 , f"active_mask must be of size ({B},{I}); got {list(active_mask.shape)}"
+        assert active_mask.ndim == 2 , f"active_mask should have 2 dims, got instead {list(active_mask.shape)}"
         # assert active_mask.shape == (self.batch_size, self.I)  NOT TRUE for last batch with batch_size smaller
         stockIDs = self._eye.to(prices_seq.device)
         if torch.cuda.is_available():
@@ -970,7 +878,7 @@ class UMIModel(nn.Module):
         return u_seq, r_t, m_t, loss_s, loss_m
 
     def _stage2_forward(self, feat_seq, u_seq, r_t, m_t, target, active_mask):
-        assert active_mask.ndim == 2 , f"active_mask must be of size ({B},{I}); got {list(active_mask.shape)}"
+        assert active_mask.ndim == 2 , f"active_mask should have 2 dims, got instead {list(active_mask.shape)}"
         # assert active_mask.shape == (self.batch_size, self.I) not correct since batch_size for last batch is smaller
         stockIDs = self._eye.to(feat_seq.device)
 

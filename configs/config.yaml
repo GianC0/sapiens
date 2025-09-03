@@ -9,17 +9,17 @@ MODEL:
     #  Model Paths
     logs_dir: "logs/models/"      # Where checkpoints / logs are stored       (general)
 
-    # Model architecture  
+    # Model architecture & Data Augmentation
     pred_len:   1                 # H : prediction horizon (next bar)         (one-step forecast)
-    dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+univers_mult (in this case ↑20%)       
+    dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+univers_mult (in this case +20%)       
     feature_dim: 5                # OHLCV + extra features for L1 market data. To be changed if higher level data is avail
-    feature_names: "candles"      # candles = OHLCV
+    features_to_load: "candles"   # candles = OHLCV
 
     # Training
     target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
     n_epochs:        20          # Epochs on train+valid after hp tuning and rolling initialization
     batch_size:      64          # Mini-batch size for AdamW                 
-    training_mode: "sequential"  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) → Stage-1 + Stage-2
+    training_mode: "sequential"  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) -> Stage-1 + Stage-2
     pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
     patience:        3           # Early-stop patience 
     warm_start:      true        # Enable warm-start                           (common in finance live rolls)
@@ -32,7 +32,16 @@ MODEL:
 
   # Default hyper-parameters defined by model are overwritten by this Optuna configuration
   HPARAMS:  # optuna_type: "categorical", low-high (assumed float), int_low-high, log_low-high
-    window_len:  # L : look-back window length   (sliding-window features)
+    
+    #  Training window.
+    train_offset:
+      default: "12BME"           # BME = business months end
+      optuna:
+        optuna_type: "categorical"
+        choices: ["3BME", "6BME", "12BME"]
+
+    # L : look-back window length
+    window_len:  
       default: 60
       optuna:
         optuna_type: "categorical"
@@ -112,10 +121,11 @@ STRATEGY:
   PARAMS:
     strategy_name: "LongShortStrategy"
 
-    #  Backtest
+    # Backtest
+    # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
     freq: 1B                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
-    backtest_start: 2021-07-01   # First bar the strategy trades.
-    backtest_end:   2023-07-01   # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= backtest_start + train_offset [+ valid_offset] + test_offset + pred_len
+    train_start:  2019-01-01     # Initial date where the
+    backtest_end: 2025-01-01     # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= train_start + train_offset [+ valid_offset] + pred_len
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     currency: USD
@@ -133,6 +143,7 @@ STRATEGY:
     # Hyperparameter tuning settings
     tune_hparams: true
     n_trials: 10
+    valid_split : 0.2    # meaning 80/20 train/valid split of full training dataset. NOTE: used also for model split
 
     # Data and training windows
     # holdout: 1B              # holdout period in days. NOTE: ensure pred_len < holdout
@@ -161,25 +172,12 @@ STRATEGY:
 
   # Hyperparameters to optimize
   HPARAMS:
-    #  Training window 
-    train_offset:             # Length in Datetime of training set (6 months-end)
-      default: "6BME"         # BME = business months end.
-      optuna:
-        optuna_type: "categorical"
-        choices: ["3BME", "6BME", "12BME"]
-
-    # Validation set (early stopping / Optuna) if enabled
-    valid_offset:            
-      default: "30B"                    # B = business day
-      optuna:
-        optuna_type: "categorical"
-        choices: ["14B", "30B", "60B"]
-
+    # Retrain fine-tuning
     retrain_offset:
       default: "30B"                    # B = business day
       optuna:
         optuna_type: "categorical"
-        choices: ["14B", "30B", "60B"]
+        choices: ["7B", "14B", "30B", "60B"]
 
     # Portfolio selection
     selection_top_k:

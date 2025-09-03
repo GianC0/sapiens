@@ -16,11 +16,16 @@ import importlib
 import math
 from datetime import datetime
 from pathlib import Path
+from pyexpat import model
 from typing import Dict, List, Optional
 from pandas.tseries.frequencies import to_offset
 import numpy as np
 import pandas as pd
 import yaml
+import logging
+import pandas_market_calendars as market_calendars
+logger = logging.getLogger(__name__)
+
 from nautilus_trader.common.component import init_logging
 from nautilus_trader.common.component import Logger
 from nautilus_trader.common.component import Clock
@@ -73,20 +78,19 @@ class LongShortStrategy(Strategy):
     def __init__(self, config: dict):  
         super().__init__()  
 
-        self.cfg = config
+        self.strategy_params = config["STRATEGY"]
+        self.model_params = config["MODEL"]
 
-        model_params = self.cfg["MODELS"]["PARAMS"]
+        self.calendar = market_calendars.get_calendar(config["STRATEGY"]["calendar"])
         
         # Core timing parameters
-        self.backtest_start = pd.Timestamp(self.cfg["backtest_start"], tz="UTC")
-        self.train_end = pd.Timestamp(self.cfg["train_end"], tz="UTC")
-        self.valid_end = pd.Timestamp(self.cfg["valid_end"], tz="UTC")
-        self.backtest_end = pd.Timestamp(self.cfg["backtest_end"], tz="UTC")
-        self.walkfwd_start = pd.Timestamp(self.cfg["walkfwd_start"], tz="UTC")
-        self.pred_offset = to_offset(self.cfg["pred_offset"])
-        self.retrain_offset = to_offset(self.cfg["training"]["retrain_offset"])
-        self.train_offset = to_offset(self.cfg["training"]["train_offset"])
-        self.pred_len = int(self.cfg["pred_len"])
+        self.backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC")
+        self.train_end = pd.Timestamp(self.strategy_params["train_end"], tz="UTC")
+        self.valid_end = pd.Timestamp(self.strategy_params["valid_end"], tz="UTC")
+        self.backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC")
+        self.retrain_offset = to_offset(self.strategy_params["retrain_offset"])
+        self.train_offset = to_offset(self.strategy_params["train_offset"])
+        self.pred_len = int(self.strategy_params["pred_len"])
 
 
         # Model and data parameters
@@ -100,10 +104,10 @@ class LongShortStrategy(Strategy):
         # Loader for data access
         # TODO: cols to load should be extended for features added by qlib/libraries. maybe it should include feat_dim
         cols_to_load = []
-        if model_params["feature_names"] == "candles":
+        if model_params["features_to_load"] == "candles":
             cols_to_load = ['Open', 'High', 'Low', 'Adj Close', 'Volume']
         else:
-            raise Exception(f"FEATURES {model_params["feature_names"]} NOT SUPPORTED")
+            raise Exception(f"FEATURES {model_params["features_to_load"]} NOT SUPPORTED")
         
         self.loader = CsvBarLoader(cfg=self.cfg, columns_to_load=cols_to_load)
 
@@ -167,7 +171,7 @@ class LongShortStrategy(Strategy):
     def on_fault(self) -> None:
         return
     def on_save(self) -> dict[str, bytes]:  # Returns user-defined dictionary of state to be saved
-        return
+        return {}
     def on_load(self, state: dict[str, bytes]) -> None:
         return
     
@@ -182,7 +186,7 @@ class LongShortStrategy(Strategy):
         self.log.info(f"Update timer fired at {now}")
         assert self.model.is_initialized()
 
-        data_dict = self._cache_to_dict(self.model.L + 1) # TODO: make it more generic for all models.
+        data_dict = self._cache_to_dict(window=(self.model.L + 1)) # TODO: make it more generic for all models.
 
         # TODO: superflous. consider removing compute active mask
         assert torch.equal(self.active_mask, self._compute_active_mask(data_dict) ) , "Active mask mismatch between strategy and data engine"
@@ -217,7 +221,7 @@ class LongShortStrategy(Strategy):
         self.log.info(f"Starting model retrain at {now}")
         
         # Get updated data window
-        data_dict = self._cache_to_dict(window=None)  # Get all available data
+        data_dict = self._cache_to_dict(window=0)  # Get all available data
         if not data_dict:
             return
         
@@ -337,13 +341,13 @@ class LongShortStrategy(Strategy):
             df = self.loader._frames[ticker]
             
             # Check 1: Has enough historical data before walk-forward start
-            train_data = df[df.index < self.walkfwd_start]
+            train_data = df[df.index <= self.valid_end]
             if len(train_data) < self.min_bars_required:
                 self.log.info(f"Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
                 continue
             
             # Check 2: Active at walk-forward start
-            pred_window = df[(df.index >= self.walkfwd_start) ]
+            pred_window = df[(df.index > self.valid_end) ]
             if len(pred_window) < self.pred_len :
                 self.log.info(f"Skipping {ticker}: not active at walk-forward start")
                 continue
@@ -369,7 +373,6 @@ class LongShortStrategy(Strategy):
             "window_len":self.cfg["window_len"],
             "pred_len":self.cfg["pred_len"],
             "train_offset":self.train_offset,
-            "pred_offset":self.pred_offset,
             "train_end":self.train_end,
             "valid_end":self.valid_end,
             "batch_size":self.cfg["training"]["batch_size"],
@@ -382,43 +385,31 @@ class LongShortStrategy(Strategy):
             "warm_training_epochs":self.cfg["training"]["warm_training_epochs"],
             "save_backups" : self.cfg["training"]["save_backups"],
             "data_dir":self.cfg["data_dir"],
-            "logger":self.log,  # Pass logger to model
             "calendar":self.cfg["calendar"]   #Equity market calendar
         }
 
+        train_data = {
+            ticker: self.loader._frames[ticker][(self.loader._frames[ticker].index <= self.valid_end) & (self.loader._frames[ticker].index >= self.backtest_start) ]
+            for ticker in self.universe
+        }
+
         
-        # HPs
-        defaults, search_space = split_hparam_cfg(self.cfg["hparams"])
-        best_hparams = {}
+        days_range = self.calendar.schedule(start_date=backtest_start, end_date=valid_end)
+        timestamps = market_calendars.date_range(days_range, frequency=cfg["freq"]).normalize()
+        for ticker in test_universe:
+            if ticker in loader._frames:
+                df = loader._frames[ticker]
+                # Get data up to validation end for initial training
+                df.index = df.index.normalize()
+                sample_data[ticker] = df.reindex(timestamps).dropna()
+                print(f"  {ticker}: {len(sample_data[ticker])} bars")
 
-        # Determine if we should run hyperparameter tuning 
-        if self.cfg["training"]["tune_hparams"]:
+        model = ModelClass(**self.model_params, **trial_hparams)
+        score = model.initialize(self.data)
 
-            # Setup and Prepare initial training data (only universe stocks)
-            self.log.info("[HPO] Optuna search ENABLED")
-            search_space = search_space
-            n_trials = self.cfg["training"]["n_trials"]
-            train_data = {
-                ticker: self.loader._frames[ticker][(self.loader._frames[ticker].index <= self.valid_end) & (self.loader._frames[ticker].index >= self.backtest_start) ]
-                for ticker in self.universe
-            }
 
-            # model_dir is sepcified by the tuner
-            tuner = OptunaHparamsTuner( 
-                model_name  = self.cfg["model_name"],
-                ModelClass   = ModelClass,
-                start = self.backtest_start,
-                end = self.valid_end,
-                logs_dir    = Path(self.cfg.get("logs_dir", "logs")),
-                data  = train_data,
-                model_params= model_params,
-                defaults    = defaults,           # default values of hparams
-                search_space= search_space,       # search sapce of hparams
-                n_trials    = n_trials,
-                log = self.log
-            )
             
-            best = tuner.optimize()
+            
 
             # Update defaults with best hyperparameters
             best_hparams = {**defaults, **best["hparams"]}
@@ -481,9 +472,11 @@ class LongShortStrategy(Strategy):
             bar_type = BarType(instrument_id=iid, bar_spec= self.bar_spec)
             
             # Get bars from cache
+            if window == 0: # load all cache
+                window = self.cfg["engine"]["cache"]["bar_capacity"]
             bars = self.cache.bars(bar_type)[:window]  # Get last 'window' bars (nautilus cache notation is opposite to pandas)
             if not bars or len(bars) < self.min_bars_required:
-                self.log.warning(f"Insufficient bars for {symbol}: {len(bars)} < {self.min_bars_required}")
+                self.log.warning(f"Insufficient bars for {iid.symbol}: {len(bars)} < {self.min_bars_required}")
                 continue
             
             # ensure there is at least one new bar after the last predition
