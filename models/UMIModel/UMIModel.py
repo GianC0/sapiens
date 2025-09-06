@@ -403,7 +403,7 @@ class UMIModel(nn.Module):
             raise ValueError(f"Validation end date: {self.valid_end} is earlier that end train end date {self.train_end}")
 
         # Create common timestamp index. This solves the start= -1 bar problem
-        start_date = self.valid_end - self.train_offset + freq2pdoffset(self.freq)
+        start_date = self.train_end - self.train_offset + freq2pdoffset(self.freq)
         days_range = self.market_calendar.schedule(start_date= start_date, end_date=self.valid_end)
         timestamps = market_calendars.date_range(days_range, frequency=self.freq).normalize()
         

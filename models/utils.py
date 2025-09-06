@@ -11,6 +11,7 @@ from nautilus_trader.cache.cache import Cache
 import torch
 from torch.utils.data import Dataset
 import re
+import json
 from pandas.tseries.frequencies import to_offset
 from nautilus_trader.model.data import BarSpecification, BarType, BarAggregation          
 from nautilus_trader.core.rust.model import PriceType       # Prince type =  BID / ASK / MID / LAST …
@@ -112,11 +113,12 @@ def freq2pdoffset(freq_str: str):
         "min": "min",          # minutes
         "h":   "h",            # hours
         # daily & above
-        "d":  "D",             # calendar days
+        "D":  "D",             # calendar days
         "B":  "B",             # business days
         "w":  "W",             # weeks (Mon-Sun anchored via suffix – see tips below)
         "M":  "ME",            # month-end
         "ME":  "ME",           # month-end
+        "BME": "BME",          # business month-end
         "MS": "MS",            # month-start
         "Q":  "Q",             # quarter-end
         "QS": "QS",            # quarter-start
@@ -130,7 +132,7 @@ def freq2pdoffset(freq_str: str):
         raise ValueError(f"Bad frequency syntax: {freq_str!r}")
 
     count, unit = m.groups()
-    unit = unit.lower() if unit not in ("B", "M", "MS","ME", "Q", "QS", "Y", "YS") else unit  # preserve case where required
+    #unit = unit.lower if unit not in ("B", "M", "MS","ME", "BME", "Q", "QS", "Y", "YS") else unit  # preserve case where required
 
     if unit not in _FREQ_MAP:
         raise ValueError(f"Unknown frequency unit {unit!r}")
@@ -230,7 +232,7 @@ def build_input_tensor(
     
     # Fill in data for each instrument
     for i, ticker in enumerate(universe):
-        assert data[ticker].shape == (T,F)  #not correct during last batch or when validation is specified.
+        assert data[ticker].shape == (T,F)  #not correct during last batch.
         # Copy values into pre-allocated array
         tensor_array[:, i, :] = torch.tensor(data[ticker].values, dtype=torch.float32, device=device)
     
@@ -330,3 +332,12 @@ def build_pred_tensor(
     # Instrument is active if it has ALL non-NaN value at last timestamp
     pred_mask = ~torch.all(torch.isnan(pred_tensor[-1, :, :]), dim=1)  # (I,)
     return pred_tensor, pred_mask
+
+def yaml_safe(obj):
+    """Return a plain Python structure safe for yaml.dump by JSON round-tripping.
+
+    Non-JSON-serializable objects are replaced with obj.freqstr when present,
+    otherwise with str(obj). This is small and readable but **lossy** for some types.
+    Useful for pandas.Timedelta attributes
+    """
+    return json.loads(json.dumps(obj, default=lambda o: getattr(o, "freqstr", str(o))))

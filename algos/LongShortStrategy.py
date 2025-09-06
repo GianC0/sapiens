@@ -26,12 +26,10 @@ import logging
 import pandas_market_calendars as market_calendars
 logger = logging.getLogger(__name__)
 
-from nautilus_trader.common.component import init_logging
-from nautilus_trader.common.component import Logger
-from nautilus_trader.common.component import Clock
+from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Logger
 from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.model.events import OrderFilled,TimeEvent
-from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose, Data
+from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose
 from nautilus_trader.model.orders import MarketOrder
 from nautilus_trader.model.enums import OrderSide
 import torch
@@ -39,15 +37,9 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.position import Position
 
 # ----- project imports -----------------------------------------------------
-from .models.interfaces import MarketModel
-from .engine.data_loader import CsvBarLoader, FeatureBarData
-from ..models.utils import freq2pdoffset, freq2barspec
-from .engine.hparam_tuner import split_hparam_cfg, OptunaHparamsTuner
-
-#  risk / execution helpers (same modules you used before)
-from .engine.execution import CommissionModelBps, SlippageModelBps
-from .engine.optimizer import MaxSharpeRatioOptimizer
-from .engine.analyzers import EquityCurveAnalyzer
+from models.interfaces import MarketModel
+from algos.engine.data_loader import CsvBarLoader, FeatureBarData
+from models.utils import freq2pdoffset, freq2barspec
 
 
 # ========================================================================== #
@@ -104,10 +96,10 @@ class LongShortStrategy(Strategy):
         # Loader for data access
         # TODO: cols to load should be extended for features added by qlib/libraries. maybe it should include feat_dim
         cols_to_load = []
-        if model_params["features_to_load"] == "candles":
+        if self.model_params["features_to_load"] == "candles":
             cols_to_load = ['Open', 'High', 'Low', 'Adj Close', 'Volume']
         else:
-            raise Exception(f"FEATURES {model_params["features_to_load"]} NOT SUPPORTED")
+            raise Exception(f"FEATURES {self.model_params["features_to_load"]} NOT SUPPORTED")
         
         self.loader = CsvBarLoader(cfg=self.cfg, columns_to_load=cols_to_load)
 
@@ -291,20 +283,23 @@ class LongShortStrategy(Strategy):
         #TODO: should account for insertion and delisting at the same time. insertion needs portfolio selection
         # verify if delisted or new:
         # update mask / trigger retrain + reset on_retrain timer
+        pass
     def on_instrument_status(self, data: InstrumentStatus) -> None:
+        pass
     def on_instrument_close(self, data: InstrumentClose) -> None:
         # update the model mask and ensure the loader still provides same input shape to the model for prediction
         # remove from cache ??
-    def on_historical_data(self, data: Data) -> None:
+        pass
+    def on_historical_data(self, data) -> None:
         """Process historical data for model training."""
         # Historical data is loaded at startup via loader
-        return
+        pass
 
 
     # Unused ATM
-    def on_data(self, data: Data) -> None:  # Custom data passed to this handler
+    def on_data(self, data) -> None:  # Custom data passed to this handler
         return
-    def on_signal(self, signal: Data) -> None:  # Custom signals passed to this handler
+    def on_signal(self, signal) -> None:  # Custom signals passed to this handler
         return
     
     # ================================================================= #
@@ -405,18 +400,8 @@ class LongShortStrategy(Strategy):
                 print(f"  {ticker}: {len(sample_data[ticker])} bars")
 
         model = ModelClass(**self.model_params, **trial_hparams)
-        score = model.initialize(self.data)
+        score = model.initialize(self.data)  
 
-
-            
-            
-
-            # Update defaults with best hyperparameters
-            best_hparams = {**defaults, **best["hparams"]}
-            self.log.info(f"Best hyperparameters found: {best_hparams}")
-        else:
-            self.log.info("[HPO] Hyperparameter tuning disabled, using defaults")
-            best_hparams = defaults
 
         # Initialize model with best hyperparameters. It will have new model directory and trained on train + valid set
         final_model_params = model_params
@@ -430,21 +415,6 @@ class LongShortStrategy(Strategy):
                 (self.loader._frames[ticker].index <= self.valid_end)
             ] for ticker in self.universe
         }
-
-        # model_dir is sepcified by the tuner
-        final_tuner = OptunaHparamsTuner( 
-            model_name  = self.cfg["model_name"],
-            ModelClass   = ModelClass,
-            start = self.backtest_start,
-            end = self.valid_end,
-            logs_dir    = Path(self.cfg.get("logs_dir", "logs")),
-            data  = final_train_data,
-            model_params= final_model_params,
-            defaults    = best_hparams,       # Use best hyperparameters
-            search_space= None,               # empty search space: use defaults and 1 trial only
-            n_trials    = 1,
-            log = self.log,
-        )
         
         _ , model_dir = final_tuner.optimize()
         
@@ -501,7 +471,7 @@ class LongShortStrategy(Strategy):
 
     # TODO: superflous. consider removing
     def _compute_active_mask(self, data_dict: Dict[str, pd.DataFrame]) -> torch.Tensor:
-    """Compute mask for active instruments."""
+        """Compute mask for active instruments."""
         mask = ~torch.ones(len(self.universe), dtype=torch.bool)
         
         for i, symbol in enumerate(self.universe):
@@ -510,7 +480,7 @@ class LongShortStrategy(Strategy):
             if len(df) > 0:
                 last_date = df.index[-1]
                 now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
-                if now < last_date
+                if now < last_date:
                     mask[i] = True
         
         return mask

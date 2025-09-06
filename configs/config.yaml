@@ -23,12 +23,12 @@ MODEL:
     pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
     patience:        3           # Early-stop patience 
     warm_start:      true        # Enable warm-start                           (common in finance live rolls)
-    warm_training_epochs: 5      # Light fine-tune epochs
+    warm_training_epochs: 10     # Light fine-tune epochs
     save_backups: false          # whether to save backups during walk-forward
 
     # Hyperparameter tuning settings
     tune_hparams:    true        # Use Optuna Bayesian search.            
-    n_trials:        20          # Optuna trials for each run. Used only if tune_hparams is true
+    n_trials:        4           # Optuna trials for each run. Used only if tune_hparams is true
 
   # Default hyper-parameters defined by model are overwritten by this Optuna configuration
   HPARAMS:  # optuna_type: "categorical", low-high (assumed float), int_low-high, log_low-high
@@ -38,14 +38,16 @@ MODEL:
       default: "12BME"           # BME = business months end
       optuna:
         optuna_type: "categorical"
-        choices: ["3BME", "6BME", "12BME"]
+        #choices: ["3BME", "6BME", "12BME"]
+        choices: ["1BME", "2BME", "3BME"]
 
     # L : look-back window length
     window_len:  
-      default: 60
+      default: 10
       optuna:
         optuna_type: "categorical"
-        choices: [7, 30, 60, 150, 365]
+        choices: [1,2,3]
+        #choices: [7, 30, 60, 150, 365]
 
     # λ_IC   : independence loss weight
     lambda_ic:        
@@ -123,9 +125,9 @@ STRATEGY:
 
     # Backtest
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
-    freq: 1B                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
+    freq: 1D                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
     train_start:  2019-01-01     # Initial date where the
-    backtest_end: 2025-01-01     # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= train_start + train_offset [+ valid_offset] + pred_len
+    backtest_end: 2020-01-01     # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= train_start + train_offset [+ valid_offset] + pred_len
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     currency: USD
