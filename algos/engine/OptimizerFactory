@@ -1,0 +1,116 @@
+
+import numpy as np
+from scipy.optimize import minimize
+import logging
+logger = logging.getLogger(__name__)
+    
+def create_optimizer(self, name: str):
+    """Factory for portfolio optimizers."""
+    optimizers = {
+        "max_sharpe": MaxSharpeOptimizer,
+        "min_variance": MinVarianceOptimizer,
+        "equal_weight": EqualWeightOptimizer,
+    }
+    
+    if name not in optimizers:
+        logger.warning(f"Unknown optimizer {name}, using equal_weight")
+        return EqualWeightOptimizer()
+    
+    return optimizers[name]()
+
+class PortfolioOptimizer:
+    """Base class for portfolio optimizers."""
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
+        raise NotImplementedError
+
+class MaxSharpeOptimizer(PortfolioOptimizer):
+    """
+    Tangency (analytic) maximum-Sharpe optimizer.
+    - Allows long and short positions (no bounds).
+    - Returns weights that sum to 1 (budget constraint).
+    - Uses small ridge regularization and pseudo-inverse for stability.
+    """
+
+    def __init__(self, reg: float = 1e-8, eps: float = 1e-12):
+        """
+        reg: relative ridge regularization factor (applied as reg * trace(cov)/n).
+        eps: numerical tolerance for degenerate cases.
+        
+        NOTE:
+            Increase reg (e.g., 1e-6) if:
+
+                Many assets (100+) with limited history
+                Crypto/penny stocks with extreme correlations
+                Getting unstable/extreme weights
+
+            Decrease eps (e.g., 1e-15) if:
+
+                Need higher numerical precision
+                Working with very small return values
+        """
+        self.reg = float(reg)
+        self.eps = float(eps)
+
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
+        mu = np.asarray(mu, dtype=float)
+        cov = np.asarray(cov, dtype=float)
+        if mu.ndim != 1:
+            raise ValueError("mu must be a 1-D array of expected returns")
+        n = mu.size
+        if cov.shape != (n, n):
+            raise ValueError("cov must be a square matrix with shape (n, n) where n = len(mu)")
+
+        # Excess returns
+        e = mu - float(rf)
+
+        # Regularize covariance: scale ridge by average variance (trace/n) so reg is scale-invariant
+        trace = np.trace(cov)
+        ridge = (self.reg * trace / n) if trace > 0 else self.reg
+        cov_reg = cov + ridge * np.eye(n)
+
+        # Use pseudo-inverse for robustness (handles singular / near-singular cov)
+        inv_cov = np.linalg.pinv(cov_reg)
+
+        # Tangency direction (not yet normalized):
+        w_dir = inv_cov @ e
+
+        # If direction is (near) zero -> degenerate; fallback to equal-weight
+        s = float(w_dir.sum())
+        if abs(s) < self.eps:
+            return np.ones(n) / n
+
+        # Normalize to satisfy budget sum(w) = 1
+        w = w_dir / s
+
+        # Small numerical cleanup: if volatility of portfolio is zero, fallback
+        port_var = float(w @ (cov @ w))
+        if port_var <= self.eps:
+            return np.ones(n) / n
+
+        return w
+
+class MinVarianceOptimizer(PortfolioOptimizer):
+    """Minimum variance portfolio optimizer."""
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
+        n = len(mu)
+        
+        # Objective: portfolio variance
+        def portfolio_variance(w):
+            return np.dot(w, np.dot(cov, w))
+        
+        constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}
+        bounds = [(-1, 1) for _ in range(n)]
+        w0 = np.ones(n) / n
+        
+        result = minimize(portfolio_variance, w0, method='SLSQP',
+                         bounds=bounds, constraints=constraints)
+        
+        return result.x if result.success else w0
+
+class EqualWeightOptimizer(PortfolioOptimizer):
+    """Simple equal weight optimizer."""
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
+        n = len(mu)
+        return np.ones(n) / n
+
+# TODO: Implement M^2 optimizer (Modigliani)

@@ -30,6 +30,7 @@ from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Log
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose
+from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.orders import MarketOrder
 from nautilus_trader.model.enums import OrderSide
 import torch
@@ -39,7 +40,9 @@ from nautilus_trader.model.position import Position
 # ----- project imports -----------------------------------------------------
 from models.interfaces import MarketModel
 from algos.engine.data_loader import CsvBarLoader, FeatureBarData
+from algos.engine.OptimizerFactory import create_optimizer
 from models.utils import freq2pdoffset, freq2barspec
+
 
 
 # ========================================================================== #
@@ -70,8 +73,11 @@ class LongShortStrategy(Strategy):
     def __init__(self, config: dict):  
         super().__init__()  
 
+        # these are already flattend
         self.strategy_params = config["STRATEGY"]
         self.model_params = config["MODEL"]
+
+        
 
         self.calendar = market_calendars.get_calendar(config["STRATEGY"]["calendar"])
         
@@ -82,15 +88,15 @@ class LongShortStrategy(Strategy):
         self.backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC")
         self.retrain_offset = to_offset(self.strategy_params["retrain_offset"])
         self.train_offset = to_offset(self.strategy_params["train_offset"])
-        self.pred_len = int(self.strategy_params["pred_len"])
+        self.pred_len = int(self.model_params["pred_len"])
 
 
         # Model and data parameters
         self.model: Optional[MarketModel] = None
-        self.model_name = self.cfg["model_name"]
+        self.model_name = self.model_params["model_name"]
         self.bar_type = None  # Set in on_start
-        self.bar_spec = freq2barspec(self.cfg["freq"])
-        self.min_bars_required = self.cfg["window_len"] + self.cfg["pred_len"]  # Safety margin
+        self.bar_spec = freq2barspec( self.strategy_params["freq"])
+        self.min_bars_required = self.model_params["window_len"] + self.model_params["pred_len"]  
         
         
         # Loader for data access
@@ -101,7 +107,8 @@ class LongShortStrategy(Strategy):
         else:
             raise Exception(f"FEATURES {self.model_params["features_to_load"]} NOT SUPPORTED")
         
-        self.loader = CsvBarLoader(cfg=self.cfg, columns_to_load=cols_to_load)
+        loader_cfg = {k: v for k, v in self.strategy_params.items() if k in ["freq", "calendar", "data_dir", "currency"]}
+        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name="SIM", columns_to_load=cols_to_load)
 
         # State tracking
         
@@ -115,7 +122,31 @@ class LongShortStrategy(Strategy):
         self._last_bar_time: Optional[pd.Timestamp] = None
         self._bars_since_prediction = 0
 
-        # TODO: consider sharpe ration on (pred_ret - risk-free) / 
+
+        # Initialize tracking variables
+        self.equity_peak_value = 0.0    # probably should be evaluated locally
+        self.realised_returns = []
+        self.trailing_stops = {}
+        self._prev_nav = None
+
+        # Extract risk parameters from config
+        self.selector_k = self.strategy_params.get("selection_top_k", 30)
+        self.max_w_abs = self.strategy_params.get("risk_max_weight_abs", 0.03)
+        self.max_w_rel = self.strategy_params.get("risk_max_weight_rel", 0.20)
+        self.target_vol = self.strategy_params.get("risk_target_vol_annual", 0.15)
+        self.trailing_stop_pct = self.strategy_params.get("risk_trailing_stop_pct", 0.05)
+        self.drawdown_pct = self.strategy_params.get("risk_drawdown_pct", 0.15)
+        self.adv_lookback = self.strategy_params.get("liquidity", {}).get("adv_lookback", 30)
+        self.max_adv_pct = self.strategy_params.get("liquidity", {}).get("max_adv_pct", 0.05)
+        self.twap_slices = self.strategy_params.get("execution", {}).get("twap", {}).get("slices", 4)
+
+        # Portfolio optimizer
+        optimizer_name = self.strategy_params.get("optimizer_name", "max_sharpe")
+        self.optimizer = create_optimizer(optimizer_name)
+
+        # TODO: consider sharpe ratio on (pred_ret - risk-free)  
+        # Risk-free rate series (will be loaded with data)
+        self.rf_rate = None
 
 
     # ================================================================= #
@@ -126,6 +157,13 @@ class LongShortStrategy(Strategy):
 
         # Select universe based on stocks active at walk-forward start with enough history
         self._select_universe()
+
+        # Load risk-free rate from loader
+        if self.loader.rf_series is not None:
+            self.rf_rate = self.loader.rf_series
+        else:
+            self.log.warning("No risk-free rate data available, using 0%")
+            self.rf_rate = pd.Series(0.0)
 
         # Subscribe to bars for selected universe
         for instrument in self.loader.instruments.values():
@@ -141,7 +179,7 @@ class LongShortStrategy(Strategy):
 
         self.clock.set_timer(
             name="update_timer",  
-            interval=freq2pdoffset(self.cfg["freq"]),  # Timer interval
+            interval=freq2pdoffset(self.strategy_params["freq"]),  # Timer interval
             callback=self.on_update,  # Custom callback function invoked on timer
         )
 
@@ -430,8 +468,8 @@ class LongShortStrategy(Strategy):
         
     def _cache_to_dict(self, window: int) -> Dict[str, pd.DataFrame]:
         """
-        Convert cache data to dictionary format expected by model.
-        Efficient implementation using cache's native methods.
+        Convert cache data within the specified window to dictionary format expected by model.
+        Efficient implementation using nautilus trader cache's native methods.
         """
         data_dict = {}
         
@@ -443,7 +481,7 @@ class LongShortStrategy(Strategy):
             
             # Get bars from cache
             if window == 0: # load all cache
-                window = self.cfg["engine"]["cache"]["bar_capacity"]
+                window = self.strategy_params["engine"]["cache"]["bar_capacity"]
             bars = self.cache.bars(bar_type)[:window]  # Get last 'window' bars (nautilus cache notation is opposite to pandas)
             if not bars or len(bars) < self.min_bars_required:
                 self.log.warning(f"Insufficient bars for {iid.symbol}: {len(bars)} < {self.min_bars_required}")
@@ -487,43 +525,73 @@ class LongShortStrategy(Strategy):
     
     # ----- weight optimiser ------------------------------------------
     def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
-        mu = np.array([preds[s] for s in self.universe])
-        if self.optimizer is None:
-            w = pd.Series(mu, index=self.universe)
+        """Compute target portfolio weights from predictions using optimizer."""
+        
+        # Convert predictions to array aligned with universe
+        mu = np.array([preds.get(s, 0.0) for s in self.universe])
+        
+        
+        # Calculate covariance matrix
+        # Get historical returns for covariance
+        returns_data = []
+        valid_symbols = []
+        
+        for symbol in self.universe:
+            if symbol not in preds:
+                continue
+                
+            instrument_id = InstrumentId(Symbol(symbol), self.venue)
+            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
+            bars = self.cache.bars(bar_type)
+            
+            if len(bars) > 2:
+                # Calculate returns from bars
+                closes = [float(b.close) for b in bars[-self.optimizer_lookback.n:]]
+                returns = pd.Series(closes).pct_change().dropna()
+                returns_data.append(returns.values)
+                valid_symbols.append(symbol)
+        
+        if len(returns_data) > 1:
+            # Build covariance matrix
+            returns_df = pd.DataFrame(returns_data).T
+            cov = returns_df.cov().values
+            
+            # Get current risk-free rate
+            current_rf = 0.0
+            if self.rf_rate is not None and len(self.rf_rate) > 0:
+                # Get most recent risk-free rate (annualized)
+                current_rf = self.rf_rate.iloc[-1] if not pd.isna(self.rf_rate.iloc[-1]) else 0.0
+            
+            # Optimize with valid symbols only
+            valid_mu = np.array([preds[s] for s in valid_symbols])
+            w_opt = self.optimizer.optimize(valid_mu, cov, current_rf)
+            
+            # Map back to full universe
+            w = pd.Series(0.0, index=self.universe)
+            for i, symbol in enumerate(valid_symbols):
+                w[symbol] = w_opt[i]
         else:
-            lookback = int(self.cfg["optimizer"].get("lookback_days", 60))
-            
-            returns = pd.DataFrame()
-            for s in self.universe:
-                bars = []
-                for bar in self.cache.bars(self._bar_type):
-                    if bar.instrument_id.symbol == s:
-                        bars.append(bar)
-                if len(bars) >= 2:
-                    closes = [b.close for b in bars[-lookback:]]
-                    ret = pd.Series(closes).pct_change().dropna()
-                    returns[s] = ret
-            
-            cov = returns.cov().values if not returns.empty else np.diag(np.ones_like(mu))
-            w_vec = self.optimizer.optimize(mu, cov)
-            w = pd.Series(w_vec, index=self.universe)
+            # Fallback to simple ranking
+            w = pd.Series(mu, index=self.universe)
 
-        # ------- keep only top / bottom k ----------------------------
+        
+        # Select top-k long and short
         shorts = w.nsmallest(self.selector_k)
-        longs  = w.nlargest(self.selector_k)
+        longs = w.nlargest(self.selector_k)
         w = pd.concat([shorts, longs]).reindex(self.universe).fillna(0.0)
-
-        # ------- cap position weights --------------------------------
+        
+        # Apply position limits
         w = w.clip(-self.max_w_abs, self.max_w_abs)
         if w.abs().sum() > self.max_w_rel:
             w *= self.max_w_rel / w.abs().sum()
-
-        # ------- vol targeting ---------------------------------------
-        if self.realised_returns:
-            realised_vol = np.std(self.realised_returns) * math.sqrt(252)
+        
+        # Volatility targeting
+        if len(self.realised_returns) > 20:
+            realised_vol = np.std(self.realised_returns) * np.sqrt(252)
             if realised_vol > 0:
                 scale = min(1.5, self.target_vol / realised_vol)
                 w *= scale
+        
         return w.to_dict()
 
     # ----- execution --------------------------------------------------
