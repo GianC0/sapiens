@@ -423,7 +423,7 @@ class LongShortStrategy(Strategy):
         self.model = ModelClass(**final_model_params, **best_hparams)
 
         if (model_dir / "init.pt").exists():
-                state_dict = torch.load(model_dir / "init.pt", map_location='cpu')
+                state_dict = torch.load(model_dir / "init.pt", map_location=model._device)
                 self.model.load_state_dict(state_dict)
         else:
             raise ImportError(f"Could not find init.pt in {model_dir}")

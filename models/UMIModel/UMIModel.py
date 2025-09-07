@@ -108,8 +108,8 @@ class UMIModel(nn.Module):
         self.patience = patience                                                                    # early stopping patience epochs for any training stage
         self.hp = self._default_hparams()                                                           # hyper-parameters
         self.hp.update(hparams)                                                                     # updated with those defined in the yaml config
-        self.warm_start          = warm_start                                                       # warm start when stock is deleted or retrain delta elapsed
-        self.warm_training_epochs = warm_training_epochs if warm_start is not None else self.n_epochs
+        #self.warm_start          = warm_start                                                      # warm start when stock is deleted or retrain delta elapsed
+        #self.warm_training_epochs = warm_training_epochs if warm_start is not None else self.n_epochs
         self._global_epoch = 0                                                                      # global epoch counter for stats
     
 
@@ -163,7 +163,7 @@ class UMIModel(nn.Module):
 
         return best_val
 
-    def update(self, data: Dict[str, DataFrame], current_time: Timestamp, active_mask: torch.Tensor):
+    def update(self, data: Dict[str, DataFrame], current_time: Timestamp, active_mask: torch.Tensor, warm_start: Optional[bool] = False, warm_training_epochs: Optional[int] = None):
         """
         One-off training (train + valid).
         """
@@ -173,12 +173,14 @@ class UMIModel(nn.Module):
         # Assert universe
         assert self._universe == list(data.keys()), "Universe error!"
 
+        epochs = warm_training_epochs if warm_training_epochs is not None else self.n_epochs
+
         # set current time for end of training (no validation)
         # the model assumes that input cutoff of old data is done by strategy at current_time - training_offset
         self.train_end = current_time
         self.valid_end = current_time
 
-        if not self.warm_start:
+        if not warm_start:
             if self.logger:
                 self.logger.info(f"[update] Warm-start disabled. Initialization on most updated window up until: {current_time}")
     
@@ -197,7 +199,7 @@ class UMIModel(nn.Module):
             if self.logger:
                 self.logger.info(f"[update] Loading weights from {latest_path}")
             try:
-                self.load_state_dict(torch.load(latest_path, map_location='cpu'))
+                self.load_state_dict(torch.load(latest_path, map_location=self._device))
             except Exception as e:
                 if self.logger:
                     self.logger.info(f"[update] Failed to load weights: {e}, training from scratch")
@@ -208,7 +210,7 @@ class UMIModel(nn.Module):
             raise ImportError("Could not find latest.pt warmed-up model in ", self.model_dir)
         
         # Train
-        _ = self._train(data, self.warm_training_epochs, active_mask)
+        _ = self._train(data, epochs, active_mask)
         
         # Save backup if requested
         if self.save_backups:

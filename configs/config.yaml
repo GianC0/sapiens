@@ -22,8 +22,6 @@ MODEL:
     training_mode: "sequential"  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) -> Stage-1 + Stage-2
     pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
     patience:        3           # Early-stop patience 
-    warm_start:      true        # Enable warm-start                           (common in finance live rolls)
-    warm_training_epochs: 10     # Light fine-tune epochs
     save_backups: false          # whether to save backups during walk-forward
 
     # Hyperparameter tuning settings
@@ -123,7 +121,7 @@ STRATEGY:
   PARAMS:
     strategy_name: "LongShortStrategy"
 
-    # Backtest
+    # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
     freq: 1D                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
     train_start:  2019-01-01     # Initial date where the
@@ -131,6 +129,8 @@ STRATEGY:
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     currency: USD
+    warm_start:      true        # Enable warm-start
+
 
     # Paths
     data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
@@ -180,6 +180,14 @@ STRATEGY:
       optuna:
         optuna_type: "categorical"
         choices: ["7B", "14B", "30B", "60B"]
+    
+    # Light fine-tune epochs
+    warm_training_epochs:      
+      default: 5
+      optuna:
+        optuna_type: int_low-high
+        low: 5
+        high: 20
 
     # Portfolio selection
     selection_top_k:
