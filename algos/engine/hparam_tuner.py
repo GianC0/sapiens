@@ -85,6 +85,9 @@ class OptunaHparamsTuner:
         self.model_params["freq"] = self.strategy_params["freq"]
         self.model_params["calendar"] = self.strategy_params["calendar"]
 
+        # TODO: Centralized Setup correct types (Dates and offsets). Now done in specific model/strategy
+        
+
         # Split hparams into defaults and search spaces
         self.model_defaults, self.model_search = self._split_hparam_cfg(self.model_hparams)
         self.strategy_defaults, self.strategy_search = self._split_hparam_cfg(self.strategy_hparams)

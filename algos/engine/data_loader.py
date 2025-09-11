@@ -13,10 +13,9 @@ the adapter automatically falls back to the plain Bar fields.
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional
-
+import logging
 import numpy as np
 import pandas as pd
-import torch
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import Equity
@@ -24,6 +23,8 @@ from nautilus_trader.model.objects import Price, Quantity, Money
 from nautilus_trader.model.currencies import USD,EUR
 from models.utils import freq2barspec
 #from nautilus_trader.model import Data  # base class for custom data
+
+logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------ #
@@ -74,6 +75,7 @@ class CsvBarLoader:
         tz: str = "UTC",
         universe: Optional[List[str]] = None,
         columns_to_load: List[str] = [],  # empty list takes all
+        benchmark: str = "SPY"
     ):
         root = Path(cfg["data_dir"])
         freq = cfg["freq"]
@@ -87,9 +89,8 @@ class CsvBarLoader:
         self.cfg = cfg
 
         stock_dir = self._root / "stocks" / cfg["calendar"]
-        bond_dir  = self._root / "bonds" / cfg["calendar"]
         self._stock_files = sorted(stock_dir.glob("*.csv"))
-        self._rf_file     = bond_dir / "DGS10.csv"
+        benchmarks_file = self._root / "benchmarks" / "benchmarks.csv"
 
         self._universe: List[str] = (
             universe
@@ -112,9 +113,47 @@ class CsvBarLoader:
                     self._frames[symbol] = df
                 # Create instrument for each stock
                 self._instruments[symbol] = self._create_equity_instrument(symbol)
-        self._yield_series: Optional[pd.Series] = (
-            self._parse_rf_csv(self._rf_file) if self._rf_file.exists() else None
-        )
+        
+        # Load benchmark data
+        
+        self._benchmark_data = None
+        self._risk_free_df = None
+        if benchmarks_file.exists():
+            df = pd.read_csv(benchmarks_file, parse_dates=['dt'])
+            df.rename(columns={"dt": "Date"}, inplace=True)
+            df.set_index('Date', inplace=True)
+            df.index = pd.to_datetime(df.index, utc=True)
+            
+            # Risk-free rate from US Treasury 3-months yield column (already in %)
+            self._risk_free_df = df[['us3m']] / 100.0  # Double brackets → DataFrame
+            self._risk_free_df.rename(columns={"us3m": "risk_free"}, inplace=True)
+            self._risk_free_df.sort_index(inplace=True)
+            
+            
+            # Benchmark using S&P500
+            if benchmark == "SPY":
+                self._benchmark_data = df[['sp500', 'sp500_volume']]
+                self._benchmark_data.rename(columns={"sp500": "Benchmark", 'sp500_volume': 'Volume'}, inplace=True)
+                self._benchmark_returns = df['Benchmark'].pct_change()
+            
+            # Benchmark using DowJones Industrial Average
+            elif benchmark == "DJIA":
+                self._benchmark_data = df[['djia', 'djia_volume']]
+                self._benchmark_data.rename(columns={"djia": "Benchmark", 'djia_volume': 'Volume'}, inplace=True)
+                self._benchmark_returns = df['sp500'].pct_change()
+
+            # Defaulting to S&P500
+            else:
+                logger.warning(f"{benchmark} is not a valid benchmark... Using SPY instead")
+                self._benchmark_data = df[['sp500', 'sp500_volume']]
+                self._benchmark_data.rename(columns={"sp500": "Benchmark", 'sp500_volume': 'Volume'}, inplace=True)
+                self._benchmark_returns = df['Benchmark'].pct_change()
+            
+            self._benchmark_data.sort_index(inplace=True)
+            self._benchmark_returns.sort_index(inplace=True)
+
+
+
 
     def _create_equity_instrument(self, symbol: str) -> Equity:
         """Create an Equity instrument for the given symbol."""
@@ -148,13 +187,17 @@ class CsvBarLoader:
         return self._universe
 
     @property
+    def benchmark_returns(self) -> Optional[pd.Series]:
+        return self._benchmark_returns
+    
+    @property
     def instruments(self) -> Dict[str, Equity]:
         """Return all created instruments."""
         return self._instruments
 
     @property
     def rf_series(self) -> Optional[pd.Series]:
-        return self._yield_series
+        return self._risk_free_df
 
     def bar_iterator(self) -> Iterator[Bar]:
         """
@@ -252,3 +295,4 @@ class CsvBarLoader:
         rf.set_index("Date", inplace=True)
         rf["DGS10"] = pd.to_numeric(rf["DGS10"], errors="coerce") / 100.0
         return rf["DGS10"].asfreq("B").ffill()
+    

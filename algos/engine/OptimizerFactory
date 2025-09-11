@@ -53,7 +53,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
         super().__init__(weight_bounds, solver)
         self.risk_free_rate = risk_free_rate
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0, **kwargs) -> np.ndarray:
         """
         Find weights that maximize Sharpe ratio.
         
@@ -89,14 +89,13 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
 class MinVarianceOptimizer(PortfolioOptimizer):
     """Minimum variance portfolio optimizer using PyPortfolioOpt."""
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, **kwargs) -> np.ndarray:
         """
         Find minimum variance portfolio.
         
         Args:
             mu: Expected returns (n,)
             cov: Covariance matrix (n, n)
-            rf: Risk-free rate (unused for min variance)
         """
         try:
             ef = EfficientFrontier(
@@ -125,7 +124,7 @@ class M2Optimizer(PortfolioOptimizer):
     M² adjusts portfolio returns to match benchmark volatility for comparison.
     """
     
-    def __init__(self, benchmark_vol: float = 0.15, weight_bounds=(-1, 1), solver=None):
+    def __init__(self, weight_bounds=(-1, 1), solver=None):
         """
         Args:
             benchmark_vol: Annualized benchmark volatility (default 15%)
@@ -133,9 +132,8 @@ class M2Optimizer(PortfolioOptimizer):
             solver: cvxpy solver
         """
         super().__init__(weight_bounds, solver)
-        self.benchmark_vol = benchmark_vol
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float, benchmark_vol: float, **kwargs) -> np.ndarray:
         """
         Find weights that maximize M² measure.
         
@@ -166,7 +164,7 @@ class M2Optimizer(PortfolioOptimizer):
             # Scale weights to match benchmark volatility
             # This preserves the Sharpe ratio while adjusting risk
             if port_vol > 0:
-                scale = self.benchmark_vol / port_vol
+                scale = benchmark_vol / port_vol
                 
                 # Mix with risk-free asset to achieve target volatility
                 if scale < 1:
@@ -198,7 +196,7 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
     Good for risk-averse investors.
     """
     
-    def __init__(self, risk_aversion: float = 1.0, weight_bounds=(-1, 1), solver=None):
+    def __init__(self, risk_aversion: int = 1, weight_bounds=(-1, 1), solver=None):
         """
         Args:
             risk_aversion: Risk aversion parameter (higher = more risk averse)
@@ -208,7 +206,7 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
         super().__init__(weight_bounds, solver)
         self.risk_aversion = risk_aversion
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, **kwargs) -> np.ndarray:
         """
         Find weights that maximize quadratic utility.
         
@@ -281,7 +279,7 @@ class EqualWeightOptimizer(PortfolioOptimizer):
     def __init__(self, **kwargs):
         super().__init__()
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, **kwargs) -> np.ndarray:
         """Return equal weights for all assets."""
         n = len(mu)
         return np.ones(n) / n

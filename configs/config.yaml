@@ -152,6 +152,7 @@ STRATEGY:
     # allocation:
     #   gross_leverage: 2.0    # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
     #   net_exposure:   0.0    # Σwᵢ ≈ 0 (market-neutral)
+    
 
     # Trading friction costs
     costs:
@@ -174,6 +175,9 @@ STRATEGY:
 
   # Hyperparameters to optimize
   HPARAMS:
+
+    # TODO: Risk Aversion
+
     # Retrain fine-tuning
     retrain_offset:
       default: "30B"                    # B = business day
@@ -204,7 +208,7 @@ STRATEGY:
         optuna_type: categorical
         choices: ["max_sharpe"] # , "min_variance", "equal_weight"
     
-    optimizer_lookback_days:
+    optimizer_lookback:
       default: "60B"
       optuna:
         optuna_type: categorical

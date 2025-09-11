@@ -96,7 +96,8 @@ class LongShortStrategy(Strategy):
         self.model_name = self.model_params["model_name"]
         self.bar_type = None  # Set in on_start
         self.bar_spec = freq2barspec( self.strategy_params["freq"])
-        self.min_bars_required = self.model_params["window_len"] + self.model_params["pred_len"]  
+        self.min_bars_required = self.model_params["window_len"] + self.model_params["pred_len"]
+        self.optimizer_lookback = freq2pdoffset( self.strategy_params["optimizer_lookback"])
         
         
         # Loader for data access
@@ -141,6 +142,8 @@ class LongShortStrategy(Strategy):
         self.twap_slices = self.strategy_params.get("execution", {}).get("twap", {}).get("slices", 4)
 
         # Portfolio optimizer
+        # TODO: add risk_aversion config parameter for MaxQuadraticUtilityOptimizer
+        # TODO: make sure to pass proper params to create_optimizer depending on the optimizer all __init__ needed by any optimizer
         optimizer_name = self.strategy_params.get("optimizer_name", "max_sharpe")
         self.optimizer = create_optimizer(optimizer_name)
 
@@ -524,11 +527,63 @@ class LongShortStrategy(Strategy):
         return mask
     
     # ----- weight optimiser ------------------------------------------
+    def _get_risk_free_rate(self, timestamp: pd.Timestamp) -> float:
+        """Get risk-free rate for given timestamp with average fallback logic."""
+        if self.loader._benchmark_data is None:
+            return 0.0
+        
+        df = self.loader._risk_free_df
+        
+        # Try exact date first
+        if timestamp.normalize() in df.index:
+            rf_now = df.loc[timestamp.normalize(), 'risk_free']
+            if not pd.isna(rf_now):
+                return float(rf_now)
+        
+        # Fallback: nearest available data
+        nearest_idx = df.index.get_indexer([timestamp], method='nearest')[0]
+        if nearest_idx >= 0:
+            return float(df.iloc[nearest_idx]['risk_free'])
+        
+        # Last Fallback: average over window [now - freq, now + freq]
+        freq_offset = freq2pdoffset(self.strategy_params["freq"])
+        start = timestamp - freq_offset
+        end = timestamp + freq_offset
+        
+        window_data = df.loc[(df.index >= start) & (df.index <= end), 'risk_free']
+        
+        if len(window_data) > 0:
+            return float(window_data.mean() )
+        
+        return 0.0
+    
+    def _get_benchmark_volatility(self, timestamp: pd.Timestamp) -> Optional[float]:
+        """Calculate benchmark volatility using same lookback as optimizer."""
+        if self.loader._benchmark_data is None:
+            return None
+        
+        df = self.loader._benchmark_data
+        
+        # Calculate start date for lookback window
+        lookback_start = timestamp - self.optimizer_lookback
+
+        # Get data in lookback window
+        volatility = df.loc[(df.index >= lookback_start) & (df.index <= timestamp), "Benchmark"].std()
+
+        return volatility
+
     def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
         """Compute target portfolio weights from predictions using optimizer."""
         
         # Convert predictions to array aligned with universe
         mu = np.array([preds.get(s, 0.0) for s in self.universe])
+        now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
+
+        # Calculate current risk-free rate
+        current_rf = self._get_risk_free_rate(now)
+
+        # Calculate benchmark volatility
+        benchmark_vol = self._get_benchmark_volatility(now)
         
         
         # Calculate covariance matrix
@@ -564,16 +619,17 @@ class LongShortStrategy(Strategy):
             
             # Optimize with valid symbols only
             valid_mu = np.array([preds[s] for s in valid_symbols])
-            w_opt = self.optimizer.optimize(valid_mu, cov, current_rf)
+            w_opt = self.optimizer.optimize(valid_mu, cov, current_rf, benchmark_vol)
             
             # Map back to full universe
             w = pd.Series(0.0, index=self.universe)
             for i, symbol in enumerate(valid_symbols):
                 w[symbol] = w_opt[i]
         else:
-            # Fallback to simple ranking
-            w = pd.Series(mu, index=self.universe)
-
+            # TODO: to ensure no trades are execute in case of these failures
+            # TODO: it should also be notified
+            return {}
+            
         
         # Select top-k long and short
         shorts = w.nsmallest(self.selector_k)
