@@ -385,7 +385,7 @@ class OptunaHparamsTuner:
                     mlflow.log_param("model_path", str(self.best_model_path))
                     
                     # Run backtest with these strategy parameters
-                    metrics = self._run_backtest(
+                    metrics = self._backtest(
                         model_params_all= self.best_model_params_flat,  # type: ignore
                         strategy_params_all = strategy_params_flat,
                         start = strategy_params_flat["valid_start"],
@@ -459,7 +459,7 @@ class OptunaHparamsTuner:
             "metrics": best_trial.user_attrs.get("metrics", {})
         }
     
-    def _run_backtest(
+    def _backtest(
         self,
         model_params_all: dict,
         strategy_params_all: dict,
