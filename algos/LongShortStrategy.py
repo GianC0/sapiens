@@ -185,6 +185,10 @@ class LongShortStrategy(Strategy):
         # Build and initialize model
         self._initialize_model()
 
+        # Set initial update time to avoid immediate firing
+        self._last_update_time = pd.Timestamp(self.clock.utc_now(), tz='UTC')
+        self._last_retrain_time = pd.Timestamp(self.clock.utc_now(), tz='UTC')
+
         self.clock.set_timer(
             name="update_timer",  
             interval=freq2pdoffset(self.strategy_params["freq"]),  # Timer interval

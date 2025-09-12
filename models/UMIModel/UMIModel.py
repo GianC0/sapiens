@@ -87,20 +87,19 @@ class UMIModel(nn.Module):
 
         # model parameters
         self.F              = feature_dim                                                          # number of features per stock
-        self.L              = window_len                                                          # length of the sliding window (L+1 bars)
+        self.L              = window_len                                                           # length of the sliding window (L+1 bars)
         self.I              = None                                                                 # number of stocks/instruments. here it is just initialized
         self.n_epochs       = n_epochs                                                             # number of epochs for training
         self.pretrain_epochs = pretrain_epochs                                                     # epochs for Stage-1 pre-training (hybrid mode)
         self.training_mode = training_mode                                                         # "hybrid" or "sequential"
-        
-        self.model_dir =  model_dir                              # model directory with timestamp and hparams
+        self.model_dir =  model_dir                                                                # model directory with timestamp and hparams
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
         # stock universe
         self._universe: list[str] = []                                                               # list of ordered instruments the model is trained on
         #self.universe_mult = max(1, int(dynamic_universe_mult))                                     # over-allocation factor for dynamic universe
         
-        self.target_idx = target_idx                                                                  # usually "close" is at index 3 in the dataframes
+        self.target_idx = target_idx                                                                 # usually "close" is at index 3 in the dataframes
         
         # training parameters
         self._is_initialized = False
@@ -111,7 +110,7 @@ class UMIModel(nn.Module):
         #self.warm_start          = warm_start                                                      # warm start when stock is deleted or retrain delta elapsed
         #self.warm_training_epochs = warm_training_epochs if warm_start is not None else self.n_epochs
         self._global_epoch = 0                                                                      # global epoch counter for stats
-    
+        self._epoch_logs = []                                                                       # useful during full strategy run to track updates() and reinitializations
 
 
 
@@ -455,7 +454,6 @@ class UMIModel(nn.Module):
         # ═══════════════════════════════════════════════════════════════════════════════
         
         best_validation_loss = float('inf')
-        self._epoch_logs = []
         global_epoch = 0
         
         # ═══════════════════════════════════════════════════════════════════════════════

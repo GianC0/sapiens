@@ -142,10 +142,17 @@ STRATEGY:
         bar_capacity: 4096       # ≥ L + pred_len + some safety margin
 
 
-    # Hyperparameter tuning settings
+    # Hyperparameter tuning Settings and Objectives
+    # Objectives: sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown, total_return, annual_return, daily_vol
     tune_hparams: true
     n_trials: 10
     valid_split : 0.2    # meaning 80/20 train/valid split of full training dataset. NOTE: used also for model split
+    objectives:          # use only nautilus_trader portfolio_analyzer statistics
+      sharpe_ratio: maximize
+      #total_return: maximize
+      #profit_factor: maximize 
+
+
 
     # Data and training windows
     # holdout: 1B              # holdout period in days. NOTE: ensure pred_len < holdout
@@ -162,7 +169,7 @@ STRATEGY:
 
     # Order execution algorithm
     execution:
-      timing_force: "DAY"      #  Specifies how long the order will remain open or active before any remaining quantity is canceled.
+      timing_force: "DAY"      # Specifies how long the order will remain open or active before any remaining quantity is canceled.
       twap:                    # Split parent order into 4 TWAP child orders, each after 2.5 seconds 
         horizon_secs: 10.0
         interval_secs: 2.5

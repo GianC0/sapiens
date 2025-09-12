@@ -9,23 +9,6 @@ Orchestrates two-phase hyperparameter optimization:
 Each phase gets its own Optuna study and MLflow experiment.
 """
 
-from __future__ import annotations
-from math import exp
-from pathlib import Path
-from typing import Callable, Dict, Any, Optional, Tuple
-from unittest import loader
-import optuna
-from optuna.storages import RDBStorage
-import pandas as pd
-import torch.nn as nn
-import mlflow
-from mlflow import MlflowClient
-import yaml
-from datetime import datetime
-import importlib
-import logging
-logger = logging.getLogger(__name__)
-import pandas_market_calendars as market_calendars
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.config import BacktestDataConfig, CacheConfig
@@ -34,6 +17,23 @@ from nautilus_trader.backtest.models import FillModel
 from nautilus_trader.model.data import Bar
 from nautilus_trader.backtest.node import BacktestEngineConfig
 
+import pandas_market_calendars as market_calendars
+from math import exp
+from pathlib import Path
+from typing import Callable, Dict, Any, Optional, Tuple
+from unittest import loader
+import optuna
+from optuna.storages import RDBStorage
+import pandas as pd
+from sqlalchemy import Engine
+import torch.nn as nn
+import mlflow
+from mlflow import MlflowClient
+import yaml
+from datetime import datetime
+import importlib
+import logging
+logger = logging.getLogger(__name__)
 
 from algos.engine.data_loader import CsvBarLoader
 from models.utils import freq2pdoffset, yaml_safe, freq2barspec
@@ -109,9 +109,9 @@ class OptunaHparamsTuner:
         self._setup_mlflow()
         
         # Optimization Best Parameters 
-        self.best_model_params_flat = None
+        self.best_model_params_flat = {}
         self.best_model_path = None
-        self.best_strategy_hparams = None
+        self.best_strategy_params_flat = {}
         self.results = {}
 
         # TODO: ensure that when no optim is run, then this still works
@@ -209,7 +209,7 @@ class OptunaHparamsTuner:
             study = optuna.create_study(
                 study_name=model_study_name,
                 storage=storage,
-                direction='minimize',
+                directions='minimize',
                 sampler=optuna.samplers.TPESampler(seed=self.seed),
                 load_if_exists=True,
             )
@@ -269,7 +269,7 @@ class OptunaHparamsTuner:
                         epoch = m.pop("epoch")
                         mlflow.log_metrics(m, step=epoch)
                     mlflow.log_metric("best_validation_loss", score)
-                    mlflow.pytorch.log_model( model , name = model_name)
+                    mlflow.pytorch.log_model( model , name = model_name) # type: ignore
                     
                     # Store model directory in trial
                     trial.set_user_attr("model_path", str(model_dir / "init.pt"))
@@ -302,7 +302,7 @@ class OptunaHparamsTuner:
             if best_trial is None:
                 raise Exception("Could not compute hp optimization of model")
             
-            mlflow.log_metric("best_model_loss", best_trial.value)
+            mlflow.log_metric("best_model_loss", best_trial.value) # type: ignore
             
             logger.info(f"\nBest model trial: {best_trial.number}")
             logger.info(f"Best model loss: {best_trial.value:.6f}")
@@ -313,7 +313,7 @@ class OptunaHparamsTuner:
             "model_path": self.best_model_path,
         }
 
-    def optimize_strategy(self) -> Dict[str, Any]:
+    def optimize_strategy(self, ) -> Dict[str, Any]:
         """
         Phase 2: Optimize strategy hyperparameters using best model.
         
@@ -355,18 +355,21 @@ class OptunaHparamsTuner:
             strategy_study_name = f"strategy_{self.strategy_params['strategy_name']}"
             strategy_db_path = self.run_dir / "strategy_hpo.db"
             storage = RDBStorage(f"sqlite:///{strategy_db_path}")
+
+            # Parse Objectives and directions. Structure: obj:direction
+            objectives, directions = zip(*self.strategy_params['objectives'].items())
             
             # TODO: ensure propoer direction depending on all the metrics
             study = optuna.create_study(
                 study_name=strategy_study_name,
                 storage=storage,
-                direction="maximize",  # Maximize strategy performance
+                directions=list(directions),  # follow the specific directions given in config for each metric
                 sampler=optuna.samplers.TPESampler(seed=self.seed),
                 load_if_exists=True,
             )
             
             # Define objective function for strategy
-            def strategy_objective(trial: optuna.Trial) -> float:
+            def strategy_objective(trial: optuna.Trial) -> Tuple:
                 trial_hparams = self._suggest_params(trial, self.strategy_defaults, self.strategy_search)
 
                 offset = self.best_model_params_flat["train_offset"]
@@ -386,8 +389,8 @@ class OptunaHparamsTuner:
                     
                     # Run backtest with these strategy parameters
                     metrics = self._backtest(
-                        model_params_all= self.best_model_params_flat,  # type: ignore
-                        strategy_params_all = strategy_params_flat,
+                        model_params_flat= self.best_model_params_flat,  # type: ignore
+                        strategy_params_flat = strategy_params_flat,
                         start = strategy_params_flat["valid_start"],
                         end = strategy_params_flat["valid_end"],
                     )
@@ -397,15 +400,15 @@ class OptunaHparamsTuner:
                         mlflow.log_metric(metric_name, metric_value)
                     
                     # Use Portfolio return as objective
-                    score = metrics.get('portfolio_return', 0.0)
+                    scores = tuple(metrics[obj] for obj in objectives )
                     
                     # Store trial attributes
                     trial.set_user_attr("metrics", metrics)
                     trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
                     
-                    logger.info(f"  Trial {trial.number}: Portfolio Return = {score:.4f}")
+                    logger.info(f"  Trial {trial.number}: Scores = {scores:.4f}")
                     
-                    return score
+                    return scores
             
             # Run optimization
             n_trials = self.strategy_params.get("n_trials", 1)
@@ -419,23 +422,23 @@ class OptunaHparamsTuner:
             
             # Get best trial
             best_trial = study.best_trial
-            self.best_strategy_hparams = best_trial.params
+            self.best_strategy_params_flat = self.strategy_params | best_trial.params
             
             # Log best results
             mlflow.log_params({
-                f"best_strategy_{k}": v for k, v in self.best_strategy_hparams.items()
+                f"best_strategy_{k}": v for k, v in best_trial.params.items()
             })
-            mlflow.log_metric("best_strategy_sharpe", best_trial.value)
+            mlflow.log_metric("best_strategy_sharpe", best_trial.value) # type: ignore
             
             logger.info(f"\nBest strategy trial: {best_trial.number}")
             logger.info(f"Best strategy Sharpe: {best_trial.value:.4f}")
-            logger.info(f"Best strategy hparams: {self.best_strategy_hparams}")
+            logger.info(f"Best strategy hparams: {best_trial.params}")
             
             # Save strategy optimization results
             strategy_results = {
                 "best_trial": best_trial.number,
                 "best_sharpe": best_trial.value,
-                "best_hparams": self.best_strategy_hparams,
+                "best_hparams": best_trial.params,
                 "best_metrics": best_trial.user_attrs.get("metrics", {}),
                 "all_trials": [
                     {
@@ -454,18 +457,23 @@ class OptunaHparamsTuner:
             mlflow.log_artifact(str(results_path))
         
         return {
-            "hparams": self.best_strategy_hparams,
-            "sharpe_ratio": best_trial.value,
+            "hparams": best_trial.params,
             "metrics": best_trial.user_attrs.get("metrics", {})
         }
     
+    def get_best_config_flat(self, ) -> Dict[str, Any]:
+        config = {"MODEL": self.best_model_params_flat , "STRATEGY": self.best_strategy_params_flat }
+
+        return config
+
+
     def _backtest(
         self,
-        model_params_all: dict,
-        strategy_params_all: dict,
+        model_params_flat: dict,
+        strategy_params_flat: dict,
         start: pd.Timestamp,
         end: pd.Timestamp,
-    ) -> Dict[str, float]:
+        ) -> Dict[str, float]:
         """
         Run a full backtest with given model and strategy hyperparameters.
         
@@ -475,16 +483,18 @@ class OptunaHparamsTuner:
         
         # init config (flat)
         config = {
-            'MODEL': model_params_all ,
-            'STRATEGY': strategy_params_all ,
+            'MODEL': model_params_flat ,
+            'STRATEGY': strategy_params_flat ,
         }
+
+        
 
         
         # Train model on Train + Valid with best HP
         # (DONE THROUGH THE STRATEGY)
 
         # Initialize Strategy
-        strategy_name = strategy_params_all.get('strategy_name', 'LongShortStrategy')
+        strategy_name = strategy_params_flat.get('strategy_name', 'LongShortStrategy')
         try:
             # Try to import from algos module
             strategy_module = importlib.import_module(f"algos.{strategy_name}")
@@ -507,8 +517,8 @@ class OptunaHparamsTuner:
             name="SIM",
             book_type="L1_MBP",     # bars are inluded in L1 market-by-price
             account_type=AccountType.CASH,
-            base_currency=strategy_params_all["currency"],
-            starting_balances=str(strategy_params_all["initial_cash"])+" "+str(strategy_params_all["currency"]),
+            base_currency=strategy_params_flat["currency"],
+            starting_balances=str(strategy_params_flat["initial_cash"])+" "+str(strategy_params_flat["currency"]),
             bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices
             )
         
@@ -516,7 +526,7 @@ class OptunaHparamsTuner:
         engine = BacktestEngine(
             config=BacktestEngineConfig(
                 strategies=[StrategyClass(config=config)],
-                trader_id=f"Backtest_{model_params_all["model_name"]}_{strategy_params_all["strategy_name"]}",
+                trader_id=f"Backtest_{model_params_flat["model_name"]}_{strategy_params_flat["strategy_name"]}",
             ),
             data_configs=[
                 BacktestDataConfig(
@@ -524,16 +534,16 @@ class OptunaHparamsTuner:
                     data_cls=Bar,
                     start_time=pd.Timestamp.isoformat(start),
                     end_time=pd.Timestamp.isoformat(end),
-                    bar_spec=freq2barspec(strategy_params_all["freq"]),
+                    bar_spec=freq2barspec(strategy_params_flat["freq"]),
                 )
             ],
             venues=[venue],
             cache=CacheConfig(
-                bar_capacity=strategy_params_all.get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
+                bar_capacity=strategy_params_flat.get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
             ),
             fill_model=FillModel(
-                prob_fill_on_limit=strategy_params_all.get("costs", {}).get("prob_fill_on_limit", 0.2),
-                prob_slippage=strategy_params_all.get("costs", {}).get("prob_slippage", 0.2),
+                prob_fill_on_limit=strategy_params_flat.get("costs", {}).get("prob_fill_on_limit", 0.2),
+                prob_slippage=strategy_params_flat.get("costs", {}).get("prob_slippage", 0.2),
                 random_seed=self.seed,
             ),
         )
@@ -543,124 +553,132 @@ class OptunaHparamsTuner:
             engine.add_instrument(instrument)
         
         # Add historical data (only validation period)
+        bar_count = 0
         for bar_or_feature in self.loader.bar_iterator():
             if isinstance(bar_or_feature, Bar):
                 bar_ts = pd.Timestamp(bar_or_feature.ts_event, unit='ns', tz='UTC')
                 if start <= bar_ts <= end:
                     engine.add_data(bar_or_feature)
+                    bar_count += 1
         
-        # Run backtest
-        engine.run(start=start, end=end)
-        
-        # Calculate performance metrics
-        portfolio = engine.portfolio
-        account = engine.cache.account_for_venue(venue)
-        
-        # Get equity curve for metrics calculation
-        equity_curve = []
-        for position_event in engine.cache.position_events():
-            equity_curve.append({
-                'timestamp': position_event.ts_event,
-                'value': float(account.balance_total(currency=strategy_params_all["currency"]))
-            })
-        
-        if not equity_curve:
-            # No trades, return zero metrics
+        # Error Handling
+        if bar_count == 0:
+            logger.warning(f"No bars found in period {start} to {end}")
             return {
                 'sharpe_ratio': 0.0,
                 'total_return': 0.0,
                 'max_drawdown': 0.0,
                 'win_rate': 0.0,
                 'num_trades': 0,
+                'total_return': 0.0,
             }
         
-        # Calculate returns
-        equity_df = pd.DataFrame(equity_curve)
-        if len(equity_df) > 1:
-            equity_df['returns'] = equity_df['value'].pct_change()
+        # Run backtest
+        engine.run(start=start, end=end)
+
+        # Calculate metrics using Nautilus built-in analyzer
+        metrics = self._compute_metrics(engine=engine, venue=venue, strategy_params_flat=strategy_params_flat)
+        
+        engine.dispose()
+        
+        return metrics
+
+    def _compute_metrics(self, engine: BacktestEngine, venue: Venue, strategy_params_flat: Dict) -> Dict:
+        # Calculate metrics using Nautilus built-in analyzer
+        metrics = {}
+
+        # Get portfolio analyzer for comprehensive metrics
+        portfolio_analyzer = engine.analyzer
+        
+        # Get account for final balance
+        account = engine.cache.account_for_venue(venue)
+        
+        try:
+            # Get portfolio statistics from analyzer
+            stats = portfolio_analyzer.get_portfolio_stats()
             
-            # Calculate metrics
-            total_return = (equity_df['value'].iloc[-1] / equity_df['value'].iloc[0]) - 1
+            # TODO: decide what to store/analyze
+            # check: https://github.com/nautechsystems/nautilus_trader/tree/develop/nautilus_trader/analysis/statistics
+            # check: https://nautilustrader.io/docs/latest/concepts/reports
+
+            # Extract key metrics
+            metrics['sharpe_ratio'] = stats.get('sharpe_ratio', 0.0) if stats else 0.0
+            metrics['sortino_ratio'] = stats.get('sortino_ratio', 0.0) if stats else 0.0
+            metrics['calmar_ratio'] = stats.get('calmar_ratio', 0.0) if stats else 0.0
+            metrics['max_drawdown'] = stats.get('max_drawdown', 0.0) if stats else 0.0
             
-            # Sharpe ratio (annualized)
-            if equity_df['returns'].std() > 0:
-                sharpe_ratio = (equity_df['returns'].mean() / equity_df['returns'].std()) * (252 ** 0.5)
-            else:
-                sharpe_ratio = 0.0
+            # Get returns statistics
+            returns_stats = portfolio_analyzer.get_returns_stats() if hasattr(portfolio_analyzer, 'get_returns_stats') else {}
+            metrics['total_return'] = returns_stats.get('total_return', 0.0) if returns_stats else 0.0
+            metrics['annual_return'] = returns_stats.get('annual_return', 0.0) if returns_stats else 0.0
+            metrics['daily_vol'] = returns_stats.get('daily_vol', 0.0) if returns_stats else 0.0
             
-            # Max drawdown
-            rolling_max = equity_df['value'].expanding().max()
-            drawdown = (equity_df['value'] - rolling_max) / rolling_max
-            max_drawdown = drawdown.min()
+            # Get trade statistics
+            trade_stats = portfolio_analyzer.get_trade_stats() if hasattr(portfolio_analyzer, 'get_trade_stats') else {}
+            metrics['num_trades'] = trade_stats.get('total_trades', 0) if trade_stats else 0
+            metrics['win_rate'] = trade_stats.get('win_rate', 0.0) if trade_stats else 0.0
+            metrics['avg_win'] = trade_stats.get('avg_win', 0.0) if trade_stats else 0.0
+            metrics['avg_loss'] = trade_stats.get('avg_loss', 0.0) if trade_stats else 0.0
+            metrics['profit_factor'] = trade_stats.get('profit_factor', 0.0) if trade_stats else 0.0
+
+            logger.info(f"Metrics loaded successfully")
             
-            # Trade statistics
+        except Exception as e:
+            logger.warning(f"Could not get analyzer metrics: {e}, calculating manually")
+            
+            # Fallback to manual calculation if analyzer methods not available
             positions = list(engine.cache.positions_closed())
             num_trades = len(positions)
             
             if num_trades > 0:
-                winning_trades = sum(1 for p in positions if p.realized_pnl > 0)
+                winning_trades = sum(1 for p in positions if p.realized_pnl.as_double() > 0)
                 win_rate = winning_trades / num_trades
+                
+                # Calculate PnLs
+                pnls = [p.realized_pnl.as_double() for p in positions]
+                avg_pnl = sum(pnls) / len(pnls) if pnls else 0
+                
+                # Calculate returns from equity curve
+                initial_balance = float(strategy_params_flat['initial_cash'])
+                final_balance = float(account.balance_total(strategy_params_flat["currency"]).as_double())
+                total_return = (final_balance / initial_balance) - 1 if initial_balance > 0 else 0
+                
+                # Simple Sharpe calculation
+                if len(pnls) > 1:
+                    returns = [(pnls[i] / initial_balance) for i in range(len(pnls))]
+                    if len(returns) > 0 and all(r == returns[0] for r in returns):
+                        sharpe_ratio = 0.0  # All returns are the same
+                    else:
+                        import numpy as np
+                        returns_array = np.array(returns)
+                        sharpe_ratio = (np.mean(returns_array) / np.std(returns_array)) * np.sqrt(252) if np.std(returns_array) > 0 else 0
+                else:
+                    sharpe_ratio = 0.0
+                    
+                metrics = {
+                    'sharpe_ratio': sharpe_ratio,
+                    'total_return': total_return,
+                    'max_drawdown': 0.0,  # Would need equity curve to calculate
+                    'win_rate': win_rate,
+                    'num_trades': num_trades,
+                    'avg_pnl': avg_pnl,
+                    'final_balance': final_balance,
+                }
             else:
-                win_rate = 0.0
-        else:
-            total_return = 0.0
-            sharpe_ratio = 0.0
-            max_drawdown = 0.0
-            win_rate = 0.0
-            num_trades = 0
-        
-        metrics = {
-            'sharpe_ratio': sharpe_ratio,
-            'total_return': total_return,
-            'max_drawdown': max_drawdown,
-            'win_rate': win_rate,
-            'num_trades': num_trades,
-            'final_balance': float(account.balance_total(currency=strategy_params_all["currency"]))
-        }
-        
+                # No trades executed
+                initial_balance = float(strategy_params_flat['initial_cash'])
+                final_balance = float(account.balance_total(strategy_params_flat["currency"]).as_double())
+                
+                metrics = {
+                    'sharpe_ratio': 0.0,
+                    'total_return': (final_balance / initial_balance) - 1 if initial_balance > 0 else 0,
+                    'max_drawdown': 0.0,
+                    'win_rate': 0.0,
+                    'num_trades': 0,
+                    'final_balance': final_balance,
+                }
+
         return metrics
-    
-    def get_best_config(self) -> Dict:
-        """
-        Generate a config file with the best hyperparameters found.
-        
-        Returns:
-            Complete configuration with optimized hyperparameters
-        """
-        if not self.results:
-            raise ValueError("Must run optimization before getting best config")
-        
-        # Create optimized config
-        optimized_config = self.config.copy()
-        
-        # Update model hyperparameters
-        for param, value in self.best_model_params_flat.items():
-            if param in optimized_config['MODEL']['HPARAMS']:
-                optimized_config['MODEL']['HPARAMS'][param] = {
-                    'default': value,
-                    # Remove optuna section since we have the best value
-                }
-        
-        # Update strategy hyperparameters
-        for param, value in self.best_strategy_hparams.items():
-            if param in optimized_config['STRATEGY']['HPARAMS']:
-                optimized_config['STRATEGY']['HPARAMS'][param] = {
-                    'default': value,
-                    # Remove optuna section since we have the best value
-                }
-        
-        # Disable hyperparameter tuning flags
-        optimized_config['MODEL']['PARAMS']['tune_hparams'] = False
-        optimized_config['STRATEGY']['PARAMS']['tune_hparams'] = False
-        
-        # Save optimized config
-        optimized_config_path = self.run_dir / "optimized_config.yaml"
-        with open(optimized_config_path, 'w') as f:
-            yaml.dump(yaml_safe(optimized_config), f)
-        
-        logger.info(f"Optimized config saved to: {optimized_config_path}")
-        
-        return optimized_config
     
     def _add_dates(self, cfg, offset) -> Dict:
         # TODO: to verify this is also working for strategy
