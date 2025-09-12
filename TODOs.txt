@@ -13,12 +13,3 @@ add pyportfolio opt and stock selection
 - genai
 verify tests for models
 verify autogen workflow
-
-LLM prompt
-"
-rewrite the optuna optimization so that the workflow becomes:
-from: run_backtest -> strategy -> optuna hp optimizer -> model 
-to:    run_backtest -> optuna hp optimizer -> strategy -> model
-
-moreover the optuna hp optimizer should handle all the hparams for both model and strategy, as well as full mlflow logging (meaning, you should move all the mlflow logging from strategy and model directly to the hp_optimizer). Provide minimal code changes and output, add comments when necessary. Make it production ready. After writing the code, review it and fix any mistakes. Then only when it's ready provide the changes.
-"

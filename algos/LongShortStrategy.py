@@ -17,6 +17,7 @@ import math
 from datetime import datetime
 from pathlib import Path
 from pyexpat import model
+from tracemalloc import start
 from typing import Dict, List, Optional
 from pandas.tseries.frequencies import to_offset
 import numpy as np
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Logger
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.orders import MarketOrder
@@ -82,10 +84,15 @@ class LongShortStrategy(Strategy):
         self.calendar = market_calendars.get_calendar(config["STRATEGY"]["calendar"])
         
         # Core timing parameters
-        self.backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC")
+        self.train_start = pd.Timestamp(self.strategy_params["train_start"], tz="UTC")
         self.train_end = pd.Timestamp(self.strategy_params["train_end"], tz="UTC")
+        self.valid_start = pd.Timestamp(self.strategy_params["valid_start"], tz="UTC")
         self.valid_end = pd.Timestamp(self.strategy_params["valid_end"], tz="UTC")
-        self.backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC")
+
+        # NOT NEEDED
+        #self.backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC")
+        #self.backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC")
+    
         self.retrain_offset = to_offset(self.strategy_params["retrain_offset"])
         self.train_offset = to_offset(self.strategy_params["train_offset"])
         self.pred_len = int(self.model_params["pred_len"])
@@ -112,10 +119,8 @@ class LongShortStrategy(Strategy):
         self.loader = CsvBarLoader(cfg=loader_cfg, venue_name="SIM", columns_to_load=cols_to_load)
 
         # State tracking
-        
         self.universe: List[str] = []  # Ordered list of instruments
         self.active_mask: Optional[torch.Tensor] = None  # (I,)
-        #self.data_dict: Dict[str, pd.DataFrame] = {}  # {symbol: DataFrame}
 
         self._last_prediction_time: Optional[pd.Timestamp] = None
         self._last_update_time: Optional[pd.Timestamp] = None
@@ -165,7 +170,7 @@ class LongShortStrategy(Strategy):
         if self.loader.rf_series is not None:
             self.rf_rate = self.loader.rf_series
         else:
-            self.log.warning("No risk-free rate data available, using 0%")
+            logger.warning("No risk-free rate data available, using 0%")
             self.rf_rate = pd.Series(0.0)
 
         # Subscribe to bars for selected universe
@@ -216,18 +221,38 @@ class LongShortStrategy(Strategy):
         assert event.ts_event > self._last_update_time 
 
         now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
-        self.log.info(f"Update timer fired at {now}")
+
+        # Skip if no update needed
+        if self._last_update_time and now < (self._last_update_time + freq2pdoffset(self.strategy_params["freq"])):
+            logger.warning("WIERD STRATEGY UPDATE() CALL")
+            return
+        
+        logger.info(f"Update timer fired at {now}")
+        
+        # Skip if no update needed
+        if self._last_update_time and now < (self._last_update_time + freq2pdoffset(self.strategy_params["freq"])):
+            logger.warning("WIERD STRATEGY UPDATE() CALL")
+
+        if not self.model.is_initialized:
+            logger.warning("MODEL NOT INITIALIZED WITHIN STRATEGY UPDATE() CALL")
+            return
+        
         assert self.model.is_initialized()
 
         data_dict = self._cache_to_dict(window=(self.model.L + 1)) # TODO: make it more generic for all models.
 
+        if not data_dict:
+            logger.warning("DATA DICTIONARY EMPTY WITHIN STRATEGY UPDATE() CALL")
+            return
+        
         # TODO: superflous. consider removing compute active mask
         assert torch.equal(self.active_mask, self._compute_active_mask(data_dict) ) , "Active mask mismatch between strategy and data engine"
 
         assert self.universe == self.model._universe, "Universe mismatch between strategy and model"
+
         preds = self.model.predict(data=data_dict, current_time=now, active_mask=self.active_mask) #  preds: Dict[str, float]
 
-        assert preds is not None, "Model prediction returned None"
+        assert preds is not None, "Model predictions are empty"
 
         # Logic to handle orders and portfolio updates
         weights = self._compute_target_weights(preds)
@@ -249,9 +274,10 @@ class LongShortStrategy(Strategy):
         now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
         
         # Skip if too soon since last retrain
-        assert self._last_retrain_time and (now - self._last_retrain_time) < self.retrain_offset
+        if self._last_retrain_time and (now - self._last_retrain_time) < self.retrain_offset:
+            return
         
-        self.log.info(f"Starting model retrain at {now}")
+        logger.info(f"Starting model retrain at {now}")
         
         # Get updated data window
         data_dict = self._cache_to_dict(window=0)  # Get all available data
@@ -266,10 +292,12 @@ class LongShortStrategy(Strategy):
             data=data_dict,
             current_time=now,
             active_mask=self.active_mask
+            warm_start=self.strategy_params.get("warm_start", False),
+            warm_training_epochs=self.strategy_params.get("warm_training_epochs", 1)
         )
         
         self._last_retrain_time = now
-        self.log.info(f"Model retrain completed at {now}")
+        logger.info(f"Model retrain completed at {now}")
             
             
 
@@ -365,6 +393,44 @@ class LongShortStrategy(Strategy):
     # INTERNAL HELPERS
     # ================================================================= #
 
+    def _rebalance_portfolio(self, target_weights: Dict[str, float]):
+        """Rebalance portfolio to target weights."""
+        nav = self.portfolio.net_liquidation
+        
+        for symbol, target_weight in target_weights.items():
+            instrument_id = InstrumentId(Symbol(symbol), self.venue)
+            
+            # Get current position
+            position = self.portfolio.position(instrument_id)
+            current_qty = position.quantity if position else 0
+            
+            # Get current price from cache
+            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
+            bars = self.cache.bars(bar_type)
+            if not bars:
+                continue
+            
+            current_price = float(bars[-1].close)
+            
+            # Calculate target quantity
+            target_value = target_weight * nav
+            target_qty = int(target_value / current_price)
+            
+            # Calculate order quantity
+            order_qty = target_qty - current_qty
+            
+            if order_qty != 0:
+                # CHANGED: Create and submit order using Nautilus API
+                order_side = OrderSide.BUY if order_qty > 0 else OrderSide.SELL
+                order = self.order_factory.market(
+                    instrument_id=instrument_id,
+                    order_side=order_side,
+                    quantity=Quantity.from_int(abs(order_qty)),
+                )
+                self.submit_order(order)
+        return
+            
+
     def _select_universe(self):
         """Select stocks active at walk-forward start with sufficient history."""
         candidate_universe = self.loader.universe
@@ -379,20 +445,20 @@ class LongShortStrategy(Strategy):
             # Check 1: Has enough historical data before walk-forward start
             train_data = df[df.index <= self.valid_end]
             if len(train_data) < self.min_bars_required:
-                self.log.info(f"Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
+                logger.info(f"Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
                 continue
             
             # Check 2: Active at walk-forward start
             pred_window = df[(df.index > self.valid_end) ]
             if len(pred_window) < self.pred_len :
-                self.log.info(f"Skipping {ticker}: not active at walk-forward start")
+                logger.info(f"Skipping {ticker}: not active at walk-forward start")
                 continue
                 
 
                 
             selected.append(ticker)
             
-        self.log.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates")
+        logger.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates")
         self.universe = sorted(selected)
 
     def _initialize_model(self):
@@ -403,71 +469,26 @@ class LongShortStrategy(Strategy):
         if ModelClass is None:
             raise ImportError(f"Could not find model class in models.{self.model_name}")
 
-        model_params = {
-            "freq":self.cfg["freq"],
-            "feature_dim":self.cfg["feature_dim"],
-            "window_len":self.cfg["window_len"],
-            "pred_len":self.cfg["pred_len"],
-            "train_offset":self.train_offset,
-            "train_end":self.train_end,
-            "valid_end":self.valid_end,
-            "batch_size":self.cfg["training"]["batch_size"],
-            "n_epochs":self.cfg["training"]["n_epochs"],
-            "patience":self.cfg["training"]["patience"],
-            "pretrain_epochs":self.cfg["training"]["pretrain_epochs"],
-            "training_mode":self.cfg["training"]["training_mode"],
-            "close_idx":self.cfg["training"]["target_idx"],
-            "warm_start":self.cfg["training"]["warm_start"],
-            "warm_training_epochs":self.cfg["training"]["warm_training_epochs"],
-            "save_backups" : self.cfg["training"]["save_backups"],
-            "data_dir":self.cfg["data_dir"],
-            "calendar":self.cfg["calendar"]   #Equity market calendar
-        }
+        # Check if model hparam was trained already and stored so no init needed
+        if (self.model_params["model_dir"] / "init.pt").exists():
 
-        train_data = {
-            ticker: self.loader._frames[ticker][(self.loader._frames[ticker].index <= self.valid_end) & (self.loader._frames[ticker].index >= self.backtest_start) ]
-            for ticker in self.universe
-        }
+            logger.info(f"Model {self.model_name} not found in {self.model_params["model_dir"]} . Loading in process...")
+            model = ModelClass(**self.model_params)
+            state_dict = torch.load(self.model_params["model_dir"] / "init.pt", map_location=model._device)
+            self.model = model.load_state_dict(state_dict)
+            logger.info(f"Model {self.model_name} stored in {self.model_params["model_dir"]} loaded successfully")
 
         
-        days_range = self.calendar.schedule(start_date=backtest_start, end_date=valid_end)
-        timestamps = market_calendars.date_range(days_range, frequency=cfg["freq"]).normalize()
-        for ticker in test_universe:
-            if ticker in loader._frames:
-                df = loader._frames[ticker]
-                # Get data up to validation end for initial training
-                df.index = df.index.normalize()
-                sample_data[ticker] = df.reindex(timestamps).dropna()
-                print(f"  {ticker}: {len(sample_data[ticker])} bars")
-
-        model = ModelClass(**self.model_params, **trial_hparams)
-        score = model.initialize(self.data)  
-
-
-        # Initialize model with best hyperparameters. It will have new model directory and trained on train + valid set
-        final_model_params = model_params
-        final_model_params["train_end"] = self.valid_end
-        final_model_params["valid_end"] = self.valid_end
-
-        # Prepare extended training data
-        final_train_data = {
-            ticker: self.loader._frames[ticker][
-                (self.loader._frames[ticker].index >= self.backtest_start) & 
-                (self.loader._frames[ticker].index <= self.valid_end)
-            ] for ticker in self.universe
-        }
-        
-        _ , model_dir = final_tuner.optimize()
-        
-
-        # reload the model to use for walk-forward steps
-        self.model = ModelClass(**final_model_params, **best_hparams)
-
-        if (model_dir / "init.pt").exists():
-                state_dict = torch.load(model_dir / "init.pt", map_location=model._device)
-                self.model.load_state_dict(state_dict)
         else:
-            raise ImportError(f"Could not find init.pt in {model_dir}")
+            logger.info(f"Model {self.model_name} not found in {self.model_params["model_dir"]} . Starting initialization on train data ...")
+            
+            model = ModelClass(**self.model_params)
+            train_data = self._get_data(start = self.train_start , end = self.train_end)
+            model.initialize(train_data)
+            self.model = model
+
+        return
+
         
     def _cache_to_dict(self, window: int) -> Dict[str, pd.DataFrame]:
         """
@@ -487,7 +508,7 @@ class LongShortStrategy(Strategy):
                 window = self.strategy_params["engine"]["cache"]["bar_capacity"]
             bars = self.cache.bars(bar_type)[:window]  # Get last 'window' bars (nautilus cache notation is opposite to pandas)
             if not bars or len(bars) < self.min_bars_required:
-                self.log.warning(f"Insufficient bars for {iid.symbol}: {len(bars)} < {self.min_bars_required}")
+                logger.warning(f"Insufficient bars for {iid.symbol}: {len(bars)} < {self.min_bars_required}")
                 continue
             
             # ensure there is at least one new bar after the last predition
@@ -509,7 +530,7 @@ class LongShortStrategy(Strategy):
                 data_dict[iid.symbol.value] = df
 
         return data_dict 
-
+    
     # TODO: superflous. consider removing
     def _compute_active_mask(self, data_dict: Dict[str, pd.DataFrame]) -> torch.Tensor:
         """Compute mask for active instruments."""
@@ -694,7 +715,7 @@ class LongShortStrategy(Strategy):
             remainder = delta - slice_qty * (self.twap_slices - 1)
             self._submit_market_order(instrument_id, remainder)
 
-    def _submit_market_order(self, instrument_id, qty: int):  # CHANGED: New method
+    def _submit_market_order(self, instrument_id, qty: int):
         if qty == 0:
             return
         # CHANGED: Create and submit order using Nautilus API
@@ -702,7 +723,7 @@ class LongShortStrategy(Strategy):
         order = self.order_factory.market(
             instrument_id=instrument_id,
             order_side=order_side,
-            quantity=abs(qty),
+            quantity=Quantity.from_int(abs(qty)),
         )
         self.submit_order(order)
 
@@ -740,3 +761,21 @@ class LongShortStrategy(Strategy):
             if qty != 0:
                 self._submit_market_order(instrument_id, -qty)
         self.trailing_stops.clear()
+    
+    def _get_data(self, start, end) -> Dict[str, pd.DataFrame]:
+        # Create data dictionary for selected stocks
+        calendar = market_calendars.get_calendar(self.model_params["calendar"])
+        days_range = calendar.schedule(start_date=start, end_date=end)
+        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"]).normalize()
+
+        # init train+valid data
+        data = {}
+        for ticker in self.loader.universe:
+            if ticker in self.loader._frames:
+                df = self.loader._frames[ticker]
+                # Get data up to validation end for initial training
+                # TODO: this has to change in order to manage data from different timezones/market hours
+                df.index = df.index.normalize()
+                data[ticker] = df.reindex(timestamps).dropna()
+                #logger.info(f"  {ticker}: {len(data[ticker])} bars")
+        return data

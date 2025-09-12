@@ -28,12 +28,16 @@ logger = logging.getLogger(__name__)
 import pandas_market_calendars as market_calendars
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.config import BacktestDataConfig
+from nautilus_trader.config import BacktestDataConfig, CacheConfig
 from nautilus_trader.backtest.engine import BacktestEngine
+from nautilus_trader.backtest.models import FillModel
+from nautilus_trader.model.data import Bar
+from nautilus_trader.backtest.node import BacktestEngineConfig
 
 
 from algos.engine.data_loader import CsvBarLoader
-from models.utils import freq2pdoffset, yaml_safe
+from models.utils import freq2pdoffset, yaml_safe, freq2barspec
+
 
 
 class OptunaHparamsTuner:
@@ -105,7 +109,7 @@ class OptunaHparamsTuner:
         self._setup_mlflow()
         
         # Optimization Best Parameters 
-        self.best_model_params = None
+        self.best_model_params_flat = None
         self.best_model_path = None
         self.best_strategy_hparams = None
         self.results = {}
@@ -289,7 +293,7 @@ class OptunaHparamsTuner:
             
             # Get best trial
             best_trial = study.best_trial
-            self.best_model_params = best_trial.user_attrs["best_model_params_flat"]
+            self.best_model_params_flat = best_trial.user_attrs["best_model_params_flat"]
             self.best_model_path = Path(best_trial.user_attrs["model_path"])
             
             # Log best results
@@ -305,7 +309,7 @@ class OptunaHparamsTuner:
             logger.info(f"Best model hparams: {best_trial.user_attrs["best_model_hparams"]}")
         
         return {
-            "hparams": self.best_model_params,
+            "hparams": self.best_model_params_flat,
             "model_path": self.best_model_path,
         }
 
@@ -320,9 +324,26 @@ class OptunaHparamsTuner:
         logger.info("PHASE 2: STRATEGY HYPERPARAMETER OPTIMIZATION")
         logger.info(f"{'='*60}\n")
         
-        if self.best_model_params is None or self.best_model_path is None:
+        if self.best_model_params_flat is None or self.best_model_path is None:
             raise ValueError("Must run optimize_model() before optimize_strategy()")
         
+        strategy_name = self.strategy_params.get('strategy_name', 'LongShortStrategy')
+        try:
+            # Try to import from algos module
+            strategy_module = importlib.import_module(f"algos.{strategy_name}")
+            StrategyClass = getattr(strategy_module, strategy_name, None)
+            
+            if StrategyClass is None:
+                # Try without redundant naming (e.g., algos.LongShortStrategy.Strategy)
+                StrategyClass = getattr(strategy_module, "Strategy", None)
+            
+            if StrategyClass is None:
+                raise ImportError(f"Could not find strategy class in algos.{strategy_name}")
+                
+        except ImportError as e:
+            logger.error(f"Failed to import strategy {strategy_name}: {e}")
+            raise
+
         # Create MLflow experiment for strategy optimization
         with mlflow.start_run(
             run_name="Strategy_Optimization",
@@ -335,6 +356,7 @@ class OptunaHparamsTuner:
             strategy_db_path = self.run_dir / "strategy_hpo.db"
             storage = RDBStorage(f"sqlite:///{strategy_db_path}")
             
+            # TODO: ensure propoer direction depending on all the metrics
             study = optuna.create_study(
                 study_name=strategy_study_name,
                 storage=storage,
@@ -346,6 +368,9 @@ class OptunaHparamsTuner:
             # Define objective function for strategy
             def strategy_objective(trial: optuna.Trial) -> float:
                 trial_hparams = self._suggest_params(trial, self.strategy_defaults, self.strategy_search)
+
+                offset = self.best_model_params_flat["train_offset"]
+                strategy_params_flat = self._add_dates(self.strategy_params, offset ) | trial_hparams
                 
                 # Start MLflow run for this trial
                 with mlflow.start_run(
@@ -361,10 +386,10 @@ class OptunaHparamsTuner:
                     
                     # Run backtest with these strategy parameters
                     metrics = self._run_backtest(
-                        model_path=self.best_model_path,
-                        model_params=self.best_model_params,
-                        strategy_hparams=trial_hparams,
-                        trial_number=trial.number
+                        model_params_all= self.best_model_params_flat,  # type: ignore
+                        strategy_params_all = strategy_params_flat,
+                        start = strategy_params_flat["valid_start"],
+                        end = strategy_params_flat["valid_end"],
                     )
                     
                     # Log all metrics
@@ -378,7 +403,7 @@ class OptunaHparamsTuner:
                     trial.set_user_attr("metrics", metrics)
                     trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
                     
-                    logger.info(f"  Trial {trial.number}: Sharpe = {score:.4f}")
+                    logger.info(f"  Trial {trial.number}: Portfolio Return = {score:.4f}")
                     
                     return score
             
@@ -436,10 +461,10 @@ class OptunaHparamsTuner:
     
     def _run_backtest(
         self,
-        model_path: Path,
-        model_params: dict,
-        strategy_hparams: dict,
-        trial_number: int
+        model_params_all: dict,
+        strategy_params_all: dict,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
     ) -> Dict[str, float]:
         """
         Run a full backtest with given model and strategy hyperparameters.
@@ -447,62 +472,68 @@ class OptunaHparamsTuner:
         Returns:
             Dictionary of performance metrics
         """
-        # Create config with trial hyperparameters
+        
+        # init config (flat)
         config = {
-            'MODEL': {
-                'PARAMS': self.model_params.copy(),
-                'HPARAMS': {k: v for k, v in model_params.items() 
-                        if k not in self.model_params}
-            },
-            'STRATEGY': {
-                'PARAMS': self.strategy_params.copy(),
-                'HPARAMS': strategy_hparams
-            }
+            'MODEL': model_params_all ,
+            'STRATEGY': strategy_params_all ,
         }
+
         
-        # Update model path
-        config['MODEL']['PARAMS']['model_dir'] = str(model_path.parent)
-        config['MODEL']['PARAMS']['model_path'] = str(model_path)
-        config['MODEL']['PARAMS']['tune_hparams'] = False
-        
-        # Update strategy params with trial hparams (flattened for strategy)
-        strategy_config = config['STRATEGY']['PARAMS'].copy()
-        strategy_config.update(strategy_hparams)
-        
-        # Use validation period for strategy optimization
-        start = pd.Timestamp(self.strategy_params["train_start"], tz="UTC")
-        end = pd.Timestamp(self.strategy_params["valid_end"], tz="UTC")
-        
-        # Initialize BacktestEngine
+        # Train model on Train + Valid with best HP
+        # (DONE THROUGH THE STRATEGY)
+
+        # Initialize Strategy
+        strategy_name = strategy_params_all.get('strategy_name', 'LongShortStrategy')
+        try:
+            # Try to import from algos module
+            strategy_module = importlib.import_module(f"algos.{strategy_name}")
+            StrategyClass = getattr(strategy_module, strategy_name, None)
+            
+            if StrategyClass is None:
+                # Try without redundant naming (e.g., algos.LongShortStrategy.Strategy)
+                StrategyClass = getattr(strategy_module, "Strategy", None)
+            
+            if StrategyClass is None:
+                raise ImportError(f"Could not find strategy class in algos.{strategy_name}")
+
+        except ImportError as e:
+            logger.error(f"Failed to import strategy {strategy_name}: {e}")
+            raise
+
+
+        # Initialize Venue
         venue = Venue(
             name="SIM",
             book_type="L1_MBP",     # bars are inluded in L1 market-by-price
             account_type=AccountType.CASH,
-            base_currency=self.strategy_params["currency"],
-            starting_balances=str(self.strategy_params["initial_cash"])+" "+str(self.strategy_params["currency"]),
+            base_currency=strategy_params_all["currency"],
+            starting_balances=str(strategy_params_all["initial_cash"])+" "+str(strategy_params_all["currency"]),
             bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices
             )
+        
+        # Initialize BacktestEngine
         engine = BacktestEngine(
             config=BacktestEngineConfig(
-                strategies=[self.strategy_class(config=config)],
-                trader_id=f"OPT-{trial_number}",
+                strategies=[StrategyClass(config=config)],
+                trader_id=f"Backtest_{model_params_all["model_name"]}_{strategy_params_all["strategy_name"]}",
             ),
             data_configs=[
                 BacktestDataConfig(
                     catalog_path=":memory:",
                     data_cls=Bar,
-                    start_time=start,
-                    end_time=end,
-                    bar_spec=freq2barspec(self.strategy_params["freq"])
+                    start_time=pd.Timestamp.isoformat(start),
+                    end_time=pd.Timestamp.isoformat(end),
+                    bar_spec=freq2barspec(strategy_params_all["freq"]),
                 )
             ],
             venues=[venue],
             cache=CacheConfig(
-                bar_capacity=self.strategy_params.get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
+                bar_capacity=strategy_params_all.get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
             ),
             fill_model=FillModel(
-                prob_fill_on_limit=self.strategy_params.get("costs", {}).get("prob_fill_on_limit", 0.2),
-                prob_slippage=self.strategy_params.get("costs", {}).get("prob_slippage", 0.2),
+                prob_fill_on_limit=strategy_params_all.get("costs", {}).get("prob_fill_on_limit", 0.2),
+                prob_slippage=strategy_params_all.get("costs", {}).get("prob_slippage", 0.2),
                 random_seed=self.seed,
             ),
         )
@@ -523,14 +554,14 @@ class OptunaHparamsTuner:
         
         # Calculate performance metrics
         portfolio = engine.portfolio
-        account = engine.cache.account_for_venue(self.venue)
+        account = engine.cache.account_for_venue(venue)
         
         # Get equity curve for metrics calculation
         equity_curve = []
         for position_event in engine.cache.position_events():
             equity_curve.append({
                 'timestamp': position_event.ts_event,
-                'value': float(account.balance_total(currency=self.strategy_params["currency"]))
+                'value': float(account.balance_total(currency=strategy_params_all["currency"]))
             })
         
         if not equity_curve:
@@ -584,7 +615,7 @@ class OptunaHparamsTuner:
             'max_drawdown': max_drawdown,
             'win_rate': win_rate,
             'num_trades': num_trades,
-            'final_balance': float(account.balance_total(currency=self.strategy_params["currency"]))
+            'final_balance': float(account.balance_total(currency=strategy_params_all["currency"]))
         }
         
         return metrics
@@ -603,7 +634,7 @@ class OptunaHparamsTuner:
         optimized_config = self.config.copy()
         
         # Update model hyperparameters
-        for param, value in self.best_model_params.items():
+        for param, value in self.best_model_params_flat.items():
             if param in optimized_config['MODEL']['HPARAMS']:
                 optimized_config['MODEL']['HPARAMS'][param] = {
                     'default': value,
