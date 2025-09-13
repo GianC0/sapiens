@@ -209,7 +209,7 @@ class OptunaHparamsTuner:
             study = optuna.create_study(
                 study_name=model_study_name,
                 storage=storage,
-                directions='minimize',
+                direction='minimize',
                 sampler=optuna.samplers.TPESampler(seed=self.seed),
                 load_if_exists=True,
             )
@@ -465,7 +465,6 @@ class OptunaHparamsTuner:
         config = {"MODEL": self.best_model_params_flat , "STRATEGY": self.best_strategy_params_flat }
 
         return config
-
 
     def _backtest(
         self,

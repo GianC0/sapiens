@@ -229,7 +229,6 @@ class UMIModel(nn.Module):
         # mlflow.log_metric("update_timestamp", current_time.timestamp())
         # mlflow.log_artifact(str(self.model_dir / "latest.pt"))       
 
-
     def predict(self, data: Dict[str, DataFrame], current_time: pd.Timestamp, active_mask: torch.Tensor) -> Dict[str, float]:
         """
         Generate predictions for current market state.

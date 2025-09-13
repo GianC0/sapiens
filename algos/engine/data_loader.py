@@ -132,22 +132,22 @@ class CsvBarLoader:
             
             # Benchmark using S&P500
             if benchmark == "SPY":
-                self._benchmark_data = df[['sp500', 'sp500_volume']]
-                self._benchmark_data.rename(columns={"sp500": "Benchmark", 'sp500_volume': 'Volume'}, inplace=True)
-                self._benchmark_returns = df['Benchmark'].pct_change()
+                self._benchmark_data = df[['sp500', 'sp500_volume']].copy()
+                self._benchmark_data = self._benchmark_data.rename(columns={"sp500": "Benchmark", 'sp500_volume': 'Volume'})
+                self._benchmark_returns = self._benchmark_data['Benchmark'].pct_change()
             
             # Benchmark using DowJones Industrial Average
             elif benchmark == "DJIA":
-                self._benchmark_data = df[['djia', 'djia_volume']]
-                self._benchmark_data.rename(columns={"djia": "Benchmark", 'djia_volume': 'Volume'}, inplace=True)
-                self._benchmark_returns = df['sp500'].pct_change()
+                self._benchmark_data = df[['djia', 'djia_volume']].copy()
+                self._benchmark_data = self._benchmark_data.rename(columns={"djia": "Benchmark", 'djia_volume': 'Volume'})
+                self._benchmark_returns = self._benchmark_data['sp500'].pct_change()
 
             # Defaulting to S&P500
             else:
                 logger.warning(f"{benchmark} is not a valid benchmark... Using SPY instead")
-                self._benchmark_data = df[['sp500', 'sp500_volume']]
-                self._benchmark_data.rename(columns={"sp500": "Benchmark", 'sp500_volume': 'Volume'}, inplace=True)
-                self._benchmark_returns = df['Benchmark'].pct_change()
+                self._benchmark_data = df[['sp500', 'sp500_volume']].copy()
+                self._benchmark_data = self._benchmark_data.rename(columns={"sp500": "Benchmark", 'sp500_volume': 'Volume'})
+                self._benchmark_returns = self._benchmark_data['Benchmark'].pct_change()
             
             self._benchmark_data.sort_index(inplace=True)
             self._benchmark_returns.sort_index(inplace=True)
@@ -196,7 +196,8 @@ class CsvBarLoader:
         return self._instruments
 
     @property
-    def rf_series(self) -> Optional[pd.Series]:
+    def risk_free_df(self) -> Optional[pd.DataFrame]:
+        """Return DataFrame with column risk_free"""
         return self._risk_free_df
 
     def bar_iterator(self) -> Iterator[Bar]:

@@ -213,7 +213,7 @@ STRATEGY:
       default: "max_sharpe"          # maximize sharpe ratio
       optuna:
         optuna_type: categorical
-        choices: ["max_sharpe"] # , "min_variance", "equal_weight"
+        choices: ["m2"] # , "min_variance", "equal_weight", "max_sharpe", "m2"
     
     optimizer_lookback:
       default: "60B"

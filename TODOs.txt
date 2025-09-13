@@ -1,15 +1,14 @@
+strategy full implementation -> double check order_mngt and position_mngt
+NEW: Strategy → Calculates Weights → OrderManager → Creates/Submits/Manages Orders
 check TODOs wherever they are
-
 model: remove hparams from __init__ -> no hparams awarenes
-strategy full implementation
-run_backtest to properly create optimizer and backtest
-hp_optimizer to implement optim + backtest
+
 
 add pyportfolio opt and stock selection
 - move hp optimizer to top of workflow (to manage hps of model, strategy and MLflow logging)
 - research notebook to identify scope and write only relevant code
 - run backtest
 
-- genai
+- genai pdf2model
 verify tests for models
 verify autogen workflow

@@ -27,14 +27,18 @@ def create_optimizer(name: str, **kwargs):
 class PortfolioOptimizer:
     """Base class for portfolio optimizers using PyPortfolioOpt."""
     
-    def __init__(self, weight_bounds=(-1, 1), solver=None):
+    def __init__(self,  adv_lookback: int = 30, max_adv_pct: float = 0.05, weight_bounds=(-1, 1), solver=None):
         """
         Args:
             weight_bounds: tuple of (min, max) weights, default allows short selling
             solver: cvxpy solver to use (None for default)
+            adv_lookback: lookback for ADV (stored for reference; ADV series should be provided to optimize())
+            max_adv_pct: maximum fraction of ADV allowed per trade (e.g. 0.01 = 1% ADV)
         """
         self.weight_bounds = weight_bounds
         self.solver = solver
+        self.adv_lookback = adv_lookback
+        self.max_adv_pct = max_adv_pct
     
     def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
         raise NotImplementedError
@@ -44,13 +48,67 @@ class PortfolioOptimizer:
         if isinstance(weights_dict, dict):
             return np.array(list(weights_dict.values()))
         return weights_dict
+    
+    def _add_adv_constraints(self,
+                             ef: EfficientFrontier,
+                             tickers,
+                             current_weights: pd.Series,
+                             prices: pd.Series,
+                             adv_series: pd.Series,
+                             portfolio_value: float):
+        """
+        Add linear constraints |w_i - current_w_i| <= max_weight_change_i derived from ADV limits.
 
+        Parameters required:
+          - tickers: list-like in same order as mu/cov passed to EfficientFrontier
+          - current_weights: pd.Series indexed by tickers (if None assumed 0)
+          - prices: pd.Series indexed by tickers (latest price per share)
+          - adv_series: pd.Series indexed by tickers (ADV in shares)
+          - portfolio_value: float (total portfolio equity used to convert shares->weights)
+        """
+        # only add constraints if configured and inputs provided
+        if not self.max_adv_pct or self.max_adv_pct <= 0:
+            return
+
+        if any(x is None for x in (tickers, prices, adv_series, portfolio_value)):
+            logger.debug("ADV constraints not added: missing tickers/prices/adv_series/portfolio_value")
+            return
+
+        # align series to tickers and compute max weight-change per asset
+        try:
+            prices_aligned = prices.loc[tickers]
+            adv_aligned = adv_series.loc[tickers]
+            if current_weights is None:
+                current_w = pd.Series(0.0, index=tickers)
+            else:
+                current_w = current_weights.reindex(tickers).fillna(0.0)
+        except Exception as e:
+            logger.warning(f"Failed to align ADV/prices/current_weights to tickers: {e}")
+            return
+
+        # max shares per trade
+        max_shares = adv_aligned * float(self.max_adv_pct)  # shares
+        # convert to maximum weight change: (price * max_shares) / portfolio_value
+        # guard division by zero
+        if portfolio_value <= 0:
+            logger.warning("portfolio_value <= 0, skipping ADV constraints")
+            return
+
+        max_weight_change = (prices_aligned * max_shares) / float(portfolio_value)
+
+        # add linear constraints to ef (w is cvxpy variable vector, index matches tickers order)
+        for i, tick in enumerate(tickers):
+            cur_w = float(current_w.loc[tick])
+            mwc = float(max_weight_change.loc[tick])
+            # use default args in lambdas to avoid late binding issue
+            ef.add_constraint(lambda w, i=i, cur_w=cur_w, mwc=mwc: w[i] - cur_w <= mwc)
+            ef.add_constraint(lambda w, i=i, cur_w=cur_w, mwc=mwc: cur_w - w[i] <= mwc)
 
 class MaxSharpeOptimizer(PortfolioOptimizer):
     """Maximum Sharpe ratio optimizer using PyPortfolioOpt."""
     
-    def __init__(self, weight_bounds=(-1, 1), solver=None, risk_free_rate=None):
-        super().__init__(weight_bounds, solver)
+    def __init__(self, adv_lookback: int, max_adv_pct: float, weight_bounds=(-1, 1), solver=None, risk_free_rate=None,):
+        super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
         self.risk_free_rate = risk_free_rate
     
     def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0, **kwargs) -> np.ndarray:
@@ -124,14 +182,14 @@ class M2Optimizer(PortfolioOptimizer):
     M² adjusts portfolio returns to match benchmark volatility for comparison.
     """
     
-    def __init__(self, weight_bounds=(-1, 1), solver=None):
+    def __init__(self, adv_lookback: int, max_adv_pct: float, weight_bounds=(-1, 1), solver=None):
         """
         Args:
             benchmark_vol: Annualized benchmark volatility (default 15%)
             weight_bounds: Weight constraints
             solver: cvxpy solver
         """
-        super().__init__(weight_bounds, solver)
+        super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
     
     def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float, benchmark_vol: float, **kwargs) -> np.ndarray:
         """
@@ -196,14 +254,14 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
     Good for risk-averse investors.
     """
     
-    def __init__(self, risk_aversion: int = 1, weight_bounds=(-1, 1), solver=None):
+    def __init__(self, adv_lookback: int, max_adv_pct: float, risk_aversion: int = 1, weight_bounds=(-1, 1), solver=None):
         """
         Args:
             risk_aversion: Risk aversion parameter (higher = more risk averse)
             weight_bounds: Weight constraints
             solver: cvxpy solver
         """
-        super().__init__(weight_bounds, solver)
+        super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
         self.risk_aversion = risk_aversion
     
     def optimize(self, mu: np.ndarray, cov: np.ndarray, **kwargs) -> np.ndarray:
@@ -239,14 +297,14 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
     Useful for risk-targeted strategies.
     """
     
-    def __init__(self, target_volatility: float = 0.15, weight_bounds=(-1, 1), solver=None):
+    def __init__(self, adv_lookback: int, max_adv_pct: float, target_volatility: float = 0.15, weight_bounds=(-1, 1), solver=None):
         """
         Args:
             target_volatility: Target portfolio volatility
             weight_bounds: Weight constraints
             solver: cvxpy solver
         """
-        super().__init__(weight_bounds, solver)
+        super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
         self.target_volatility = target_volatility
     
     def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
@@ -276,8 +334,8 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
 class EqualWeightOptimizer(PortfolioOptimizer):
     """Simple equal weight optimizer (no optimization needed)."""
     
-    def __init__(self, **kwargs):
-        super().__init__()
+    def __init__(self, adv_lookback: int, max_adv_pct: float, **kwargs):
+        super().__init__(adv_lookback, max_adv_pct)
     
     def optimize(self, mu: np.ndarray, **kwargs) -> np.ndarray:
         """Return equal weights for all assets."""

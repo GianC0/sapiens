@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 
 from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Logger
 from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
@@ -38,13 +37,20 @@ from nautilus_trader.model.enums import OrderSide
 import torch
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.position import Position
+from nautilus_trader.model.events import (
+    OrderAccepted, OrderCanceled, OrderCancelRejected,
+    OrderDenied, OrderEmulated, OrderEvent, OrderExpired,
+    OrderFilled, OrderInitialized, OrderModifyRejected,
+    OrderPendingCancel, OrderPendingUpdate, OrderRejected,
+    OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated
+)
 
 # ----- project imports -----------------------------------------------------
 from models.interfaces import MarketModel
 from algos.engine.data_loader import CsvBarLoader, FeatureBarData
 from algos.engine.OptimizerFactory import create_optimizer
 from models.utils import freq2pdoffset, freq2barspec
-
+from algos.order_management import OrderManager
 
 
 # ========================================================================== #
@@ -142,19 +148,22 @@ class LongShortStrategy(Strategy):
         self.target_vol = self.strategy_params.get("risk_target_vol_annual", 0.15)
         self.trailing_stop_pct = self.strategy_params.get("risk_trailing_stop_pct", 0.05)
         self.drawdown_pct = self.strategy_params.get("risk_drawdown_pct", 0.15)
-        self.adv_lookback = self.strategy_params.get("liquidity", {}).get("adv_lookback", 30)
-        self.max_adv_pct = self.strategy_params.get("liquidity", {}).get("max_adv_pct", 0.05)
+        adv_lookback = self.strategy_params.get("liquidity", {}).get("adv_lookback", 30)
+        max_adv_pct = self.strategy_params.get("liquidity", {}).get("max_adv_pct", 0.05)
         self.twap_slices = self.strategy_params.get("execution", {}).get("twap", {}).get("slices", 4)
 
         # Portfolio optimizer
         # TODO: add risk_aversion config parameter for MaxQuadraticUtilityOptimizer
         # TODO: make sure to pass proper params to create_optimizer depending on the optimizer all __init__ needed by any optimizer
         optimizer_name = self.strategy_params.get("optimizer_name", "max_sharpe")
-        self.optimizer = create_optimizer(optimizer_name)
+        self.optimizer = create_optimizer(name = optimizer_name, adv_lookback = adv_lookback, max_adv_pct = max_adv_pct )
 
-        # TODO: consider sharpe ratio on (pred_ret - risk-free)  
-        # Risk-free rate series (will be loaded with data)
-        self.rf_rate = None
+        # Risk free rate dataframe to use for Sharpe Ratio
+        self.rf_rate = self.loader.risk_free_df
+
+        # Order Manager for any strategy
+        self.order_manager = OrderManager(self, self.strategy_params)
+        logger.info("OrderManager initialized")
 
 
     # ================================================================= #
@@ -165,13 +174,6 @@ class LongShortStrategy(Strategy):
 
         # Select universe based on stocks active at walk-forward start with enough history
         self._select_universe()
-
-        # Load risk-free rate from loader
-        if self.loader.rf_series is not None:
-            self.rf_rate = self.loader.rf_series
-        else:
-            logger.warning("No risk-free rate data available, using 0%")
-            self.rf_rate = pd.Series(0.0)
 
         # Subscribe to bars for selected universe
         for instrument in self.loader.instruments.values():
@@ -258,9 +260,11 @@ class LongShortStrategy(Strategy):
 
         assert preds is not None, "Model predictions are empty"
 
-        # Logic to handle orders and portfolio updates
+        # Compute new portfolio target weights for all universe stocks.
         weights = self._compute_target_weights(preds)
-        self._rebalance_portfolio(weights)
+
+        # Portolio Managerment through order manager
+        self.order_manager.rebalance_portfolio(weights, self.universe)
 
         # update last updated time
         self._last_update_time = now
@@ -317,7 +321,7 @@ class LongShortStrategy(Strategy):
         self._run_trailing_stops(sym, bar.close)  
 
         # ------------ equity / draw-down log ------------------------
-        # CHANGED: Updated portfolio access methods
+        # Updated portfolio access methods
         nav = self.portfolio.net_liquidation
         self.equity_peak_value = max(self.equity_peak_value, nav)
         self.equity_analyzer.on_equity(ts, nav)
@@ -329,7 +333,7 @@ class LongShortStrategy(Strategy):
         if sym != self.universe[0]:
             return                                                     
 
-        # CHANGED: Pass cache directly to model predict
+        # Pass cache directly to model predict
         preds = self.model.predict(self.cache)
         if not preds:
             return
@@ -337,10 +341,10 @@ class LongShortStrategy(Strategy):
         weights = self._compute_target_weights(preds)
 
         # === place orders ============================================
-        self._dispatch_orders(weights, ts)  # CHANGED: Removed await
+        self._dispatch_orders(weights, ts)  # Removed await
 
         # === realised return bookkeeping ============================
-        # CHANGED: Fixed state access
+        # Fixed state access
         prev_nav = getattr(self, '_prev_nav', nav)
         if prev_nav:
             self.realised_returns.append((nav - prev_nav) / prev_nav)
@@ -376,10 +380,105 @@ class LongShortStrategy(Strategy):
         return
     
     # ================================================================= #
-    # ORDER MANAGEMENT
+    # ORDER MANAGEMENT  -> OrderManager from order_management.py
     # ================================================================= #
 
-    # TODO: use the order_management.py file
+    def on_order(self, order: OrderEvent) -> None:
+        """Handle any order event."""
+        pass  # Base handler
+    
+    def on_order_initialized(self, event: OrderInitialized) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.on_order_initialized(event)
+    
+    def on_order_denied(self, event: OrderDenied) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.on_order_denied(event)
+    
+    def on_order_emulated(self, event: OrderEmulated) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.on_order_emulated(event)
+
+    def on_order_released(self, event: OrderReleased) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.on_order_released(event)
+    
+    def on_order_submitted(self, event: OrderSubmitted) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.on_order_submitted(event)
+
+    def on_order_accepted(self, event: OrderAccepted) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.on_order_accepted(event)
+
+    def on_order_rejected(self, event: OrderRejected) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.on_order_rejected(event)
+    
+    def on_order_canceled(self, event: OrderCanceled) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.on_order_canceled(event)
+     
+    def on_order_expired(self, event: OrderExpired) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.on_order_expired(event)
+    
+    def on_order_triggered(self, event: OrderTriggered) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.handle_order_event(event)
+
+    def on_order_pending_update(self, event: OrderPendingUpdate) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.handle_order_event(event)
+    
+    def on_order_pending_cancel(self, event: OrderPendingCancel) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.handle_order_event(event)
+    
+    def on_order_modify_rejected(self, event: OrderModifyRejected) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.handle_order_event(event)
+    
+    def on_order_cancel_rejected(self, event: OrderCancelRejected) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.handle_order_event(event)
+
+    def on_order_updated(self, event: OrderUpdated) -> None:
+        """Delegate to OrderManager."""
+        if self.order_manager:
+            self.order_manager.handle_order_event(event)
+    
+    def on_order_filled(self, event: OrderFilled) -> None:
+        """Delegate to OrderManager and update trailing stops."""
+        if self.order_manager:
+            self.order_manager.on_order_filled(event)
+        
+        # Update trailing stops for position management
+        instrument_id = event.order.instrument_id
+        position = self.portfolio.position(instrument_id)
+        if position and position.quantity != 0:
+            symbol = instrument_id.symbol.value
+            if symbol not in self.trailing_stops:
+                self.trailing_stops[symbol] = float(event.last_px)
+   
+    def on_order_event(self, event: OrderEvent) -> None:
+        """Catch-all for any unhandled order events."""
+        if self.order_manager:
+            self.order_manager.handle_order_event(event)
 
     # ================================================================= #
     # POSITION MANAGEMENT
@@ -397,42 +496,6 @@ class LongShortStrategy(Strategy):
     # INTERNAL HELPERS
     # ================================================================= #
 
-    def _rebalance_portfolio(self, target_weights: Dict[str, float]):
-        """Rebalance portfolio to target weights."""
-        nav = self.portfolio.net_liquidation
-        
-        for symbol, target_weight in target_weights.items():
-            instrument_id = InstrumentId(Symbol(symbol), self.venue)
-            
-            # Get current position
-            position = self.portfolio.position(instrument_id)
-            current_qty = position.quantity if position else 0
-            
-            # Get current price from cache
-            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
-            bars = self.cache.bars(bar_type)
-            if not bars:
-                continue
-            
-            current_price = float(bars[-1].close)
-            
-            # Calculate target quantity
-            target_value = target_weight * nav
-            target_qty = int(target_value / current_price)
-            
-            # Calculate order quantity
-            order_qty = target_qty - current_qty
-            
-            if order_qty != 0:
-                # CHANGED: Create and submit order using Nautilus API
-                order_side = OrderSide.BUY if order_qty > 0 else OrderSide.SELL
-                order = self.order_factory.market(
-                    instrument_id=instrument_id,
-                    order_side=order_side,
-                    quantity=Quantity.from_int(abs(order_qty)),
-                )
-                self.submit_order(order)
-        return
             
 
     def _select_universe(self):
@@ -557,7 +620,7 @@ class LongShortStrategy(Strategy):
         if self.loader._benchmark_data is None:
             return 0.0
         
-        df = self.loader._risk_free_df
+        df = self.rf_rate
         
         # Try exact date first
         if timestamp.normalize() in df.index:
@@ -615,6 +678,8 @@ class LongShortStrategy(Strategy):
         # Get historical returns for covariance
         returns_data = []
         valid_symbols = []
+        prices = {}      # last close per symbol
+        adv_dict = {}    # ADV shares per symbol
         
         for symbol in self.universe:
             if symbol not in preds:
@@ -628,29 +693,73 @@ class LongShortStrategy(Strategy):
                 # Calculate returns from bars
                 closes = [float(b.close) for b in bars[-self.optimizer_lookback.n:]]
                 returns = pd.Series(closes).pct_change().dropna()
-                returns_data.append(returns.values)
-                valid_symbols.append(symbol)
-        
+                if len(returns) > 0:
+                    returns_data.append(returns.values)
+                    valid_symbols.append(symbol)
+                
+                # get last price
+                prices[symbol] = float(bars[-1].close) if len(bars) > 0 else 0.0
+                
+                # compute ADV using adv_lookback bars (fallback if fewer bars available)
+                volumes = [float(b.volume) for b in bars[-self.adv_lookback:]] if bars else []
+                adv_dict[symbol] = float(np.mean(volumes)) if volumes else 0.0
+
         if len(returns_data) > 1:
             # Build covariance matrix
             returns_df = pd.DataFrame(returns_data).T
             cov = returns_df.cov().values
             
-            # Get current risk-free rate
-            current_rf = 0.0
-            if self.rf_rate is not None and len(self.rf_rate) > 0:
-                # Get most recent risk-free rate (annualized)
-                current_rf = self.rf_rate.iloc[-1] if not pd.isna(self.rf_rate.iloc[-1]) else 0.0
-            
             # Optimize with valid symbols only
             valid_mu = np.array([preds[s] for s in valid_symbols])
-            w_opt = self.optimizer.optimize(valid_mu, cov, current_rf, benchmark_vol)
             
+            # Build current_weights (try to retrieve from portfolio; fallback to zero weights)
+            try:
+                # adapt to your framework: this assumes self.positions is a dict Symbol->position with .quantity
+                # TODO: double check this about strategy
+                current_shares = pd.Series(0, index=valid_symbols, dtype=float)
+                if hasattr(self, "positions") and isinstance(self.positions, dict):
+                    for s in valid_symbols:
+                        pos = self.positions.get(s)
+                        if pos is not None:
+                            current_shares[s] = float(getattr(pos, "quantity", 0))
+                else:
+                    # fallback: try self.portfolio.positions or self.account.positions etc.
+                    current_shares = pd.Series(0, index=valid_symbols, dtype=float)
+            except Exception:
+                current_shares = pd.Series(0, index=valid_symbols, dtype=float)    
+            
+            # compute portfolio value from current shares and latest prices
+            price_series = pd.Series([prices.get(s, 0.0) for s in valid_symbols], index=valid_symbols)
+            pv = float((current_shares * price_series).sum())
+            
+            # current weights by market value (safe fallback to zeros)
+            current_weights = pd.Series(0.0, index=valid_symbols)
+            if pv > 0:
+                current_weights = (current_shares * price_series) / pv
+
+            # adv series
+            adv_series = pd.Series([adv_dict.get(s, 0.0) for s in valid_symbols], index=valid_symbols)
+
+                
+            # call optimizer and pass liquidity inputs
+            w_opt = self.optimizer.optimize(
+                valid_mu,
+                cov,
+                current_rf,
+                benchmark_vol,
+                tickers=valid_symbols,
+                prices=price_series,
+                current_weights=current_weights,
+                adv_series=adv_series,
+                portfolio_value=pv
+            )
+
             # Map back to full universe
             w = pd.Series(0.0, index=self.universe)
             for i, symbol in enumerate(valid_symbols):
                 w[symbol] = w_opt[i]
         else:
+            # No reliable data -> no trades
             # TODO: to ensure no trades are execute in case of these failures
             # TODO: it should also be notified
             return {}
@@ -676,11 +785,11 @@ class LongShortStrategy(Strategy):
         return w.to_dict()
 
     # ----- execution --------------------------------------------------
-    def _dispatch_orders(self, target_w: Dict[str, float], ts: datetime):  # CHANGED: Removed async
+    def _dispatch_orders(self, target_w: Dict[str, float], ts: datetime):  # Removed async
         nav = self.portfolio.net_liquidation
         
         for sym, target_weight in target_w.items():
-            # CHANGED: Fixed bar and position access
+            # Fixed bar and position access
             instrument_id = self.instruments[sym]
             bar = None
             for b in self.cache.bars(self._bar_type):
@@ -694,7 +803,7 @@ class LongShortStrategy(Strategy):
             price = bar.close
             target_qty = int((target_weight * nav) / price)
             
-            # CHANGED: Fixed position access
+            # Fixed position access
             position = self.portfolio.position(instrument_id)
             current_qty = position.quantity if position else 0
             delta = target_qty - current_qty
@@ -722,7 +831,7 @@ class LongShortStrategy(Strategy):
     def _submit_market_order(self, instrument_id, qty: int):
         if qty == 0:
             return
-        # CHANGED: Create and submit order using Nautilus API
+        # Create and submit order using Nautilus API
         order_side = OrderSide.BUY if qty > 0 else OrderSide.SELL
         order = self.order_factory.market(
             instrument_id=instrument_id,
@@ -731,8 +840,41 @@ class LongShortStrategy(Strategy):
         )
         self.submit_order(order)
 
+    def _apply_adv_constraint(self, instrument_id: InstrumentId, quantity: int) -> int:
+        """
+        Apply Average Daily Volume constraint to order size.
+        
+        Args:
+            instrument_id: Instrument to check
+            quantity: Desired order quantity
+            
+        Returns:
+            Constrained order quantity
+        """
+        # Get recent volume data
+        bar_type = BarType(instrument_id=instrument_id, bar_spec=self.strategy.bar_spec)
+        bars = self.strategy.cache.bars(bar_type)
+        
+        if not bars:
+            return quantity
+        
+        # Calculate ADV
+        volumes = [float(bar.volume) for bar in bars[-self.adv_lookback:]]
+        if not volumes:
+            return quantity
+        
+        adv = np.mean(volumes)
+        max_trade = int(adv * self.max_adv_pct)
+        
+        if max_trade > 0 and abs(quantity) > max_trade:
+            constrained = int(math.copysign(max_trade, quantity))
+            logger.info(f"ADV constraint applied for {instrument_id}: {quantity} -> {constrained}")
+            return constrained
+        
+        return quantity
+    
     # ----- trailing stops --------------------------------------------
-    def _run_trailing_stops(self, sym: str, price: float):  # CHANGED: Removed async
+    def _run_trailing_stops(self, sym: str, price: float):  # Removed async
         instrument_id = self.instruments[sym]
         position = self.portfolio.position(instrument_id)
         pos = position.quantity if position else 0
@@ -757,7 +899,7 @@ class LongShortStrategy(Strategy):
                 self.trailing_stops.pop(sym, None)
 
     # ----- emergency liquidate ---------------------------------------
-    def _liquidate_all(self):  # CHANGED: Removed async
+    def _liquidate_all(self):  # Removed async
         for sym in self.universe:
             instrument_id = self.instruments[sym]
             position = self.portfolio.position(instrument_id)
@@ -766,6 +908,7 @@ class LongShortStrategy(Strategy):
                 self._submit_market_order(instrument_id, -qty)
         self.trailing_stops.clear()
     
+
     def _get_data(self, start, end) -> Dict[str, pd.DataFrame]:
         # Create data dictionary for selected stocks
         calendar = market_calendars.get_calendar(self.model_params["calendar"])
