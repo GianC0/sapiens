@@ -1,3 +1,6 @@
+remove/fully implement account_type NETTING with possibility to short 
+include top_k and rebalance only
+
 strategy full implementation -> double check order_mngt and position_mngt
 NEW: Strategy → Calculates Weights → OrderManager → Creates/Submits/Manages Orders
 check TODOs wherever they are

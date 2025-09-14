@@ -1,5 +1,5 @@
 """
-Order Management Module for BacktestLongShortStrategy.
+Order Management Module for Backtest Strategies.
 Handles all order-related events and execution logic.
 """
 from __future__ import annotations

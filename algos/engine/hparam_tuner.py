@@ -333,14 +333,14 @@ class OptunaHparamsTuner:
         if self.best_model_params_flat is None or self.best_model_path is None:
             raise ValueError("Must run optimize_model() before optimize_strategy()")
         
-        strategy_name = self.strategy_params.get('strategy_name', 'LongShortStrategy')
+        strategy_name = self.strategy_params.get('strategy_name', 'TopKStrategy')
         try:
             # Try to import from algos module
             strategy_module = importlib.import_module(f"algos.{strategy_name}")
             StrategyClass = getattr(strategy_module, strategy_name, None)
             
             if StrategyClass is None:
-                # Try without redundant naming (e.g., algos.LongShortStrategy.Strategy)
+                # Try without redundant naming (e.g., algos.TopKStrategy.Strategy)
                 StrategyClass = getattr(strategy_module, "Strategy", None)
             
             if StrategyClass is None:
@@ -714,13 +714,13 @@ class OptunaHparamsTuner:
         ]
 
         # Initialize Strategy
-        strategy_name = self.strategy_params.get('strategy_name', 'LongShortStrategy')
+        strategy_name = self.strategy_params.get('strategy_name', 'TopKStrategy')
         try:
             # Try to import from algos module
             strategy_module = importlib.import_module(f"algos.{strategy_name}")
             StrategyClass = getattr(strategy_module, strategy_name, None)
             if StrategyClass is None:
-                # Try without redundant naming (e.g., algos.LongShortStrategy.Strategy)
+                # Try without redundant naming (e.g., algos.TopKStrategy.Strategy)
                 StrategyClass = getattr(strategy_module, "Strategy", None)
             if StrategyClass is None:
                 raise ImportError(f"Could not find strategy class in algos.{strategy_name}")

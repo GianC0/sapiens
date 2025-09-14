@@ -119,7 +119,8 @@ MODEL:
 STRATEGY:
   # Fixed parameters (not optimized)
   PARAMS:
-    strategy_name: "LongShortStrategy"
+    strategy_name: "TopKStrategy"
+    # Strategy Description: Computes buys top n stocks with n=portfolio size 
 
     # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
@@ -129,8 +130,8 @@ STRATEGY:
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     currency: USD
-    warm_start:      true        # Enable warm-start
-
+    warm_start:      true        # Enable warm-start                   
+    rebalance_only: false        # If false, all universe instruments are considered for top_k. If true, portoflio instruments stay the same, only nav allocation changes. 
 
     # Paths
     data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
@@ -184,6 +185,14 @@ STRATEGY:
   HPARAMS:
 
     # TODO: Risk Aversion
+    
+    # Portfolio size
+    top_k:
+      default: 2
+      optuna:
+        optuna_type: int_low-high
+        low: 2
+        high: 2
 
     # Retrain fine-tuning
     retrain_offset:
@@ -199,14 +208,6 @@ STRATEGY:
         optuna_type: int_low-high
         low: 5
         high: 20
-
-    # Portfolio selection
-    selection_top_k:
-      default: 30
-      optuna:
-        optuna_type: int_low-high
-        low: 10
-        high: 50
     
     # Optimizer settings
     optimizer_name:

@@ -56,7 +56,7 @@ from algos.order_management import OrderManager
 # ========================================================================== #
 # Strategy
 # ========================================================================== #
-class LongShortStrategy(Strategy):
+class TopKStrategy(Strategy):
     """
     Long/short equity strategy, model-agnostic & frequency-agnostic.
 
@@ -141,7 +141,7 @@ class LongShortStrategy(Strategy):
         self.trailing_stops = {}
 
         # Extract risk parameters from config
-        self.selector_k = self.strategy_params.get("selection_top_k", 30)
+        self.selector_k = self.strategy_params.get("top_k", 30)
         self.max_w_abs = self.strategy_params.get("risk_max_weight_abs", 0.03)
         self.max_w_rel = self.strategy_params.get("risk_max_weight_rel", 0.20)
         self.target_vol = self.strategy_params.get("risk_target_vol_annual", 0.15)
@@ -156,6 +156,8 @@ class LongShortStrategy(Strategy):
         # TODO: make sure to pass proper params to create_optimizer depending on the optimizer all __init__ needed by any optimizer
         optimizer_name = self.strategy_params.get("optimizer_name", "max_sharpe")
         self.optimizer = create_optimizer(name = optimizer_name, adv_lookback = adv_lookback, max_adv_pct = max_adv_pct )
+        self.rebalance_only = self.strategy_params.get("rebalance_only", False)  # Rebalance mode
+        self.top_k = self.strategy_params.get("top_k", 50)  # Portfolio size
 
         # Risk free rate dataframe to use for Sharpe Ratio
         self.rf_rate = self.loader.risk_free_df
