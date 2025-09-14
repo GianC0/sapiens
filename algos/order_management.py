@@ -19,7 +19,7 @@ from nautilus_trader.model.orders import (
     MarketOrder as MO, StopMarketOrder as SM, MarketToLimitOrder as MTL, MarketIfTouchedOrder as MIT, TrailingStopMarketOrder as TSM,
     LimitOrder as LO, StopLimitOrder as SL, LimitIfTouchedOrder as LIT, TrailingStopLimitOrder as TSL
 )
-from nautilus_trader.model.enums import OrderSide, TimeInForce, OrderStatus, OrderType, 
+from nautilus_trader.model.enums import OrderSide, TimeInForce, OrderStatus, OrderType
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.objects import Quantity, Price
@@ -192,8 +192,6 @@ class OrderManager:
             order_qty = target_qty - current_qty
             
             if order_qty != 0:
-                # Apply ADV constraints
-                order_qty = self._apply_adv_constraint(instrument_id, order_qty)
                 
                 if order_qty != 0:
                     # Execute order (with TWAP if configured)
@@ -526,8 +524,96 @@ class OrderManager:
                 callback=lambda: self._submit_twap_slice(schedule_id)
             )
     
-
-    
+    def execute_order(
+        self,
+        instrument_id: InstrumentId,
+        quantity: int,
+        order_type: Optional[str] = None,
+        use_twap: Optional[bool] = None
+    ) -> None:
+        """
+        Execute an order for the given instrument and quantity.
+        
+        Args:
+            instrument_id: Instrument to trade
+            quantity: Signed quantity (positive for buy, negative for sell)
+            order_type: Optional order type override (MARKET, LIMIT, etc.)
+            use_twap: Optional TWAP override (None = use size-based logic)
+        """
+        if quantity == 0:
+            return
+        
+        # Determine order side
+        order_side = OrderSide.BUY if quantity > 0 else OrderSide.SELL
+        abs_quantity = abs(quantity)
+        
+        # Get current market data
+        bar_type = BarType(instrument_id=instrument_id, bar_spec=self.strategy.bar_spec)
+        bars = self.strategy.cache.bars(bar_type)
+        
+        if not bars:
+            logger.warning(f"No market data for {instrument_id}, skipping order")
+            return
+        
+        last_bar = bars[-1]
+        current_price = float(last_bar.close)
+        
+        
+        # Determine if TWAP should be used
+        if use_twap is None:
+            # Use TWAP for large orders (>2% of ADV or configured threshold)
+            adv_threshold = self.max_adv_pct * 0.4  # Use TWAP if > 40% of max ADV
+            bars_for_adv = bars[-self.adv_lookback:] if len(bars) >= self.adv_lookback else bars
+            avg_volume = np.mean([float(b.volume) for b in bars_for_adv]) if bars_for_adv else 0
+            
+            use_twap = (avg_volume > 0 and abs_quantity > avg_volume * adv_threshold) and self.twap_slices > 1
+        
+        # Execute with TWAP if needed
+        if use_twap and self.twap_slices > 1:
+            logger.info(f"Executing TWAP order for {instrument_id}: {abs_quantity} units")
+            self.execute_twap(
+                instrument_id=instrument_id,
+                total_quantity=abs_quantity if order_side == OrderSide.BUY else -abs_quantity
+            )
+            return
+        
+        # Single order execution
+        order_type = order_type or ("LIMIT" if self.use_limit_orders else "MARKET")
+        
+        # Create order based on type
+        if order_type == "MARKET":
+            order = self._create_market_order(
+                instrument_id=instrument_id,
+                quantity=abs_quantity,
+                order_side=order_side
+            )
+        elif order_type == "LIMIT":
+            # Calculate limit price with offset
+            if order_side == OrderSide.BUY:
+                # For buy orders, place limit slightly above current price
+                limit_price = current_price * (1 + self.limit_order_offset_bps / 10000)
+            else:
+                # For sell orders, place limit slightly below current price
+                limit_price = current_price * (1 - self.limit_order_offset_bps / 10000)
+            
+            order = self._create_limit_order(
+                instrument_id=instrument_id,
+                quantity=abs_quantity,
+                order_side=order_side,
+                price=limit_price
+            )
+        else:
+            logger.error(f"Unsupported order type: {order_type}")
+            return
+        
+        # Submit the order
+        if order:
+            self.strategy.submit_order(order)
+            logger.info(
+                f"Submitted {order_type} {order_side.name} order for {instrument_id}: "
+                f"{abs_quantity} units at {current_price:.2f}"
+            )
+        
     # =========================================================================
     # Helper Methods
     # =========================================================================

@@ -19,7 +19,8 @@ from nautilus_trader.backtest.node import BacktestEngineConfig, BacktestRunConfi
 from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.backtest.node import BacktestNode
-
+from pathlib import Path
+from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 import pandas_market_calendars as market_calendars
 from math import exp
@@ -493,20 +494,25 @@ class OptunaHparamsTuner:
 
         # Train model on Train + Valid with best HP
         # (DONE THROUGH THE STRATEGY)
-        config = self._produce_backtest_config(config, start, end)
+        backtest_cfg = self._produce_backtest_config(config, start, end)
 
         
-        node = BacktestNode(configs=[config])
+        node = BacktestNode(configs=[backtest_cfg])
 
         
+        catalog_path = self.run_dir / "catalog"
+        catalog = ParquetDataCatalog(
+            path = catalog_path, 
+            fs_protocol="file",
+        )
         
-        # Add historical data (only validation period)
+        # Add data
         bar_count = 0
         for bar_or_feature in self.loader.bar_iterator():
             if isinstance(bar_or_feature, Bar):
                 bar_ts = pd.Timestamp(bar_or_feature.ts_event, unit='ns', tz='UTC')
                 if start <= bar_ts <= end:
-                    node.add_data(bar_or_feature)
+                    catalog.write_data(bar_or_feature)
                     bar_count += 1
         
         # Error Handling
@@ -522,10 +528,13 @@ class OptunaHparamsTuner:
             }
         
         # Run backtest
-        node.run(start=start, end=end)
+        node.run()
+
+        engine = node.get_engine(f"Backtest_{backtest_cfg["MODEL"]["model_name"]}_{backtest_cfg["STRATEGY"]["strategy_name"]}")
+        venue = Venue("SIM")
 
         # Calculate metrics using Nautilus built-in analyzer
-        metrics = self._compute_metrics(engine=node, venue=venue, strategy_params_flat=strategy_params_flat)
+        metrics = self._compute_metrics(engine=engine, venue=venue, strategy_params_flat=strategy_params_flat)
         
         node.dispose()
         
@@ -679,7 +688,6 @@ class OptunaHparamsTuner:
     
     def _produce_backtest_config(self, backtest_cfg, start, end) -> BacktestRunConfig:
 
-
         # Initialize Venue configs
         venue_configs = [
             BacktestVenueConfig(
@@ -689,7 +697,8 @@ class OptunaHparamsTuner:
                 account_type="CASH",
                 base_currency=backtest_cfg["STRATEGY"]["currency"],
                 starting_balances=[str(backtest_cfg["STRATEGY"]["initial_cash"])+" "+str(backtest_cfg["STRATEGY"]["currency"])],
-                bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices
+                bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices,
+                
             ),
         ]
 
@@ -700,7 +709,7 @@ class OptunaHparamsTuner:
                 start_time=pd.Timestamp.isoformat(start),
                 end_time=pd.Timestamp.isoformat(end),
                 bar_spec=freq2barspec(backtest_cfg["STRATEGY"]["freq"]),
-                instrument_ids = 
+                instrument_ids =  [inst.id.value for inst in self.loader.instruments.values()]
             )
         ]
 
@@ -735,60 +744,5 @@ class OptunaHparamsTuner:
                 data=data_configs,
                 venues=venue_configs,
             )
-    
-
-
-
-        
-        # Initialize BacktestEngine
-        engine = BacktestEngine(
-,
-,
-            venues=[venue],
-
-        )
-
-        
-        # Initialize BacktestEngine
-        engine = BacktestEngine(
-            config=BacktestEngineConfig(
-                strategies=[StrategyClass(config=config)],
-                trader_id=f"Backtest-{model_params_flat["model_name"]}-{strategy_params_flat["strategy_name"]}",
-            ),
-            data_configs=[
-                BacktestDataConfig(
-                    catalog_path=":memory:",
-                    data_cls=Bar,
-                    start_time=pd.Timestamp.isoformat(start),
-                    end_time=pd.Timestamp.isoformat(end),
-                    bar_spec=freq2barspec(strategy_params_flat["freq"]),
-                )
-            ],
-            #venues=[venue],
-            cache=CacheConfig(
-                bar_capacity=strategy_params_flat.get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
-            ),
-            fill_model=FillModel(
-                prob_fill_on_limit=strategy_params_flat.get("costs", {}).get("prob_fill_on_limit", 0.2),
-                prob_slippage=strategy_params_flat.get("costs", {}).get("prob_slippage", 0.2),
-                random_seed=self.seed,
-            ),
-        )
-
-                
-        engine.add_venue(
-            venue=venue,
-            book_type="L1_MBP",     #TODO: ensure to specify this in the config bars are inluded in L1 market-by-price
-            account_type=AccountType.CASH,
-            base_currency=strategy_params_flat["currency"],
-            starting_balances=str(strategy_params_flat["initial_cash"])+" "+str(strategy_params_flat["currency"]),
-            bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices
-        )
-
-        config = BacktestRunConfig(
-            engine=BacktestEngineConfig(strategies=strategies),
-            data=data_configs,
-            venues=venue_configs,
-        )
 
         return config
