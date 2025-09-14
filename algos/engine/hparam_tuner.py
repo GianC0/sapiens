@@ -15,7 +15,11 @@ from nautilus_trader.config import BacktestDataConfig, CacheConfig
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.models import FillModel
 from nautilus_trader.model.data import Bar
-from nautilus_trader.backtest.node import BacktestEngineConfig
+from nautilus_trader.backtest.node import BacktestEngineConfig, BacktestRunConfig
+from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig
+from nautilus_trader.model.enums import OmsType
+from nautilus_trader.backtest.node import BacktestNode
+
 
 import pandas_market_calendars as market_calendars
 from math import exp
@@ -29,6 +33,7 @@ from sqlalchemy import Engine
 import torch.nn as nn
 import mlflow
 from mlflow import MlflowClient
+from xlrd import Book
 import yaml
 from datetime import datetime
 import importlib
@@ -486,70 +491,14 @@ class OptunaHparamsTuner:
             'STRATEGY': strategy_params_flat ,
         }
 
-        
-
-        
         # Train model on Train + Valid with best HP
         # (DONE THROUGH THE STRATEGY)
+        config = self._produce_backtest_config(config, start, end)
 
-        # Initialize Strategy
-        strategy_name = strategy_params_flat.get('strategy_name', 'LongShortStrategy')
-        try:
-            # Try to import from algos module
-            strategy_module = importlib.import_module(f"algos.{strategy_name}")
-            StrategyClass = getattr(strategy_module, strategy_name, None)
-            
-            if StrategyClass is None:
-                # Try without redundant naming (e.g., algos.LongShortStrategy.Strategy)
-                StrategyClass = getattr(strategy_module, "Strategy", None)
-            
-            if StrategyClass is None:
-                raise ImportError(f"Could not find strategy class in algos.{strategy_name}")
-
-        except ImportError as e:
-            logger.error(f"Failed to import strategy {strategy_name}: {e}")
-            raise
-
-
-        # Initialize Venue
-        venue = Venue(
-            name="SIM",
-            book_type="L1_MBP",     # bars are inluded in L1 market-by-price
-            account_type=AccountType.CASH,
-            base_currency=strategy_params_flat["currency"],
-            starting_balances=str(strategy_params_flat["initial_cash"])+" "+str(strategy_params_flat["currency"]),
-            bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices
-            )
         
-        # Initialize BacktestEngine
-        engine = BacktestEngine(
-            config=BacktestEngineConfig(
-                strategies=[StrategyClass(config=config)],
-                trader_id=f"Backtest_{model_params_flat["model_name"]}_{strategy_params_flat["strategy_name"]}",
-            ),
-            data_configs=[
-                BacktestDataConfig(
-                    catalog_path=":memory:",
-                    data_cls=Bar,
-                    start_time=pd.Timestamp.isoformat(start),
-                    end_time=pd.Timestamp.isoformat(end),
-                    bar_spec=freq2barspec(strategy_params_flat["freq"]),
-                )
-            ],
-            venues=[venue],
-            cache=CacheConfig(
-                bar_capacity=strategy_params_flat.get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
-            ),
-            fill_model=FillModel(
-                prob_fill_on_limit=strategy_params_flat.get("costs", {}).get("prob_fill_on_limit", 0.2),
-                prob_slippage=strategy_params_flat.get("costs", {}).get("prob_slippage", 0.2),
-                random_seed=self.seed,
-            ),
-        )
+        node = BacktestNode(configs=[config])
+
         
-        # Add instruments
-        for symbol, instrument in self.loader.instruments.items():
-            engine.add_instrument(instrument)
         
         # Add historical data (only validation period)
         bar_count = 0
@@ -557,7 +506,7 @@ class OptunaHparamsTuner:
             if isinstance(bar_or_feature, Bar):
                 bar_ts = pd.Timestamp(bar_or_feature.ts_event, unit='ns', tz='UTC')
                 if start <= bar_ts <= end:
-                    engine.add_data(bar_or_feature)
+                    node.add_data(bar_or_feature)
                     bar_count += 1
         
         # Error Handling
@@ -573,12 +522,12 @@ class OptunaHparamsTuner:
             }
         
         # Run backtest
-        engine.run(start=start, end=end)
+        node.run(start=start, end=end)
 
         # Calculate metrics using Nautilus built-in analyzer
-        metrics = self._compute_metrics(engine=engine, venue=venue, strategy_params_flat=strategy_params_flat)
+        metrics = self._compute_metrics(engine=node, venue=venue, strategy_params_flat=strategy_params_flat)
         
-        engine.dispose()
+        node.dispose()
         
         return metrics
 
@@ -710,6 +659,7 @@ class OptunaHparamsTuner:
         return cfg
     
     def _get_data(self, start, end) -> Dict[str, pd.DataFrame]:
+
         # Create data dictionary for selected stocks
         calendar = market_calendars.get_calendar(self.model_params["calendar"])
         days_range = calendar.schedule(start_date=start, end_date=end)
@@ -726,3 +676,119 @@ class OptunaHparamsTuner:
                 data[ticker] = df.reindex(timestamps).dropna()
                 #logger.info(f"  {ticker}: {len(data[ticker])} bars")
         return data
+    
+    def _produce_backtest_config(self, backtest_cfg, start, end) -> BacktestRunConfig:
+
+
+        # Initialize Venue configs
+        venue_configs = [
+            BacktestVenueConfig(
+                name="SIM",
+                book_type="L1_MBP",     # bars are inluded in L1 market-by-price
+                oms_type = "NETTING",
+                account_type="CASH",
+                base_currency=backtest_cfg["STRATEGY"]["currency"],
+                starting_balances=[str(backtest_cfg["STRATEGY"]["initial_cash"])+" "+str(backtest_cfg["STRATEGY"]["currency"])],
+                bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices
+            ),
+        ]
+
+        data_configs=[
+            BacktestDataConfig(
+                catalog_path=":memory:",
+                data_cls=Bar,
+                start_time=pd.Timestamp.isoformat(start),
+                end_time=pd.Timestamp.isoformat(end),
+                bar_spec=freq2barspec(backtest_cfg["STRATEGY"]["freq"]),
+                instrument_ids = 
+            )
+        ]
+
+        # Initialize Strategy
+        strategy_name = self.strategy_params.get('strategy_name', 'LongShortStrategy')
+        try:
+            # Try to import from algos module
+            strategy_module = importlib.import_module(f"algos.{strategy_name}")
+            StrategyClass = getattr(strategy_module, strategy_name, None)
+            if StrategyClass is None:
+                # Try without redundant naming (e.g., algos.LongShortStrategy.Strategy)
+                StrategyClass = getattr(strategy_module, "Strategy", None)
+            if StrategyClass is None:
+                raise ImportError(f"Could not find strategy class in algos.{strategy_name}")
+        except ImportError as e:
+            logger.error(f"Failed to import strategy {strategy_name}: {e}")
+            raise
+        
+        config=BacktestRunConfig(
+                engine=BacktestEngineConfig(
+                    trader_id=f"Backtest_{backtest_cfg["MODEL"]["model_name"]}_{backtest_cfg["STRATEGY"]["strategy_name"]}",
+                    strategies=[StrategyClass(config=backtest_cfg["STRATEGY"])],
+                    cache=CacheConfig(
+                        bar_capacity=backtest_cfg["STRATEGY"].get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
+                    ),
+                    fill_model=FillModel(
+                        prob_fill_on_limit=backtest_cfg["STRATEGY"].get("costs", {}).get("prob_fill_on_limit", 0.2),
+                        prob_slippage=backtest_cfg["STRATEGY"].get("costs", {}).get("prob_slippage", 0.2),
+                        random_seed=self.seed,
+                    ),
+                    ),
+                data=data_configs,
+                venues=venue_configs,
+            )
+    
+
+
+
+        
+        # Initialize BacktestEngine
+        engine = BacktestEngine(
+,
+,
+            venues=[venue],
+
+        )
+
+        
+        # Initialize BacktestEngine
+        engine = BacktestEngine(
+            config=BacktestEngineConfig(
+                strategies=[StrategyClass(config=config)],
+                trader_id=f"Backtest-{model_params_flat["model_name"]}-{strategy_params_flat["strategy_name"]}",
+            ),
+            data_configs=[
+                BacktestDataConfig(
+                    catalog_path=":memory:",
+                    data_cls=Bar,
+                    start_time=pd.Timestamp.isoformat(start),
+                    end_time=pd.Timestamp.isoformat(end),
+                    bar_spec=freq2barspec(strategy_params_flat["freq"]),
+                )
+            ],
+            #venues=[venue],
+            cache=CacheConfig(
+                bar_capacity=strategy_params_flat.get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
+            ),
+            fill_model=FillModel(
+                prob_fill_on_limit=strategy_params_flat.get("costs", {}).get("prob_fill_on_limit", 0.2),
+                prob_slippage=strategy_params_flat.get("costs", {}).get("prob_slippage", 0.2),
+                random_seed=self.seed,
+            ),
+        )
+
+                
+        engine.add_venue(
+            venue=venue,
+            book_type="L1_MBP",     #TODO: ensure to specify this in the config bars are inluded in L1 market-by-price
+            account_type=AccountType.CASH,
+            base_currency=strategy_params_flat["currency"],
+            starting_balances=str(strategy_params_flat["initial_cash"])+" "+str(strategy_params_flat["currency"]),
+            bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices
+        )
+
+        config = BacktestRunConfig(
+            engine=BacktestEngineConfig(strategies=strategies),
+            data=data_configs,
+            venues=venue_configs,
+        )
+
+        return config

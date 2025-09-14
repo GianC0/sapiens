@@ -19,7 +19,7 @@ from nautilus_trader.model.orders import (
     MarketOrder as MO, StopMarketOrder as SM, MarketToLimitOrder as MTL, MarketIfTouchedOrder as MIT, TrailingStopMarketOrder as TSM,
     LimitOrder as LO, StopLimitOrder as SL, LimitIfTouchedOrder as LIT, TrailingStopLimitOrder as TSL
 )
-from nautilus_trader.model.enums import OrderSide, TimeInForce, OrderStatus, OrderType
+from nautilus_trader.model.enums import OrderSide, TimeInForce, OrderStatus, OrderType, 
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.objects import Quantity, Price
@@ -123,7 +123,7 @@ class OrderManager:
         self.twap_interval = config.get('execution', {}).get('twap', {}).get('interval_secs', 2.5)
         self.adv_lookback = config.get('liquidity', {}).get('adv_lookback', 30)
         self.max_adv_pct = config.get('liquidity', {}).get('max_adv_pct', 0.05)
-        self.timing_force = TimeInForce(config.get('execution', {}).get('timing_force', TimeInForce.DAY))
+        self.timing_force = TimeInForce[config.get('execution', {}).get('timing_force', TimeInForce.DAY)]
         self.use_limit_orders = config.get('execution', {}).get('use_limit_orders', False)
         self.limit_order_offset_bps = config.get('execution', {}).get('limit_offset_bps', 5)
         self.max_order_retries = config.get('execution', {}).get('max_retries', 3)
@@ -246,12 +246,17 @@ class OrderManager:
         """
         logger.warning("Emergency liquidation triggered")
         
+        # Close all positions abd  Unsubscribe from all data
         for symbol in symbols:
             instrument_id = InstrumentId(Symbol(symbol), self.strategy.venue)
             self.close_position(instrument_id, reason="emergency_liquidation")
+            self.strategy.unsubscribe_instrument(instrument_id = instrument_id)
         
         # Cancel all pending orders
         self.cancel_all_orders()
+        return
+        
+
 
     # =========================================================================
     # Order Event Handlers

@@ -90,10 +90,10 @@ class LongShortStrategy(Strategy):
         self.calendar = market_calendars.get_calendar(config["STRATEGY"]["calendar"])
         
         # Core timing parameters
-        self.train_start = pd.Timestamp(self.strategy_params["train_start"], tz="UTC")
-        self.train_end = pd.Timestamp(self.strategy_params["train_end"], tz="UTC")
-        self.valid_start = pd.Timestamp(self.strategy_params["valid_start"], tz="UTC")
-        self.valid_end = pd.Timestamp(self.strategy_params["valid_end"], tz="UTC")
+        self.train_start = pd.Timestamp(self.strategy_params["train_start"])
+        self.train_end = pd.Timestamp(self.strategy_params["train_end"])
+        self.valid_start = pd.Timestamp(self.strategy_params["valid_start"])
+        self.valid_end = pd.Timestamp(self.strategy_params["valid_end"])
 
         # NOT NEEDED
         #self.backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC")
@@ -136,10 +136,9 @@ class LongShortStrategy(Strategy):
 
 
         # Initialize tracking variables
-        self.equity_peak_value = 0.0    # probably should be evaluated locally
+        self.max_registered_portfolio_nav = 0.0
         self.realised_returns = []
         self.trailing_stops = {}
-        self._prev_nav = None
 
         # Extract risk parameters from config
         self.selector_k = self.strategy_params.get("selection_top_k", 30)
@@ -235,9 +234,8 @@ class LongShortStrategy(Strategy):
         
         logger.info(f"Update timer fired at {now}")
         
-        # Skip if no update needed
-        if self._last_update_time and now < (self._last_update_time + freq2pdoffset(self.strategy_params["freq"])):
-            logger.warning("WIERD STRATEGY UPDATE() CALL")
+        # Check if drowdown stop is needed
+        self._check_drowdown_stop
 
         if not self.model.is_initialized:
             logger.warning("MODEL NOT INITIALIZED WITHIN STRATEGY UPDATE() CALL")
@@ -299,7 +297,7 @@ class LongShortStrategy(Strategy):
         self.model.update(
             data=data_dict,
             current_time=now,
-            active_mask=self.active_mask
+            active_mask=self.active_mask,
             warm_start=self.strategy_params.get("warm_start", False),
             warm_training_epochs=self.strategy_params.get("warm_training_epochs", 1)
         )
@@ -317,43 +315,14 @@ class LongShortStrategy(Strategy):
         ts = bar.ts_event
         sym = bar.instrument_id.symbol
         
-        # ------------ trailing-stop maintenance ----------------------
-        self._run_trailing_stops(sym, bar.close)  
+        # ------------ trailing-stop  ----------------------
+        self._check_trailing_stop(sym, bar.close)  
 
-        # ------------ equity / draw-down log ------------------------
-        # Updated portfolio access methods
-        nav = self.portfolio.net_liquidation
-        self.equity_peak_value = max(self.equity_peak_value, nav)
-        self.equity_analyzer.on_equity(ts, nav)
-        if nav < self.equity_peak_value * (1 - self.drawdown_pct):
-            self._liquidate_all()  
-            return
+        # ------------ drawdown-stop ------------------------
+        self._check_drowdown_stop()
+        
+        return
 
-        # ------------ run rebalance once per bar time-stamp ---------
-        if sym != self.universe[0]:
-            return                                                     
-
-        # Pass cache directly to model predict
-        preds = self.model.predict(self.cache)
-        if not preds:
-            return
-               # === weights =================================================
-        weights = self._compute_target_weights(preds)
-
-        # === place orders ============================================
-        self._dispatch_orders(weights, ts)  # Removed await
-
-        # === realised return bookkeeping ============================
-        # Fixed state access
-        prev_nav = getattr(self, '_prev_nav', nav)
-        if prev_nav:
-            self.realised_returns.append((nav - prev_nav) / prev_nav)
-            if len(self.realised_returns) > 60:
-                self.realised_returns.pop(0)
-        self._prev_nav = nav
-
-        # === model upkeep ===========================================
-        self.model.update(self.cache)
 
     def on_instrument(self, instrument: Instrument) -> None:
         """Handle new instrument events."""
@@ -664,24 +633,30 @@ class LongShortStrategy(Strategy):
         """Compute target portfolio weights from predictions using optimizer."""
         
         # Convert predictions to array aligned with universe
-        mu = np.array([preds.get(s, 0.0) for s in self.universe])
         now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
-
         # Calculate current risk-free rate
         current_rf = self._get_risk_free_rate(now)
-
         # Calculate benchmark volatility
         benchmark_vol = self._get_benchmark_volatility(now)
-        
-        
+        # Calculate net asset value
+        nav = self.portfolio.net_liquidation
+        # Max % of average daily traded volume to use for weights
+        max_adv_pct = self.strategy_params.get("liquidity", {}).get("max_adv_pct", 0.05)
+        max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
+
+        # Check if we can short (margin account) or only long (cash account)
+        can_short = self.strategy_params.get("account_type", "CASH") == "MARGIN"
+
         # Calculate covariance matrix
         # Get historical returns for covariance
         returns_data = []
         valid_symbols = []
+        current_holdings = set()
         prices = {}      # last close per symbol
-        adv_dict = {}    # ADV shares per symbol
+        adv_volumes = {} # ADV shares per symbol
         
-        for symbol in self.universe:
+        # Consider the whole universe for the new stock allocation
+        for i, symbol in enumerate(self.universe):
             if symbol not in preds:
                 continue
                 
@@ -689,6 +664,10 @@ class LongShortStrategy(Strategy):
             bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
             bars = self.cache.bars(bar_type)
             
+            position = self.portfolio.position(instrument_id)
+            if position and position.quantity > 0:
+                current_holdings.add(symbol)
+
             if len(bars) > 2:
                 # Calculate returns from bars
                 closes = [float(b.close) for b in bars[-self.optimizer_lookback.n:]]
@@ -696,82 +675,88 @@ class LongShortStrategy(Strategy):
                 if len(returns) > 0:
                     returns_data.append(returns.values)
                     valid_symbols.append(symbol)
-                
-                # get last price
-                prices[symbol] = float(bars[-1].close) if len(bars) > 0 else 0.0
-                
-                # compute ADV using adv_lookback bars (fallback if fewer bars available)
-                volumes = [float(b.volume) for b in bars[-self.adv_lookback:]] if bars else []
-                adv_dict[symbol] = float(np.mean(volumes)) if volumes else 0.0
+        
+                    # get last price
+                    prices[symbol] = float(bars[-1].close) if len(bars) > 0 else 0.0
+                    
+                    # compute ADV using adv_lookback bars (fallback if fewer bars available)
+                    volumes = [float(b.volume) for b in bars[-self.adv_lookback:]] if bars else []
+                    adv_volumes[symbol] = float(np.mean(volumes)) if volumes else 0.0
+                    
+        
+        if len(returns_data) <= 1:
+            return {}  # Not enough data
+        
+        # Build covariance matrix
+        returns_df = pd.DataFrame(returns_data).T
+        cov = returns_df.cov().values
+        
+        # Optimize with valid symbols only
+        valid_mu = np.array([preds[s] for s in valid_symbols])
+         
+        max_weight_changes = np.ones(len(valid_symbols))
 
-        if len(returns_data) > 1:
-            # Build covariance matrix
-            returns_df = pd.DataFrame(returns_data).T
-            cov = returns_df.cov().values
-            
-            # Optimize with valid symbols only
-            valid_mu = np.array([preds[s] for s in valid_symbols])
-            
-            # Build current_weights (try to retrieve from portfolio; fallback to zero weights)
-            try:
-                # adapt to your framework: this assumes self.positions is a dict Symbol->position with .quantity
-                # TODO: double check this about strategy
-                current_shares = pd.Series(0, index=valid_symbols, dtype=float)
-                if hasattr(self, "positions") and isinstance(self.positions, dict):
-                    for s in valid_symbols:
-                        pos = self.positions.get(s)
-                        if pos is not None:
-                            current_shares[s] = float(getattr(pos, "quantity", 0))
-                else:
-                    # fallback: try self.portfolio.positions or self.account.positions etc.
-                    current_shares = pd.Series(0, index=valid_symbols, dtype=float)
-            except Exception:
-                current_shares = pd.Series(0, index=valid_symbols, dtype=float)    
-            
-            # compute portfolio value from current shares and latest prices
-            price_series = pd.Series([prices.get(s, 0.0) for s in valid_symbols], index=valid_symbols)
-            pv = float((current_shares * price_series).sum())
-            
-            # current weights by market value (safe fallback to zeros)
-            current_weights = pd.Series(0.0, index=valid_symbols)
-            if pv > 0:
-                current_weights = (current_shares * price_series) / pv
-
-            # adv series
-            adv_series = pd.Series([adv_dict.get(s, 0.0) for s in valid_symbols], index=valid_symbols)
-
-                
-            # call optimizer and pass liquidity inputs
-            w_opt = self.optimizer.optimize(
-                valid_mu,
-                cov,
-                current_rf,
-                benchmark_vol,
-                tickers=valid_symbols,
-                prices=price_series,
-                current_weights=current_weights,
-                adv_series=adv_series,
-                portfolio_value=pv
-            )
-
-            # Map back to full universe
-            w = pd.Series(0.0, index=self.universe)
+        if nav > 0:
             for i, symbol in enumerate(valid_symbols):
-                w[symbol] = w_opt[i]
-        else:
-            # No reliable data -> no trades
-            # TODO: to ensure no trades are execute in case of these failures
-            # TODO: it should also be notified
-            return {}
+                if adv_volumes[symbol] > 0:
+                    max_shares_tradeable = adv_volumes[symbol] * max_adv_pct
+                    max_value_tradeable = max_shares_tradeable * prices[symbol]
+                    max_weight_changes[i] = max_value_tradeable / nav
+        
+        # Call optimizer
+        w_opt = self.optimizer.optimize(
+            mu=valid_mu,
+            benchmark_vol = benchmark_vol,
+            cov=cov,
+            rf=current_rf,
+            max_weight_change=max_weight_changes
+        )
+
+        # Map back to full universe
+        w = pd.Series(0.0, index=self.universe)
+        for i, symbol in enumerate(valid_symbols):
+            w[symbol] = w_opt[i]
             
+
+        if can_short:
+            # Select top-k long and short positions
+            shorts = w.nsmallest(self.selector_k)
+            longs = w.nlargest(self.selector_k)
+            w = pd.concat([shorts, longs]).reindex(self.universe).fillna(0.0)
+        else:
+            # Cash account: only long positions or selling existing positions
+
+            # Can go long on any stock (positive weights)
+            longs = w.nlargest(self.selector_k)
+            
+            # Can only sell (go to zero) stocks we currently hold
+            potential_sells = w[w < 0].loc[list(current_holdings)]
+            sells = potential_sells.nsmallest(min(self.selector_k, len(potential_sells)))
+            
+            # Combine: long positions + zero weights for sells
+            w = pd.Series(0.0, index=self.universe)
+            w[longs.index] = longs.values
+            w[sells.index] = 0.0  # Sell to zero, not short
+            
+            # Can go long on any stock (positive weights)
+            longs = w.nlargest(self.selector_k)
+            
+            # Can only sell (go to zero) stocks we currently hold
+            potential_sells = w[w < 0].loc[list(current_holdings)]
+            sells = potential_sells.nsmallest(min(self.selector_k, len(potential_sells)))
+            
+            # Combine: long positions + zero weights for sells
+            w = pd.Series(0.0, index=self.universe)
+            w[longs.index] = longs.values
+            w[sells.index] = 0.0  # Sell to zero, not short            
         
-        # Select top-k long and short
-        shorts = w.nsmallest(self.selector_k)
-        longs = w.nlargest(self.selector_k)
-        w = pd.concat([shorts, longs]).reindex(self.universe).fillna(0.0)
+
+        # Apply position limits (only positive limits for cash accounts)
+        if can_short:
+            w = w.clip(-self.max_w_abs, self.max_w_abs)
+        else:
+            w = w.clip(0, self.max_w_abs)  # No negative weights in cash account
         
-        # Apply position limits
-        w = w.clip(-self.max_w_abs, self.max_w_abs)
         if w.abs().sum() > self.max_w_rel:
             w *= self.max_w_rel / w.abs().sum()
         
@@ -784,97 +769,9 @@ class LongShortStrategy(Strategy):
         
         return w.to_dict()
 
-    # ----- execution --------------------------------------------------
-    def _dispatch_orders(self, target_w: Dict[str, float], ts: datetime):  # Removed async
-        nav = self.portfolio.net_liquidation
-        
-        for sym, target_weight in target_w.items():
-            # Fixed bar and position access
-            instrument_id = self.instruments[sym]
-            bar = None
-            for b in self.cache.bars(self._bar_type):
-                if b.instrument_id == instrument_id:
-                    bar = b
-                    break
-            
-            if not bar or bar.close == 0:
-                continue
-                
-            price = bar.close
-            target_qty = int((target_weight * nav) / price)
-            
-            # Fixed position access
-            position = self.portfolio.position(instrument_id)
-            current_qty = position.quantity if position else 0
-            delta = target_qty - current_qty
 
-            # -------- ADV cap ----------------------------------------
-            volumes = []
-            for b in self.cache.bars(self._bar_type):
-                if b.instrument_id == instrument_id:
-                    volumes.append(b.volume)
-            volumes = volumes[-self.adv_lookback:] if volumes else [0.0]
-            
-            max_trade = int(np.mean(volumes) * self.max_adv_pct)
-            if max_trade:
-                delta = int(math.copysign(min(abs(delta), max_trade), delta))
-            if delta == 0:
-                continue
-
-            # -------- TWAP slicing -----------------------------------
-            slice_qty = int(delta / self.twap_slices)
-            for i in range(self.twap_slices - 1):
-                self._submit_market_order(instrument_id, slice_qty)
-            remainder = delta - slice_qty * (self.twap_slices - 1)
-            self._submit_market_order(instrument_id, remainder)
-
-    def _submit_market_order(self, instrument_id, qty: int):
-        if qty == 0:
-            return
-        # Create and submit order using Nautilus API
-        order_side = OrderSide.BUY if qty > 0 else OrderSide.SELL
-        order = self.order_factory.market(
-            instrument_id=instrument_id,
-            order_side=order_side,
-            quantity=Quantity.from_int(abs(qty)),
-        )
-        self.submit_order(order)
-
-    def _apply_adv_constraint(self, instrument_id: InstrumentId, quantity: int) -> int:
-        """
-        Apply Average Daily Volume constraint to order size.
-        
-        Args:
-            instrument_id: Instrument to check
-            quantity: Desired order quantity
-            
-        Returns:
-            Constrained order quantity
-        """
-        # Get recent volume data
-        bar_type = BarType(instrument_id=instrument_id, bar_spec=self.strategy.bar_spec)
-        bars = self.strategy.cache.bars(bar_type)
-        
-        if not bars:
-            return quantity
-        
-        # Calculate ADV
-        volumes = [float(bar.volume) for bar in bars[-self.adv_lookback:]]
-        if not volumes:
-            return quantity
-        
-        adv = np.mean(volumes)
-        max_trade = int(adv * self.max_adv_pct)
-        
-        if max_trade > 0 and abs(quantity) > max_trade:
-            constrained = int(math.copysign(max_trade, quantity))
-            logger.info(f"ADV constraint applied for {instrument_id}: {quantity} -> {constrained}")
-            return constrained
-        
-        return quantity
-    
-    # ----- trailing stops --------------------------------------------
-    def _run_trailing_stops(self, sym: str, price: float):  # Removed async
+    # ----- trailing and drawdown stops for risk --------------------------------------------
+    def _check_trailing_stop(self, sym: str, price: float):  # Removed async
         instrument_id = self.instruments[sym]
         position = self.portfolio.position(instrument_id)
         pos = position.quantity if position else 0
@@ -888,27 +785,26 @@ class LongShortStrategy(Strategy):
             if price > high:
                 self.trailing_stops[sym] = price
             elif price <= high * (1 - self.trailing_stop_pct):
-                self._submit_market_order(instrument_id, -pos)
+                self.order_manager.close_position(instrument_id, reason="trailing_stop")
                 self.trailing_stops.pop(sym, None)
         else:                             # short
             low = self.trailing_stops.get(sym, price)
             if price < low:
                 self.trailing_stops[sym] = price
             elif price >= low * (1 + self.trailing_stop_pct):
-                self._submit_market_order(instrument_id, -pos)
+                self.order_manager.close_position(instrument_id, reason="trailing_stop")
                 self.trailing_stops.pop(sym, None)
 
-    # ----- emergency liquidate ---------------------------------------
-    def _liquidate_all(self):  # Removed async
-        for sym in self.universe:
-            instrument_id = self.instruments[sym]
-            position = self.portfolio.position(instrument_id)
-            qty = position.quantity if position else 0
-            if qty != 0:
-                self._submit_market_order(instrument_id, -qty)
-        self.trailing_stops.clear()
-    
+    def _check_drowdown_stop(self):
+        nav = self.portfolio.net_liquidation
+        self.max_registered_portfolio_nav = max(self.max_registered_portfolio_nav, nav)
+        #self.equity_analyzer.on_equity(ts, nav)
+        
+        if nav < self.max_registered_portfolio_nav * (1 - self.drawdown_pct):
+            self.order_manager.liquidate_all(self.universe) 
 
+        return
+    
     def _get_data(self, start, end) -> Dict[str, pd.DataFrame]:
         # Create data dictionary for selected stocks
         calendar = market_calendars.get_calendar(self.model_params["calendar"])

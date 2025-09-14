@@ -49,60 +49,24 @@ class PortfolioOptimizer:
             return np.array(list(weights_dict.values()))
         return weights_dict
     
-    def _add_adv_constraints(self,
-                             ef: EfficientFrontier,
-                             tickers,
-                             current_weights: pd.Series,
-                             prices: pd.Series,
-                             adv_series: pd.Series,
-                             portfolio_value: float):
+    def _add_adv_constraints(self, ef: EfficientFrontier, max_weight_change: np.ndarray):
         """
-        Add linear constraints |w_i - current_w_i| <= max_weight_change_i derived from ADV limits.
-
-        Parameters required:
-          - tickers: list-like in same order as mu/cov passed to EfficientFrontier
-          - current_weights: pd.Series indexed by tickers (if None assumed 0)
-          - prices: pd.Series indexed by tickers (latest price per share)
-          - adv_series: pd.Series indexed by tickers (ADV in shares)
-          - portfolio_value: float (total portfolio equity used to convert shares->weights)
+        Add linear constraints |w_new - w_current| <= max_weight_change.
+        
+        Args:
+            ef: EfficientFrontier object
+            max_weight_change: Array of maximum allowed weight changes per asset
         """
-        # only add constraints if configured and inputs provided
-        if not self.max_adv_pct or self.max_adv_pct <= 0:
+        if max_weight_change is None:
             return
-
-        if any(x is None for x in (tickers, prices, adv_series, portfolio_value)):
-            logger.debug("ADV constraints not added: missing tickers/prices/adv_series/portfolio_value")
-            return
-
-        # align series to tickers and compute max weight-change per asset
-        try:
-            prices_aligned = prices.loc[tickers]
-            adv_aligned = adv_series.loc[tickers]
-            if current_weights is None:
-                current_w = pd.Series(0.0, index=tickers)
-            else:
-                current_w = current_weights.reindex(tickers).fillna(0.0)
-        except Exception as e:
-            logger.warning(f"Failed to align ADV/prices/current_weights to tickers: {e}")
-            return
-
-        # max shares per trade
-        max_shares = adv_aligned * float(self.max_adv_pct)  # shares
-        # convert to maximum weight change: (price * max_shares) / portfolio_value
-        # guard division by zero
-        if portfolio_value <= 0:
-            logger.warning("portfolio_value <= 0, skipping ADV constraints")
-            return
-
-        max_weight_change = (prices_aligned * max_shares) / float(portfolio_value)
-
-        # add linear constraints to ef (w is cvxpy variable vector, index matches tickers order)
-        for i, tick in enumerate(tickers):
-            cur_w = float(current_w.loc[tick])
-            mwc = float(max_weight_change.loc[tick])
-            # use default args in lambdas to avoid late binding issue
-            ef.add_constraint(lambda w, i=i, cur_w=cur_w, mwc=mwc: w[i] - cur_w <= mwc)
-            ef.add_constraint(lambda w, i=i, cur_w=cur_w, mwc=mwc: cur_w - w[i] <= mwc)
+        
+        # Add box constraints for each asset
+        for i, max_change in enumerate(max_weight_change):
+            if max_change > 0:  # Only add constraint if there's a limit
+                # w[i] <= w_current[i] + max_change
+                ef.add_constraint(lambda w, i=i, mc=max_change: w[i] <= mc)
+                # w[i] >= w_current[i] - max_change  
+                ef.add_constraint(lambda w, i=i, mc=max_change: w[i] >= -mc)
 
 class MaxSharpeOptimizer(PortfolioOptimizer):
     """Maximum Sharpe ratio optimizer using PyPortfolioOpt."""
@@ -111,7 +75,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
         self.risk_free_rate = risk_free_rate
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0, **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0, max_weight_change: np.ndarray = None, **kwargs) -> np.ndarray:
         """
         Find weights that maximize Sharpe ratio.
         
@@ -131,6 +95,8 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
                 weight_bounds=self.weight_bounds,
                 solver=self.solver
             )
+            # Add ADV constraints
+            self._add_adv_constraints(ef, max_weight_change)
             
             # Maximize Sharpe ratio
             weights = ef.max_sharpe(risk_free_rate=risk_free)
@@ -147,7 +113,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
 class MinVarianceOptimizer(PortfolioOptimizer):
     """Minimum variance portfolio optimizer using PyPortfolioOpt."""
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, max_weight_change: np.ndarray = None, **kwargs) -> np.ndarray:
         """
         Find minimum variance portfolio.
         
@@ -162,6 +128,9 @@ class MinVarianceOptimizer(PortfolioOptimizer):
                 weight_bounds=self.weight_bounds,
                 solver=self.solver
             )
+
+            # Add ADV constraints
+            self._add_adv_constraints(ef, max_weight_change)
             
             # Minimize volatility
             weights = ef.min_volatility()
@@ -191,7 +160,7 @@ class M2Optimizer(PortfolioOptimizer):
         """
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float, benchmark_vol: float, **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float, benchmark_vol: float, max_weight_change: np.ndarray = None, **kwargs) -> np.ndarray:
         """
         Find weights that maximize M² measure.
         
@@ -210,6 +179,9 @@ class M2Optimizer(PortfolioOptimizer):
             # Define custom M² objective
             # Since M² is monotonic with Sharpe ratio, we can maximize Sharpe
             # and then scale to match benchmark volatility
+
+            # Add ADV constraints
+            self._add_adv_constraints(ef, max_weight_change)
             
             # First get max Sharpe portfolio
             ef.max_sharpe(risk_free_rate=rf)
@@ -264,7 +236,7 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
         self.risk_aversion = risk_aversion
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, max_weight_change: np.ndarray = None, **kwargs) -> np.ndarray:
         """
         Find weights that maximize quadratic utility.
         
@@ -278,6 +250,9 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
                 weight_bounds=self.weight_bounds,
                 solver=self.solver
             )
+
+            # Add ADV constraints
+            self._add_adv_constraints(ef, max_weight_change)
             
             # Maximize quadratic utility
             weights = ef.max_quadratic_utility(risk_aversion=self.risk_aversion)
@@ -307,7 +282,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
         self.target_volatility = target_volatility
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float = 0.0, max_weight_change: np.ndarray = None) -> np.ndarray:
         """
         Find weights that maximize return for given risk level.
         """
@@ -318,6 +293,9 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
                 weight_bounds=self.weight_bounds,
                 solver=self.solver
             )
+            
+            # Add ADV constraints
+            self._add_adv_constraints(ef, max_weight_change)
             
             # Maximize return for target volatility
             weights = ef.efficient_risk(target_volatility=self.target_volatility)
@@ -337,7 +315,7 @@ class EqualWeightOptimizer(PortfolioOptimizer):
     def __init__(self, adv_lookback: int, max_adv_pct: float, **kwargs):
         super().__init__(adv_lookback, max_adv_pct)
     
-    def optimize(self, mu: np.ndarray, **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, max_weight_change: np.ndarray = None, **kwargs) -> np.ndarray:
         """Return equal weights for all assets."""
         n = len(mu)
         return np.ones(n) / n
