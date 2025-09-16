@@ -111,6 +111,7 @@ def main():
         final_metrics = tuner._backtest(
             model_params_flat = optimized_config_flat["MODEL"],
             strategy_params_flat = optimized_config_flat["STRATEGY"],
+            strategy_params_path=strategy_results["strategy_params_path"],
             start = backtest_start,
             end = backtest_end,
         )

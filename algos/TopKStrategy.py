@@ -14,6 +14,7 @@ import asyncio
 import calendar
 import importlib
 import math
+from typing import Any
 from datetime import datetime
 from pathlib import Path
 from pyexpat import model
@@ -22,9 +23,12 @@ from typing import Dict, List, Optional
 from pandas.tseries.frequencies import to_offset
 import numpy as np
 import pandas as pd
+from sklearn import frozen
+from sympy import total_degree
 import yaml
-import logging
 import pandas_market_calendars as market_calendars
+import torch
+import logging
 logger = logging.getLogger(__name__)
 
 from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Logger
@@ -34,7 +38,7 @@ from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, Instrumen
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.orders import MarketOrder
 from nautilus_trader.model.enums import OrderSide
-import torch
+from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.position import Position
 from nautilus_trader.model.events import (
@@ -54,34 +58,27 @@ from algos.order_management import OrderManager
 
 
 # ========================================================================== #
+# Strategy Config
+# ========================================================================== #
+class TopKStrategyConfig(StrategyConfig, frozen=True):
+    config = Dict[str, Any]
+
+
+# ========================================================================== #
 # Strategy
 # ========================================================================== #
 class TopKStrategy(Strategy):
     """
-    Long/short equity strategy, model-agnostic & frequency-agnostic.
-
-    YAML keys used
-    --------------
-    model_name:          umi | my_gpt_model | …
-    freq:                "1D" | "15m" | …
-    data_dir:            root folder with stocks/  bonds/
-    window_len, pred_len
-    training:            {n_epochs,…}
-    selection.top_k      (long+short per side)
-    costs.fee_bps, costs.spread_bps
-    execution.twap_slices, execution.parallel_orders
-    liquidity.adv_lookback, liquidity.max_adv_pct
-    risk.trailing_stop_pct, risk.drawdown_pct,
-         risk.max_weight_abs, risk.max_weight_rel, risk.target_vol_annual
-    optimizer.name:      max_sharpe | none
+    Long/short TopK equity strategy, model-agnostic & frequency-agnostic.
     """
 
 
     # ------------------------------------------------------------------ #
-    def __init__(self, config: dict):  
-        super().__init__()  
+    def __init__(self, nautilus_cfg: TopKStrategyConfig):  
+        super().__init__(config = nautilus_cfg)  
 
         # these are already flattend
+        config = nautilus_cfg.config
         self.strategy_params = config["STRATEGY"]
         self.model_params = config["MODEL"]
 
@@ -114,15 +111,8 @@ class TopKStrategy(Strategy):
         
         
         # Loader for data access
-        # TODO: cols to load should be extended for features added by qlib/libraries. maybe it should include feat_dim
-        cols_to_load = []
-        if self.model_params["features_to_load"] == "candles":
-            cols_to_load = ['Open', 'High', 'Low', 'Adj Close', 'Volume']
-        else:
-            raise Exception(f"FEATURES {self.model_params["features_to_load"]} NOT SUPPORTED")
-        
         loader_cfg = {k: v for k, v in self.strategy_params.items() if k in ["freq", "calendar", "data_dir", "currency"]}
-        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name="SIM", columns_to_load=cols_to_load)
+        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name="SIM", columns_to_load=self.model_params["features_to_load"], adjust=self.model_params["adjust"])
 
         # State tracking
         self.universe: List[str] = []  # Ordered list of instruments
@@ -144,7 +134,7 @@ class TopKStrategy(Strategy):
         self.selector_k = self.strategy_params.get("top_k", 30)
         self.max_w_abs = self.strategy_params.get("risk_max_weight_abs", 0.03)
         self.max_w_rel = self.strategy_params.get("risk_max_weight_rel", 0.20)
-        self.target_vol = self.strategy_params.get("risk_target_vol_annual", 0.15)
+        self.target_volatility = self.strategy_params.get("risk_target_volatility_annual", 0.05)
         self.trailing_stop_pct = self.strategy_params.get("risk_trailing_stop_pct", 0.05)
         self.drawdown_pct = self.strategy_params.get("risk_drawdown_pct", 0.15)
         adv_lookback = self.strategy_params.get("liquidity", {}).get("adv_lookback", 30)
@@ -155,7 +145,10 @@ class TopKStrategy(Strategy):
         # TODO: add risk_aversion config parameter for MaxQuadraticUtilityOptimizer
         # TODO: make sure to pass proper params to create_optimizer depending on the optimizer all __init__ needed by any optimizer
         optimizer_name = self.strategy_params.get("optimizer_name", "max_sharpe")
-        self.optimizer = create_optimizer(name = optimizer_name, adv_lookback = adv_lookback, max_adv_pct = max_adv_pct )
+        weight_bounds = (-1, 1)   # (+) = long position , (-) = short position
+        if self.strategy_params["account_type"] == "CASH":
+            weight_bounds = (0, 1)  # long-only positions
+        self.optimizer = create_optimizer(name = optimizer_name, adv_lookback = adv_lookback, max_adv_pct = max_adv_pct, weight_bounds = weight_bounds)
         self.rebalance_only = self.strategy_params.get("rebalance_only", False)  # Rebalance mode
         self.top_k = self.strategy_params.get("top_k", 50)  # Portfolio size
 
@@ -636,29 +629,48 @@ class TopKStrategy(Strategy):
         
         # Convert predictions to array aligned with universe
         now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
-        # Calculate current risk-free rate
+        # Current risk-free rate
         current_rf = self._get_risk_free_rate(now)
-        # Calculate benchmark volatility
+        # Benchmark volatility
         benchmark_vol = self._get_benchmark_volatility(now)
-        # Calculate net asset value
+        # Current portfolio net asset value
         nav = self.portfolio.net_liquidation
+
         # Max % of average daily traded volume to use for weights
-        max_adv_pct = self.strategy_params.get("liquidity", {}).get("max_adv_pct", 0.05)
-        max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
+        max_adv_pct = self.strategy_params["liquidity"]["max_adv_pct"]
+        #max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
 
         # Check if we can short (margin account) or only long (cash account)
-        can_short = self.strategy_params.get("account_type", "CASH") == "MARGIN"
+        can_short = self.strategy_params.get["account_type"] == "MARGIN"
 
-        # Calculate covariance matrix
+
+        # ASSET SELECTION: select from whole universe or only from portfolio
+        if self.strategy_params["rebalance_only"]:
+            # Only rebalance current positions
+            selected_symbols = [pos.instrument_id.symbol.value for pos in self.cache.positions_open()]
+        else:
+            # Select top-k based on predictions
+            pred_series = pd.Series(preds)
+            
+            if can_short:
+                l_n = self.selector_k // 2
+                longs = pred_series.nlargest(l_n).index.tolist()
+                shorts = pred_series.nsmallest(self.selector_k - l_n).index.tolist()
+                selected_symbols = longs + shorts
+            else:
+                selected_symbols = pred_series[pred_series > 0].nlargest(self.selector_k).index.tolist()
+        
+        
+        # MIN/MAX WEIGHT COMPUTATION + USEFULL VARS
         # Get historical returns for covariance
         returns_data = []
-        valid_symbols = []
-        current_holdings = set()
+        valid_symbols = [] # error handling
         prices = {}      # last close per symbol
         adv_volumes = {} # ADV shares per symbol
-        
-        # Consider the whole universe for the new stock allocation
-        for i, symbol in enumerate(self.universe):
+        allowed_weight_ranges = [] # min-max portfolio-relative weight for instrument computed from ADV and relative portolio contraints
+
+        # Single loop over selected symbols only
+        for symbol in selected_symbols:
             if symbol not in preds:
                 continue
                 
@@ -666,25 +678,39 @@ class TopKStrategy(Strategy):
             bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
             bars = self.cache.bars(bar_type)
             
+            if len(bars) <= 2:
+                continue
+                
+            # Get returns
+            closes = [float(b.close) for b in bars[-self.optimizer_lookback.n:]]
+            returns = pd.Series(closes).pct_change().dropna()
+            if len(returns) == 0:
+                continue
+                
+            returns_data.append(returns.values)
+            valid_symbols.append(symbol)
+            prices[symbol] = float(bars[-1].close)
+            
+            # Compute ADV and constraints
             position = self.portfolio.position(instrument_id)
-            if position and position.quantity > 0:
-                current_holdings.add(symbol)
-
-            if len(bars) > 2:
-                # Calculate returns from bars
-                closes = [float(b.close) for b in bars[-self.optimizer_lookback.n:]]
-                returns = pd.Series(closes).pct_change().dropna()
-                if len(returns) > 0:
-                    returns_data.append(returns.values)
-                    valid_symbols.append(symbol)
+            current_w = (position.quantity * prices[symbol] / nav) if position else 0.0
+            
+            volumes = [float(b.volume) for b in bars[-self.adv_lookback:]]
+            adv = float(np.mean(volumes)) if volumes else 0.0
+            max_w_relative = min((adv * max_adv_pct * prices[symbol]) / nav, self.max_w_abs) if nav > 0 else self.max_w_abs
+            
+            # Set allowed range
+            if can_short:
+                w_min = max(current_w - max_w_relative, -self.max_w_abs, self.weight_bounds[0])
+                w_max = min(current_w + max_w_relative, self.max_w_abs, self.weight_bounds[1])
+            else:
+                w_min = 0.0
+                w_max = min(current_w + max_w_relative, self.max_w_abs) if current_w > 0 else min(max_w_relative, self.max_w_abs)
+            
+            allowed_weight_ranges.append([w_min, w_max])
         
-                    # get last price
-                    prices[symbol] = float(bars[-1].close) if len(bars) > 0 else 0.0
-                    
-                    # compute ADV using adv_lookback bars (fallback if fewer bars available)
-                    volumes = [float(b.volume) for b in bars[-self.adv_lookback:]] if bars else []
-                    adv_volumes[symbol] = float(np.mean(volumes)) if volumes else 0.0
-                    
+        if len(returns_data) <= 1:
+            return {}
         
         if len(returns_data) <= 1:
             return {}  # Not enough data
@@ -696,14 +722,8 @@ class TopKStrategy(Strategy):
         # Optimize with valid symbols only
         valid_mu = np.array([preds[s] for s in valid_symbols])
          
-        max_weight_changes = np.ones(len(valid_symbols))
+        
 
-        if nav > 0:
-            for i, symbol in enumerate(valid_symbols):
-                if adv_volumes[symbol] > 0:
-                    max_shares_tradeable = adv_volumes[symbol] * max_adv_pct
-                    max_value_tradeable = max_shares_tradeable * prices[symbol]
-                    max_weight_changes[i] = max_value_tradeable / nav
         
         # Call optimizer
         w_opt = self.optimizer.optimize(
@@ -711,63 +731,13 @@ class TopKStrategy(Strategy):
             benchmark_vol = benchmark_vol,
             cov=cov,
             rf=current_rf,
-            max_weight_change=max_weight_changes
+            max_weight_change=np.array(allowed_weight_ranges)
         )
 
         # Map back to full universe
         w = pd.Series(0.0, index=self.universe)
         for i, symbol in enumerate(valid_symbols):
             w[symbol] = w_opt[i]
-            
-
-        if can_short:
-            # Select top-k long and short positions
-            shorts = w.nsmallest(self.selector_k)
-            longs = w.nlargest(self.selector_k)
-            w = pd.concat([shorts, longs]).reindex(self.universe).fillna(0.0)
-        else:
-            # Cash account: only long positions or selling existing positions
-
-            # Can go long on any stock (positive weights)
-            longs = w.nlargest(self.selector_k)
-            
-            # Can only sell (go to zero) stocks we currently hold
-            potential_sells = w[w < 0].loc[list(current_holdings)]
-            sells = potential_sells.nsmallest(min(self.selector_k, len(potential_sells)))
-            
-            # Combine: long positions + zero weights for sells
-            w = pd.Series(0.0, index=self.universe)
-            w[longs.index] = longs.values
-            w[sells.index] = 0.0  # Sell to zero, not short
-            
-            # Can go long on any stock (positive weights)
-            longs = w.nlargest(self.selector_k)
-            
-            # Can only sell (go to zero) stocks we currently hold
-            potential_sells = w[w < 0].loc[list(current_holdings)]
-            sells = potential_sells.nsmallest(min(self.selector_k, len(potential_sells)))
-            
-            # Combine: long positions + zero weights for sells
-            w = pd.Series(0.0, index=self.universe)
-            w[longs.index] = longs.values
-            w[sells.index] = 0.0  # Sell to zero, not short            
-        
-
-        # Apply position limits (only positive limits for cash accounts)
-        if can_short:
-            w = w.clip(-self.max_w_abs, self.max_w_abs)
-        else:
-            w = w.clip(0, self.max_w_abs)  # No negative weights in cash account
-        
-        if w.abs().sum() > self.max_w_rel:
-            w *= self.max_w_rel / w.abs().sum()
-        
-        # Volatility targeting
-        if len(self.realised_returns) > 20:
-            realised_vol = np.std(self.realised_returns) * np.sqrt(252)
-            if realised_vol > 0:
-                scale = min(1.5, self.target_vol / realised_vol)
-                w *= scale
         
         return w.to_dict()
 

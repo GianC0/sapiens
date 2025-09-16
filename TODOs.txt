@@ -1,6 +1,8 @@
-remove/fully implement account_type NETTING with possibility to short 
-include top_k and rebalance only
 
+
+fill_model issue in hparams to add in venue: TypeError: Unexpected keyword argument 'fill_model'
+fee model for venue
+latency_model to add as well
 strategy full implementation -> double check order_mngt and position_mngt
 NEW: Strategy → Calculates Weights → OrderManager → Creates/Submits/Manages Orders
 check TODOs wherever they are

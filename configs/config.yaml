@@ -10,10 +10,11 @@ MODEL:
     logs_dir: "logs/models/"      # Where checkpoints / logs are stored       (general)
 
     # Model architecture & Data Augmentation
-    pred_len:   1                 # H : prediction horizon (next bar)         (one-step forecast)
-    dynamic_universe_mult: 0.2    # Capacity multiplier when extenting universe: 1+univers_mult (in this case +20%)       
-    feature_dim: 5                # OHLCV + extra features for L1 market data. To be changed if higher level data is avail
-    features_to_load: "candles"   # candles = OHLCV
+    pred_len:   1                     # H : prediction horizon (next bar)         (one-step forecast)
+    dynamic_universe_mult: 0.2        # Capacity multiplier when extenting universe: 1+univers_mult (in this case +20%)       
+    feature_dim: 5                    # OHLCV + extra features for L1 market data. To be changed if higher level data is avail
+    features_to_load: "candles"       # candles = OHLCV
+    adjust: true                      # wheter to adjust OHLC based on stock splits and dividends
 
     # Training
     target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
@@ -131,8 +132,9 @@ STRATEGY:
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     currency: USD
     warm_start:      true        # Enable warm-start                   
-    rebalance_only: false        # If false, all universe instruments are considered for top_k. If true, portoflio instruments stay the same, only nav allocation changes. 
-
+    rebalance_only: false        # false = all universe instruments are considered for top_k. true = portoflio instruments stay the same, with dynamic reallocation 
+    account_type: CASH           # "CASH" = long positions only or sells. "MARGIN" can short as well
+    
     # Paths
     data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
     logs_dir: "logs/strategies/"
@@ -186,7 +188,7 @@ STRATEGY:
 
     # TODO: Risk Aversion
     
-    # Portfolio size
+    # Portfolio size (if MARGIN account: top_k/2 are short , top_k/2 are long)
     top_k:
       default: 2
       optuna:
@@ -230,12 +232,12 @@ STRATEGY:
         low: 0.02
         high: 0.10
     
-    risk_target_vol_annual:           # Volatility target (Hull, risk parity) 15 %
-      default: 0.15
-      optuna:
-        optuna_type: low-high
-        low: 0.10
-        high: 0.25
+    #risk_target_volatility_annual:           # Volatility target (Hull, risk parity) 15 % only for "efficient_risk" optimizer 
+    #  default: 0.15
+    #  optuna:
+    #    optuna_type: low-high
+    #    low: 0.05
+    #    high: 0.20
     
     risk_drawdown_pct:                # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
       default: 0.15

@@ -159,7 +159,6 @@ class TestModelInterfaceProduction:
                     'High': close * np.random.uniform(1.01, 1.05, n_bars),
                     'Low': close * np.random.uniform(0.95, 0.99, n_bars),
                     'Close': close,
-                    'Adj Close': close,  # No adjustments for simplicity
                     'Volume': np.random.randint(1e6, 1e7, n_bars)
                 }, index=dates)
                 

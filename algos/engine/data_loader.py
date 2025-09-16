@@ -74,7 +74,8 @@ class CsvBarLoader:
         venue_name: str="SIM",
         tz: str = "UTC",
         universe: Optional[List[str]] = None,
-        columns_to_load: List[str] = [],  # empty list takes all
+        columns_to_load: str = "candles", 
+        adjust: bool = False,
         benchmark: str = "SPY"
     ):
         root = Path(cfg["data_dir"])
@@ -102,12 +103,12 @@ class CsvBarLoader:
         self._frames: Dict[str, pd.DataFrame] = {}    
         self._instruments: Dict[str, Equity] = {}
         
-        for p in self._stock_files:
-            symbol = p.stem.upper()
+        for path in self._stock_files:
+            symbol = path.stem.upper()
             if symbol in self._universe:
-                df = self._parse_stock_csv(p)
-                if len(columns_to_load) > 0:
-                    available_cols = [col for col in columns_to_load if col in df.columns]
+                df = self._parse_stock_csv(path, adjust = adjust)
+                if columns_to_load == "candles":
+                    available_cols = [col for col in ["Open","High","Low","Close","Volume"] if col in df.columns]
                     self._frames[symbol] = df[available_cols]
                 else:
                     self._frames[symbol] = df
@@ -211,8 +212,7 @@ class CsvBarLoader:
         all_ts = sorted({ts for f in self._frames.values() for ts in f.index})
 
         for ts in all_ts:
-            epoch_ns = int(ts.tz_localize(self.tz).value)
-            ts_init = epoch_ns  # Use same as event time for simplicity
+            ts_init = pd.to_datetime([ts]).astype(int).item()
 
             for sym in self._universe:
                 if sym not in self._frames:
@@ -230,7 +230,7 @@ class CsvBarLoader:
                 # ---- 1) full-feature object -------------------------
                 yield FeatureBarData(
                     instrument=sym,
-                    ts_event=epoch_ns,
+                    ts_event=ts_init,
                     ts_init=ts_init,
                     features=numeric_vector,
                 )
@@ -242,40 +242,86 @@ class CsvBarLoader:
                 yield Bar(
                     bar_type=BarType(
                         instrument_id=instrument.id,
-                        bar_spec= freq2barspec(self.cfg["freq"])),
-                    instrument_id=instrument.id,
+                        bar_spec= freq2barspec(self.cfg["freq"])
+                        ),
                     open=Price.from_str(f"{_get('Open'):.2f}"),
                     high=Price.from_str(f"{_get('High'):.2f}"),
                     low=Price.from_str(f"{_get('Low'):.2f}"),
-                    close=Price.from_str(f"{_get('Adj Close'):.2f}"),  # Always use adjusted close
+                    close=Price.from_str(f"{_get('Close'):.2f}"),  # Always use adjusted close
                     volume=Quantity.from_int(int(_get('Volume'))),
-                    ts_event=epoch_ns,
+                    ts_event=ts_init,
                     ts_init=ts_init,
                 )
+    
+    def bars(self) -> List[Bar]:
+        """
+        Returns List of either FeatureBarData or Bar :
+            1. FeatureBarData   (all numeric columns)
+            2. Bar              (OHLCV with adjusted close)
+
+        They share the VERY SAME ts_event so the cache keeps them aligned.
+        """
+        all_ts = sorted({ts for f in self._frames.values() for ts in f.index})
+
+        for ts in all_ts:
+            ts_init = pd.to_datetime([ts]).astype(int).item()
+
+            for sym in self._universe:
+                if sym not in self._frames:
+                    continue
+                    
+                df = self._frames[sym]
+                if ts not in df.index:
+                    continue        # missing bar – universe padding
+
+                row = df.loc[ts]
+                numeric_vector = row.values.astype(np.float32)
+                
+                instrument = self._instruments[sym]
+
+                # ---- 1) full-feature object -------------------------
+                yield FeatureBarData(
+                    instrument=sym,
+                    ts_event=ts_init,
+                    ts_init=ts_init,
+                    features=numeric_vector,
+                )
+
+                # ---- 2) traditional Bar with ADJUSTED CLOSE ---------
+                # Always use adjusted close as the close price
+                def _get(col): return float(row[col]) if col in row else 0.0
+                
+                yield Bar(
+                    bar_type=BarType(
+                        instrument_id=instrument.id,
+                        bar_spec= freq2barspec(self.cfg["freq"])
+                        ),
+                    open=Price.from_str(f"{_get('Open'):.2f}"),
+                    high=Price.from_str(f"{_get('High'):.2f}"),
+                    low=Price.from_str(f"{_get('Low'):.2f}"),
+                    close=Price.from_str(f"{_get('Close'):.2f}"),  # Always use adjusted close
+                    volume=Quantity.from_int(int(_get('Volume'))),
+                    ts_event=ts_init,
+                    ts_init=ts_init,
+                )
+        ret
     # ------------------------------------------------------------------ #
     # parsing helpers
     # ------------------------------------------------------------------ #
-    def _parse_stock_csv(self, path: Path) -> pd.DataFrame:
+    def _parse_stock_csv(self, path: Path, adjust: bool) -> pd.DataFrame:
         df = pd.read_csv(path)
         df["Date"] = pd.to_datetime(df["Date"], utc=True)
         df.set_index("Date", inplace=True)
         df.sort_index(inplace=True)
 
-        # Ensure we have adjusted close - compute it if not present
-        cols_lc = {c.lower(): c for c in df.columns}
-        if ("adj close" in cols_lc) or ("adj_close" in cols_lc):
-            df.rename(columns={cols_lc["adj close"]: "Adj Close"}, inplace=True)
-        else:
-            df = self._compute_adj_close(df)
-
-        # Verify we have the adjusted close column
-        if "Adj Close" not in df.columns:
-            raise ValueError(f"Failed to compute adjusted close for {path.stem}")
+        # Adjust OHLC on stock splits and dividends
+        if adjust:
+            df = self._compute_adj_ohlc(df)
 
         return df.select_dtypes(include=[np.number])   # keep ALL numeric columns
 
     @staticmethod
-    def _compute_adj_close(df: pd.DataFrame) -> pd.DataFrame:
+    def _compute_adj_ohlc(df: pd.DataFrame) -> pd.DataFrame:
         df = df.sort_index().copy()
         factors = np.ones(len(df))
         div  = df.get("Dividends", pd.Series(0.0, index=df.index)).fillna(0.0)
@@ -286,7 +332,12 @@ class CsvBarLoader:
             c = df.iloc[i]["Close"]
             factor *= (1.0 - div.iat[i] / c) / (1.0 + splt.iat[i])
             factors[i] = factor
-        df["Adj Close"] = df["Close"] * factors
+        df["Open"] = df["Open"] * factors
+        df["High"] = df["High"] * factors
+        df["Low"] = df["Low"] * factors
+        df["Close"] = df["Close"] * factors
+
+
         return df
 
     @staticmethod

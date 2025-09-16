@@ -475,7 +475,7 @@ TASK: Implement '{self.model_name}' following the MarketModel interface.
    - state_dict/load_state_dict: Model persistence
 
 3. DATA HANDLING:
-   - Input: Dict[ticker, DataFrame] with columns: Open, High, Low, Close/Adj Close, Volume
+   - Input: Dict[ticker, DataFrame] with columns: Open, High, Low, Close, Volume
    - Use build_input_tensor/build_pred_tensor from models.utils
    - Handle active_mask for inactive instruments (set predictions to 0)
    - Maintain consistent universe ordering

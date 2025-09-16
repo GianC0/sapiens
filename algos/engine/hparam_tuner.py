@@ -9,6 +9,7 @@ Orchestrates two-phase hyperparameter optimization:
 Each phase gets its own Optuna study and MLflow experiment.
 """
 
+from matplotlib.pyplot import bar
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.config import BacktestDataConfig, CacheConfig
@@ -18,6 +19,7 @@ from nautilus_trader.model.data import Bar
 from nautilus_trader.backtest.node import BacktestEngineConfig, BacktestRunConfig
 from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig
 from nautilus_trader.model.enums import OmsType
+from nautilus_trader.config import ImportableStrategyConfig, LoggingConfig
 from nautilus_trader.backtest.node import BacktestNode
 from pathlib import Path
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
@@ -104,12 +106,8 @@ class OptunaHparamsTuner:
         self.seed = seed
 
         # --- Data Loader and Data Augmentation setup -------------------------------------------
-        # TODO: proper data augmentation
-        cols = []
-        if self.model_params["features_to_load"] == "candles":
-            cols = ['Open', 'High', 'Low', 'Adj Close', 'Volume']
         loader_cfg = {k: v for k, v in self.strategy_params.items() if k in ["freq", "calendar", "data_dir", "currency"]}
-        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name="SIM", columns_to_load=cols)
+        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name="SIM", columns_to_load=self.model_params["features_to_load"], adjust = self.model_params["adjust"])
         
         # Setup MLflow
         self._setup_mlflow()
@@ -129,7 +127,7 @@ class OptunaHparamsTuner:
         # Create parent experiment for this optimization run
         model_name = self.model_params.get('model_name', 'Unknown')
         strategy_name = self.strategy_params.get('strategy_name', 'Unknown')
-        exp_name = f"Backtest_{model_name}_{strategy_name}"
+        exp_name = f"Backtest-{model_name}-{strategy_name}"
         mlflow.set_experiment(exp_name)
         
         # Start parent run
@@ -388,6 +386,10 @@ class OptunaHparamsTuner:
                     parent_run_id=strategy_opt_run.info.run_id
                 ) as trial_run:
                     # Log trial parameters
+                    strategy_params_path = self.run_dir / "strategy"/ f"strategy_optimization_trial{trial.number}.yaml" # necessary for nautilus trader
+                    strategy_params_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(strategy_params_path, 'w') as f:
+                        yaml.dump(yaml_safe(strategy_params_flat), f)
                     mlflow.log_params(trial_hparams)
                     mlflow.log_param("trial_number", trial.number)
                     mlflow.log_param("phase", "strategy_optimization")
@@ -397,6 +399,7 @@ class OptunaHparamsTuner:
                     metrics = self._backtest(
                         model_params_flat= self.best_model_params_flat,  # type: ignore
                         strategy_params_flat = strategy_params_flat,
+                        strategy_params_path = strategy_params_path,
                         start = strategy_params_flat["valid_start"],
                         end = strategy_params_flat["valid_end"],
                     )
@@ -411,6 +414,7 @@ class OptunaHparamsTuner:
                     # Store trial attributes
                     trial.set_user_attr("metrics", metrics)
                     trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
+                    trial.set_system_attr("strategy_params_path", strategy_params_path)
                     
                     logger.info(f"  Trial {trial.number}: Scores = {scores:.4f}")
                     
@@ -463,6 +467,7 @@ class OptunaHparamsTuner:
             mlflow.log_artifact(str(results_path))
         
         return {
+            "strategy_params_path": best_trial.user_attrs.get("strategy_params_path"),
             "hparams": best_trial.params,
             "metrics": best_trial.user_attrs.get("metrics", {})
         }
@@ -476,6 +481,7 @@ class OptunaHparamsTuner:
         self,
         model_params_flat: dict,
         strategy_params_flat: dict,
+        strategy_params_path: Path,
         start: pd.Timestamp,
         end: pd.Timestamp,
         ) -> Dict[str, float]:
@@ -494,7 +500,7 @@ class OptunaHparamsTuner:
 
         # Train model on Train + Valid with best HP
         # (DONE THROUGH THE STRATEGY)
-        backtest_cfg = self._produce_backtest_config(config, start, end)
+        backtest_cfg = self._produce_backtest_config(config, strategy_params_path, start, end)
 
         
         node = BacktestNode(configs=[backtest_cfg])
@@ -507,16 +513,15 @@ class OptunaHparamsTuner:
         )
         
         # Add data
-        bar_count = 0
+        bars = []
         for bar_or_feature in self.loader.bar_iterator():
             if isinstance(bar_or_feature, Bar):
                 bar_ts = pd.Timestamp(bar_or_feature.ts_event, unit='ns', tz='UTC')
                 if start <= bar_ts <= end:
-                    catalog.write_data(bar_or_feature)
-                    bar_count += 1
+                    bars.append(bar_or_feature)
         
         # Error Handling
-        if bar_count == 0:
+        if len(bars) == 0:
             logger.warning(f"No bars found in period {start} to {end}")
             return {
                 'sharpe_ratio': 0.0,
@@ -527,10 +532,12 @@ class OptunaHparamsTuner:
                 'total_return': 0.0,
             }
         
+        catalog.write_data(bars)
+
         # Run backtest
         node.run()
 
-        engine = node.get_engine(f"Backtest_{backtest_cfg["MODEL"]["model_name"]}_{backtest_cfg["STRATEGY"]["strategy_name"]}")
+        engine = node.get_engine(f"Backtest-{config["MODEL"]["model_name"]}-{config["STRATEGY"]["strategy_name"]}")
         venue = Venue("SIM")
 
         # Calculate metrics using Nautilus built-in analyzer
@@ -686,15 +693,15 @@ class OptunaHparamsTuner:
                 #logger.info(f"  {ticker}: {len(data[ticker])} bars")
         return data
     
-    def _produce_backtest_config(self, backtest_cfg, start, end) -> BacktestRunConfig:
+    def _produce_backtest_config(self, backtest_cfg, strategy_params_path, start, end) -> BacktestRunConfig:
 
         # Initialize Venue configs
         venue_configs = [
             BacktestVenueConfig(
                 name="SIM",
-                book_type="L1_MBP",     # bars are inluded in L1 market-by-price
-                oms_type = "NETTING",
-                account_type="CASH",
+                book_type="L1_MBP",         # bars are inluded in L1 market-by-price
+                oms_type = "UNSPECIFIED",
+                account_type=backtest_cfg["STRATEGY"]["account_type"],
                 base_currency=backtest_cfg["STRATEGY"]["currency"],
                 starting_balances=[str(backtest_cfg["STRATEGY"]["initial_cash"])+" "+str(backtest_cfg["STRATEGY"]["currency"])],
                 bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices,
@@ -727,19 +734,25 @@ class OptunaHparamsTuner:
         except ImportError as e:
             logger.error(f"Failed to import strategy {strategy_name}: {e}")
             raise
-        
+        #strategy = StrategyClass(config=backtest_cfg)
         config=BacktestRunConfig(
                 engine=BacktestEngineConfig(
-                    trader_id=f"Backtest_{backtest_cfg["MODEL"]["model_name"]}_{backtest_cfg["STRATEGY"]["strategy_name"]}",
-                    strategies=[StrategyClass(config=backtest_cfg["STRATEGY"])],
+                    trader_id=f"Backtest-{backtest_cfg["MODEL"]["model_name"]}-{backtest_cfg["STRATEGY"]["strategy_name"]}",
+                    strategies=[ImportableStrategyConfig(
+                        strategy_path=f"algos:{strategy_name}",
+                        config_path = str(strategy_params_path),
+                        config = yaml_safe(backtest_cfg),
+                    )],
                     cache=CacheConfig(
                         bar_capacity=backtest_cfg["STRATEGY"].get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
-                    ),
-                    fill_model=FillModel(
-                        prob_fill_on_limit=backtest_cfg["STRATEGY"].get("costs", {}).get("prob_fill_on_limit", 0.2),
-                        prob_slippage=backtest_cfg["STRATEGY"].get("costs", {}).get("prob_slippage", 0.2),
-                        random_seed=self.seed,
-                    ),
+                        ),
+                    logging=LoggingConfig(log_level="ERROR"),
+                    # TODO: fix fill model issue
+                    #fill_model=FillModel(
+                    #    prob_fill_on_limit=backtest_cfg["STRATEGY"].get("costs", {}).get("prob_fill_on_limit", 0.2),
+                    #    prob_slippage=backtest_cfg["STRATEGY"].get("costs", {}).get("prob_slippage", 0.2),
+                    #    random_seed=self.seed,
+                    #    ),
                     ),
                 data=data_configs,
                 venues=venue_configs,
