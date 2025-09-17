@@ -739,14 +739,14 @@ class OptunaHparamsTuner:
                 engine=BacktestEngineConfig(
                     trader_id=f"Backtest-{backtest_cfg["MODEL"]["model_name"]}-{backtest_cfg["STRATEGY"]["strategy_name"]}",
                     strategies=[ImportableStrategyConfig(
-                        strategy_path=f"algos:{strategy_name}",
-                        config_path = str(strategy_params_path),
+                        strategy_path=f"algos.{strategy_name}:{strategy_name}",
+                        config_path = f"algos.{strategy_name}:{strategy_name}Config",
                         config = yaml_safe(backtest_cfg),
                     )],
                     cache=CacheConfig(
                         bar_capacity=backtest_cfg["STRATEGY"].get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
                         ),
-                    logging=LoggingConfig(log_level="ERROR"),
+                    logging=LoggingConfig(log_level="INFO"),
                     # TODO: fix fill model issue
                     #fill_model=FillModel(
                     #    prob_fill_on_limit=backtest_cfg["STRATEGY"].get("costs", {}).get("prob_fill_on_limit", 0.2),

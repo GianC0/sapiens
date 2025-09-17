@@ -27,7 +27,7 @@ MODEL:
 
     # Hyperparameter tuning settings
     tune_hparams:    true        # Use Optuna Bayesian search.            
-    n_trials:        4           # Optuna trials for each run. Used only if tune_hparams is true
+    n_trials:        1           # Optuna trials for each run. Used only if tune_hparams is true
 
   # Default hyper-parameters defined by model are overwritten by this Optuna configuration
   HPARAMS:  # optuna_type: "categorical", low-high (assumed float), int_low-high, log_low-high

@@ -28,8 +28,9 @@ from sympy import total_degree
 import yaml
 import pandas_market_calendars as market_calendars
 import torch
+from dataclasses import dataclass, field
 import logging
-logger = logging.getLogger(__name__)
+#logger = logging.getLogger(__name__)
 
 from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Logger
 from nautilus_trader.trading.strategy import Strategy
@@ -60,8 +61,9 @@ from algos.order_management import OrderManager
 # ========================================================================== #
 # Strategy Config
 # ========================================================================== #
+
 class TopKStrategyConfig(StrategyConfig, frozen=True):
-    config = Dict[str, Any]
+    config : Dict[str, Any] = field(default_factory=dict) 
 
 
 # ========================================================================== #
@@ -74,17 +76,23 @@ class TopKStrategy(Strategy):
 
 
     # ------------------------------------------------------------------ #
-    def __init__(self, nautilus_cfg: TopKStrategyConfig):  
-        super().__init__(config = nautilus_cfg)  
+    def __init__(self, config: TopKStrategyConfig):  
+        super().__init__()  
 
-        # these are already flattend
-        config = nautilus_cfg.config
-        self.strategy_params = config["STRATEGY"]
-        self.model_params = config["MODEL"]
+        # quick & dirty: allow passing in either a plain dict or a StrategyConfig
+        #if isinstance(nautilus_cfg, dict):
+            # wrap dict into the expected StrategyConfig dataclass
+        #    nautilus_cfg = TopKStrategyConfig(config=nautilus_cfg)
+
+        # use the inner dict consistently
+        cfg = getattr(config, "config", {})
+
+        self.strategy_params = cfg.STRATEGY#["STRATEGY"]
+        self.model_params = cfg.MODEL #["MODEL"]
 
         
 
-        self.calendar = market_calendars.get_calendar(config["STRATEGY"]["calendar"])
+        self.calendar = market_calendars.get_calendar(cfg["STRATEGY"]["calendar"])
         
         # Core timing parameters
         self.train_start = pd.Timestamp(self.strategy_params["train_start"])
@@ -157,7 +165,7 @@ class TopKStrategy(Strategy):
 
         # Order Manager for any strategy
         self.order_manager = OrderManager(self, self.strategy_params)
-        logger.info("OrderManager initialized")
+        self.logger.info("OrderManager initialized")
 
 
     # ================================================================= #
@@ -224,24 +232,24 @@ class TopKStrategy(Strategy):
 
         # Skip if no update needed
         if self._last_update_time and now < (self._last_update_time + freq2pdoffset(self.strategy_params["freq"])):
-            logger.warning("WIERD STRATEGY UPDATE() CALL")
+            self.logger.warning("WIERD STRATEGY UPDATE() CALL")
             return
         
-        logger.info(f"Update timer fired at {now}")
+        self.logger.info(f"Update timer fired at {now}")
         
         # Check if drowdown stop is needed
         self._check_drowdown_stop
 
         if not self.model.is_initialized:
-            logger.warning("MODEL NOT INITIALIZED WITHIN STRATEGY UPDATE() CALL")
+            self.logger.warning("MODEL NOT INITIALIZED WITHIN STRATEGY UPDATE() CALL")
             return
         
-        assert self.model.is_initialized()
+        assert self.model.is_initialized
 
         data_dict = self._cache_to_dict(window=(self.model.L + 1)) # TODO: make it more generic for all models.
 
         if not data_dict:
-            logger.warning("DATA DICTIONARY EMPTY WITHIN STRATEGY UPDATE() CALL")
+            self.logger.warning("DATA DICTIONARY EMPTY WITHIN STRATEGY UPDATE() CALL")
             return
         
         # TODO: superflous. consider removing compute active mask
@@ -278,7 +286,7 @@ class TopKStrategy(Strategy):
         if self._last_retrain_time and (now - self._last_retrain_time) < self.retrain_offset:
             return
         
-        logger.info(f"Starting model retrain at {now}")
+        self.logger.info(f"Starting model retrain at {now}")
         
         # Get updated data window
         data_dict = self._cache_to_dict(window=0)  # Get all available data
@@ -298,7 +306,7 @@ class TopKStrategy(Strategy):
         )
         
         self._last_retrain_time = now
-        logger.info(f"Model retrain completed at {now}")
+        self.logger.info(f"Model retrain completed at {now}")
             
             
 
@@ -476,20 +484,20 @@ class TopKStrategy(Strategy):
             # Check 1: Has enough historical data before walk-forward start
             train_data = df[df.index <= self.valid_end]
             if len(train_data) < self.min_bars_required:
-                logger.info(f"Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
+                self.logger.info(f"Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
                 continue
             
             # Check 2: Active at walk-forward start
             pred_window = df[(df.index > self.valid_end) ]
             if len(pred_window) < self.pred_len :
-                logger.info(f"Skipping {ticker}: not active at walk-forward start")
+                self.logger.info(f"Skipping {ticker}: not active at walk-forward start")
                 continue
                 
 
                 
             selected.append(ticker)
             
-        logger.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates")
+        self.logger.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates")
         self.universe = sorted(selected)
 
     def _initialize_model(self):
@@ -503,15 +511,15 @@ class TopKStrategy(Strategy):
         # Check if model hparam was trained already and stored so no init needed
         if (self.model_params["model_dir"] / "init.pt").exists():
 
-            logger.info(f"Model {self.model_name} not found in {self.model_params["model_dir"]} . Loading in process...")
+            self.logger.info(f"Model {self.model_name} not found in {self.model_params["model_dir"]} . Loading in process...")
             model = ModelClass(**self.model_params)
             state_dict = torch.load(self.model_params["model_dir"] / "init.pt", map_location=model._device)
             self.model = model.load_state_dict(state_dict)
-            logger.info(f"Model {self.model_name} stored in {self.model_params["model_dir"]} loaded successfully")
+            self.logger.info(f"Model {self.model_name} stored in {self.model_params["model_dir"]} loaded successfully")
 
         
         else:
-            logger.info(f"Model {self.model_name} not found in {self.model_params["model_dir"]} . Starting initialization on train data ...")
+            self.logger.info(f"Model {self.model_name} not found in {self.model_params["model_dir"]} . Starting initialization on train data ...")
             
             model = ModelClass(**self.model_params)
             train_data = self._get_data(start = self.train_start , end = self.train_end)
@@ -539,7 +547,7 @@ class TopKStrategy(Strategy):
                 window = self.strategy_params["engine"]["cache"]["bar_capacity"]
             bars = self.cache.bars(bar_type)[:window]  # Get last 'window' bars (nautilus cache notation is opposite to pandas)
             if not bars or len(bars) < self.min_bars_required:
-                logger.warning(f"Insufficient bars for {iid.symbol}: {len(bars)} < {self.min_bars_required}")
+                self.logger.warning(f"Insufficient bars for {iid.symbol}: {len(bars)} < {self.min_bars_required}")
                 continue
             
             # ensure there is at least one new bar after the last predition
@@ -792,5 +800,5 @@ class TopKStrategy(Strategy):
                 # TODO: this has to change in order to manage data from different timezones/market hours
                 df.index = df.index.normalize()
                 data[ticker] = df.reindex(timestamps).dropna()
-                #logger.info(f"  {ticker}: {len(data[ticker])} bars")
+                #self.logger.info(f"  {ticker}: {len(data[ticker])} bars")
         return data
