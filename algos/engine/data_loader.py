@@ -80,6 +80,7 @@ class CsvBarLoader:
     ):
         root = Path(cfg["data_dir"])
         freq = cfg["freq"]
+        
         self._root = Path(root).expanduser().resolve()
         if not self._root.is_dir():
             raise FileNotFoundError(self._root)

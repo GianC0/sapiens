@@ -92,7 +92,7 @@ class UMIModel(nn.Module):
         self.n_epochs       = n_epochs                                                             # number of epochs for training
         self.pretrain_epochs = pretrain_epochs                                                     # epochs for Stage-1 pre-training (hybrid mode)
         self.training_mode = training_mode                                                         # "hybrid" or "sequential"
-        self.model_dir =  model_dir                                                                # model directory with timestamp and hparams
+        self.model_dir =  Path(model_dir)                                                                # model directory with timestamp and hparams
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
         # stock universe

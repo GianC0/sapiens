@@ -198,10 +198,10 @@ STRATEGY:
 
     # Retrain fine-tuning
     retrain_offset:
-      default: "30B"                    # B = business day
+      default: "30D"                    # D = Day
       optuna:
         optuna_type: "categorical"
-        choices: ["7B", "14B", "30B", "60B"]
+        choices: ["7D", "14D", "30D", "60D"]
     
     # Light fine-tune epochs
     warm_training_epochs:      

@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Any
 from collections import defaultdict
 import numpy as np
 from datetime import datetime, timedelta
+from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
     OrderDenied, OrderEmulated, OrderEvent, OrderExpired,
@@ -222,18 +223,18 @@ class OrderManager:
             logger.info(f"Position change for {instrument_id}: {current_qty} -> {target_quantity} ({reason})")
             self.execute_order(instrument_id, order_qty)
     
-    def close_position(self, instrument_id: InstrumentId, reason: str = "close") -> None:
+    def close_position(self, instrument: Instrument, reason: str = "close") -> None:
         """
         Close a position completely.
         
         Args:
-            instrument_id: Instrument to close
+            instrument: Instrument to close
             reason: Reason for closing (stop_loss, trailing_stop, etc.)
         """
-        position = self.strategy.portfolio.position(instrument_id)
+        position = self.strategy.portfolio.analyzer.net_position(instrument)
         if position and position.quantity != 0:
-            logger.info(f"Closing position {instrument_id}: {position.quantity} units ({reason})")
-            self.execute_order(instrument_id, -position.quantity)
+            logger.info(f"Closing position {instrument}: {position.quantity} units ({reason})")
+            self.execute_order(instrument, -position.quantity)
     
     def liquidate_all(self, symbols: List[str]) -> None:
         """

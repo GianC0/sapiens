@@ -399,7 +399,6 @@ class OptunaHparamsTuner:
                     metrics = self._backtest(
                         model_params_flat= self.best_model_params_flat,  # type: ignore
                         strategy_params_flat = strategy_params_flat,
-                        strategy_params_path = strategy_params_path,
                         start = strategy_params_flat["valid_start"],
                         end = strategy_params_flat["valid_end"],
                     )
@@ -481,7 +480,6 @@ class OptunaHparamsTuner:
         self,
         model_params_flat: dict,
         strategy_params_flat: dict,
-        strategy_params_path: Path,
         start: pd.Timestamp,
         end: pd.Timestamp,
         ) -> Dict[str, float]:
@@ -500,17 +498,18 @@ class OptunaHparamsTuner:
 
         # Train model on Train + Valid with best HP
         # (DONE THROUGH THE STRATEGY)
-        backtest_cfg = self._produce_backtest_config(config, strategy_params_path, start, end)
-
-        
-        node = BacktestNode(configs=[backtest_cfg])
-
-        
         catalog_path = self.run_dir / "catalog"
         catalog = ParquetDataCatalog(
             path = catalog_path, 
             fs_protocol="file",
         )
+        backtest_cfg = self._produce_backtest_config(config, str(catalog_path), start, end)
+
+        
+        node = BacktestNode(configs=[backtest_cfg])
+
+        
+
         
         # Add data
         bars = []
@@ -531,7 +530,8 @@ class OptunaHparamsTuner:
                 'num_trades': 0,
                 'total_return': 0.0,
             }
-        
+
+        catalog.write_data(list(self.loader.instruments.values()))
         catalog.write_data(bars)
 
         # Run backtest
@@ -693,14 +693,14 @@ class OptunaHparamsTuner:
                 #logger.info(f"  {ticker}: {len(data[ticker])} bars")
         return data
     
-    def _produce_backtest_config(self, backtest_cfg, strategy_params_path, start, end) -> BacktestRunConfig:
+    def _produce_backtest_config(self, backtest_cfg, catalog_path, start, end) -> BacktestRunConfig:
 
         # Initialize Venue configs
         venue_configs = [
             BacktestVenueConfig(
                 name="SIM",
                 book_type="L1_MBP",         # bars are inluded in L1 market-by-price
-                oms_type = "UNSPECIFIED",
+                oms_type = "NETTING",
                 account_type=backtest_cfg["STRATEGY"]["account_type"],
                 base_currency=backtest_cfg["STRATEGY"]["currency"],
                 starting_balances=[str(backtest_cfg["STRATEGY"]["initial_cash"])+" "+str(backtest_cfg["STRATEGY"]["currency"])],
@@ -711,7 +711,7 @@ class OptunaHparamsTuner:
 
         data_configs=[
             BacktestDataConfig(
-                catalog_path=":memory:",
+                catalog_path=catalog_path,
                 data_cls=Bar,
                 start_time=pd.Timestamp.isoformat(start),
                 end_time=pd.Timestamp.isoformat(end),
@@ -741,7 +741,7 @@ class OptunaHparamsTuner:
                     strategies=[ImportableStrategyConfig(
                         strategy_path=f"algos.{strategy_name}:{strategy_name}",
                         config_path = f"algos.{strategy_name}:{strategy_name}Config",
-                        config = yaml_safe(backtest_cfg),
+                        config = {"config":yaml_safe(backtest_cfg)},
                     )],
                     cache=CacheConfig(
                         bar_capacity=backtest_cfg["STRATEGY"].get("engine", {}).get("cache", {}).get("bar_capacity", 4096)

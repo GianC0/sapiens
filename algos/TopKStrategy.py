@@ -30,8 +30,11 @@ import pandas_market_calendars as market_calendars
 import torch
 from dataclasses import dataclass, field
 import logging
-#logger = logging.getLogger(__name__)
 
+from make_requirements import HERE
+logger = logging.getLogger(__name__)
+
+from nautilus_trader.model.currencies import USD,EUR
 from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Logger
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.objects import Price, Quantity
@@ -51,6 +54,7 @@ from nautilus_trader.model.events import (
 )
 
 # ----- project imports -----------------------------------------------------
+from algos import config
 from models.interfaces import MarketModel
 from algos.engine.data_loader import CsvBarLoader, FeatureBarData
 from algos.engine.OptimizerFactory import create_optimizer
@@ -80,17 +84,37 @@ class TopKStrategy(Strategy):
         super().__init__()  
 
         # quick & dirty: allow passing in either a plain dict or a StrategyConfig
-        #if isinstance(nautilus_cfg, dict):
-            # wrap dict into the expected StrategyConfig dataclass
-        #    nautilus_cfg = TopKStrategyConfig(config=nautilus_cfg)
+            #if isinstance(nautilus_cfg, dict):
+                # wrap dict into the expected StrategyConfig dataclass
+            #    nautilus_cfg = TopKStrategyConfig(config=nautilus_cfg)
 
-        # use the inner dict consistently
-        cfg = getattr(config, "config", {})
+            # use the inner dict consistently
+        if hasattr(config, 'config') and config.config is not None:
+            # It's a TopKStrategyConfig with a config attribute
+            cfg = config.config
+        elif isinstance(config, dict):
+            # It's already a dictionary
+            cfg = config
+        elif hasattr(config, '__dataclass_fields__'):
+            # It's a dataclass but config field is not initialized
+            # This happens when Nautilus creates the config incorrectly
+            # Fall back to empty dict - will be populated by Nautilus
+            cfg = {}
+        else:
+            # Field descriptor or other unexpected type
+            cfg = {}
 
-        self.strategy_params = cfg.STRATEGY#["STRATEGY"]
-        self.model_params = cfg.MODEL #["MODEL"]
+        self.strategy_params = cfg["STRATEGY"]
+        self.model_params = cfg["MODEL"]
 
-        
+        # safe handling of variable
+        if self.strategy_params["currency"]  == "USD":
+            self.strategy_params["currency"]  = USD 
+        elif self.strategy_params["currency"]  == "EUR":
+            self.strategy_params["currency"]  = EUR
+        else: # currency is already in nautilus format
+            pass 
+        self.model_params["model_dir"] = Path(self.model_params["model_dir"])
 
         self.calendar = market_calendars.get_calendar(cfg["STRATEGY"]["calendar"])
         
@@ -159,13 +183,14 @@ class TopKStrategy(Strategy):
         self.optimizer = create_optimizer(name = optimizer_name, adv_lookback = adv_lookback, max_adv_pct = max_adv_pct, weight_bounds = weight_bounds)
         self.rebalance_only = self.strategy_params.get("rebalance_only", False)  # Rebalance mode
         self.top_k = self.strategy_params.get("top_k", 50)  # Portfolio size
+        
 
         # Risk free rate dataframe to use for Sharpe Ratio
         self.rf_rate = self.loader.risk_free_df
 
         # Order Manager for any strategy
         self.order_manager = OrderManager(self, self.strategy_params)
-        self.logger.info("OrderManager initialized")
+        logger.info("OrderManager initialized")
 
 
     # ================================================================= #
@@ -190,18 +215,18 @@ class TopKStrategy(Strategy):
         self._initialize_model()
 
         # Set initial update time to avoid immediate firing
-        self._last_update_time = pd.Timestamp(self.clock.utc_now(), tz='UTC')
-        self._last_retrain_time = pd.Timestamp(self.clock.utc_now(), tz='UTC')
+        self._last_update_time = pd.Timestamp(self.clock.utc_now(),)
+        self._last_retrain_time = pd.Timestamp(self.clock.utc_now(),)
 
         self.clock.set_timer(
             name="update_timer",  
-            interval=freq2pdoffset(self.strategy_params["freq"]),  # Timer interval
+            interval=pd.Timedelta(freq2pdoffset(self.strategy_params["freq"])),  # Timer interval
             callback=self.on_update,  # Custom callback function invoked on timer
         )
 
         self.clock.set_timer(
             name="retrain_timer",  
-            interval=self.retrain_offset,  # Timer interval
+            interval=pd.Timedelta(self.retrain_offset),  # Timer interval
             callback=self.on_retrain,  # Custom callback function invoked on timer
         )
 
@@ -228,20 +253,20 @@ class TopKStrategy(Strategy):
 
         assert event.ts_event > self._last_update_time 
 
-        now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
+        now = pd.Timestamp(self.clock.utc_now(),)
 
         # Skip if no update needed
         if self._last_update_time and now < (self._last_update_time + freq2pdoffset(self.strategy_params["freq"])):
-            self.logger.warning("WIERD STRATEGY UPDATE() CALL")
+            logger.warning("WIERD STRATEGY UPDATE() CALL")
             return
         
-        self.logger.info(f"Update timer fired at {now}")
+        logger.info(f"Update timer fired at {now}")
         
         # Check if drowdown stop is needed
         self._check_drowdown_stop
 
         if not self.model.is_initialized:
-            self.logger.warning("MODEL NOT INITIALIZED WITHIN STRATEGY UPDATE() CALL")
+            logger.warning("MODEL NOT INITIALIZED WITHIN STRATEGY UPDATE() CALL")
             return
         
         assert self.model.is_initialized
@@ -249,7 +274,7 @@ class TopKStrategy(Strategy):
         data_dict = self._cache_to_dict(window=(self.model.L + 1)) # TODO: make it more generic for all models.
 
         if not data_dict:
-            self.logger.warning("DATA DICTIONARY EMPTY WITHIN STRATEGY UPDATE() CALL")
+            logger.warning("DATA DICTIONARY EMPTY WITHIN STRATEGY UPDATE() CALL")
             return
         
         # TODO: superflous. consider removing compute active mask
@@ -280,13 +305,13 @@ class TopKStrategy(Strategy):
         if event.name != "retrain_timer":
             return
         
-        now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
+        now = pd.Timestamp(self.clock.utc_now(),)
         
         # Skip if too soon since last retrain
         if self._last_retrain_time and (now - self._last_retrain_time) < self.retrain_offset:
             return
         
-        self.logger.info(f"Starting model retrain at {now}")
+        logger.info(f"Starting model retrain at {now}")
         
         # Get updated data window
         data_dict = self._cache_to_dict(window=0)  # Get all available data
@@ -306,7 +331,7 @@ class TopKStrategy(Strategy):
         )
         
         self._last_retrain_time = now
-        self.logger.info(f"Model retrain completed at {now}")
+        logger.info(f"Model retrain completed at {now}")
             
             
 
@@ -315,8 +340,8 @@ class TopKStrategy(Strategy):
     # ================================================================= #
     def on_bar(self, bar: Bar):  
         # assuming on_timer happens before then on_bars are called first,
-        ts = bar.ts_event
-        sym = bar.instrument_id.symbol
+        #ts = bar.ts_event
+        sym = bar.bar_type.instrument_id.symbol.value
         
         # ------------ trailing-stop  ----------------------
         self._check_trailing_stop(sym, bar.close)  
@@ -484,20 +509,20 @@ class TopKStrategy(Strategy):
             # Check 1: Has enough historical data before walk-forward start
             train_data = df[df.index <= self.valid_end]
             if len(train_data) < self.min_bars_required:
-                self.logger.info(f"Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
+                logger.info(f"Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
                 continue
             
             # Check 2: Active at walk-forward start
             pred_window = df[(df.index > self.valid_end) ]
             if len(pred_window) < self.pred_len :
-                self.logger.info(f"Skipping {ticker}: not active at walk-forward start")
+                logger.info(f"Skipping {ticker}: not active at walk-forward start")
                 continue
                 
 
                 
             selected.append(ticker)
             
-        self.logger.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates")
+        logger.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates")
         self.universe = sorted(selected)
 
     def _initialize_model(self):
@@ -511,15 +536,15 @@ class TopKStrategy(Strategy):
         # Check if model hparam was trained already and stored so no init needed
         if (self.model_params["model_dir"] / "init.pt").exists():
 
-            self.logger.info(f"Model {self.model_name} not found in {self.model_params["model_dir"]} . Loading in process...")
+            logger.info(f"Model {self.model_name} not found in {self.model_params["model_dir"]} . Loading in process...")
             model = ModelClass(**self.model_params)
-            state_dict = torch.load(self.model_params["model_dir"] / "init.pt", map_location=model._device)
+            state_dict = torch.load(self.model_params["model_dir"] / "init.pt", map_location=model._device, weights_only=False)
             self.model = model.load_state_dict(state_dict)
-            self.logger.info(f"Model {self.model_name} stored in {self.model_params["model_dir"]} loaded successfully")
+            logger.info(f"Model {self.model_name} stored in {self.model_params["model_dir"]} loaded successfully")
 
         
         else:
-            self.logger.info(f"Model {self.model_name} not found in {self.model_params["model_dir"]} . Starting initialization on train data ...")
+            logger.info(f"Model {self.model_name} not found in {self.model_params["model_dir"]} . Starting initialization on train data ...")
             
             model = ModelClass(**self.model_params)
             train_data = self._get_data(start = self.train_start , end = self.train_end)
@@ -547,7 +572,7 @@ class TopKStrategy(Strategy):
                 window = self.strategy_params["engine"]["cache"]["bar_capacity"]
             bars = self.cache.bars(bar_type)[:window]  # Get last 'window' bars (nautilus cache notation is opposite to pandas)
             if not bars or len(bars) < self.min_bars_required:
-                self.logger.warning(f"Insufficient bars for {iid.symbol}: {len(bars)} < {self.min_bars_required}")
+                logger.warning(f"Insufficient bars for {iid.symbol}: {len(bars)} < {self.min_bars_required}")
                 continue
             
             # ensure there is at least one new bar after the last predition
@@ -580,7 +605,7 @@ class TopKStrategy(Strategy):
             # Check if data is recent enough
             if len(df) > 0:
                 last_date = df.index[-1]
-                now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
+                now = pd.Timestamp(self.clock.utc_now(),)
                 if now < last_date:
                     mask[i] = True
         
@@ -636,7 +661,7 @@ class TopKStrategy(Strategy):
         """Compute target portfolio weights from predictions using optimizer."""
         
         # Convert predictions to array aligned with universe
-        now = pd.Timestamp(self.clock.utc_now(), tz='UTC')
+        now = pd.Timestamp(self.clock.utc_now(),)
         # Current risk-free rate
         current_rf = self._get_risk_free_rate(now)
         # Benchmark volatility
@@ -752,8 +777,10 @@ class TopKStrategy(Strategy):
 
     # ----- trailing and drawdown stops for risk --------------------------------------------
     def _check_trailing_stop(self, sym: str, price: float):  # Removed async
-        instrument_id = self.instruments[sym]
-        position = self.portfolio.position(instrument_id)
+        instrument = self.loader.instruments[sym]
+        if len(self.portfolio.analyzer._positions) == 0:
+            return
+        position = self.portfolio.analyzer.net_position(instrument)
         pos = position.quantity if position else 0
         
         if pos == 0:
@@ -765,18 +792,20 @@ class TopKStrategy(Strategy):
             if price > high:
                 self.trailing_stops[sym] = price
             elif price <= high * (1 - self.trailing_stop_pct):
-                self.order_manager.close_position(instrument_id, reason="trailing_stop")
+                self.order_manager.close_position(instrument, reason="trailing_stop")
                 self.trailing_stops.pop(sym, None)
         else:                             # short
             low = self.trailing_stops.get(sym, price)
             if price < low:
                 self.trailing_stops[sym] = price
             elif price >= low * (1 + self.trailing_stop_pct):
-                self.order_manager.close_position(instrument_id, reason="trailing_stop")
+                self.order_manager.close_position(instrument, reason="trailing_stop")
                 self.trailing_stops.pop(sym, None)
 
     def _check_drowdown_stop(self):
-        nav = self.portfolio.net_liquidation
+        #TODO: implement how to get nav HERE
+        assert False
+        nav = self.portfolio.net_exposure()
         self.max_registered_portfolio_nav = max(self.max_registered_portfolio_nav, nav)
         #self.equity_analyzer.on_equity(ts, nav)
         
@@ -800,5 +829,5 @@ class TopKStrategy(Strategy):
                 # TODO: this has to change in order to manage data from different timezones/market hours
                 df.index = df.index.normalize()
                 data[ticker] = df.reindex(timestamps).dropna()
-                #self.logger.info(f"  {ticker}: {len(data[ticker])} bars")
+                #logger.info(f"  {ticker}: {len(data[ticker])} bars")
         return data
