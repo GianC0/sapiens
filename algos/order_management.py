@@ -167,14 +167,14 @@ class OrderManager:
             target_weights: Dict[symbol, weight] where weight is fraction of NAV
             universe: List of all symbols in the universe
         """
-        nav = self.strategy.portfolio.net_liquidation
+        nav = self.strategy.portfolio.net_exposures(self.strategy.venue).get(self.strategy.strategy_params["currency"], 0.0)
         
         for symbol in universe:
             target_weight = target_weights.get(symbol, 0.0)
             instrument_id = InstrumentId(Symbol(symbol), self.strategy.venue)
             
             # Get current position
-            position = self.strategy.portfolio.position(instrument_id)
+            position = self.strategy.cache.positions(instrument_id=instrument_id)
             current_qty = position.quantity if position else 0
             
             # Get current price

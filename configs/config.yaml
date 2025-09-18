@@ -134,7 +134,8 @@ STRATEGY:
     warm_start:      true        # Enable warm-start                   
     rebalance_only: false        # false = all universe instruments are considered for top_k. true = portoflio instruments stay the same, with dynamic reallocation 
     account_type: CASH           # "CASH" = long positions only or sells. "MARGIN" can short as well
-    
+    venue_name: SIM              # name of the venue to use for trading
+
     # Paths
     data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
     logs_dir: "logs/strategies/"

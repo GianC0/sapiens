@@ -107,7 +107,7 @@ class OptunaHparamsTuner:
 
         # --- Data Loader and Data Augmentation setup -------------------------------------------
         loader_cfg = {k: v for k, v in self.strategy_params.items() if k in ["freq", "calendar", "data_dir", "currency"]}
-        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name="SIM", columns_to_load=self.model_params["features_to_load"], adjust = self.model_params["adjust"])
+        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name=self.strategy_params["venue_name"], columns_to_load=self.model_params["features_to_load"], adjust = self.model_params["adjust"])
         
         # Setup MLflow
         self._setup_mlflow()
@@ -538,7 +538,7 @@ class OptunaHparamsTuner:
         node.run()
 
         engine = node.get_engine(f"Backtest-{config["MODEL"]["model_name"]}-{config["STRATEGY"]["strategy_name"]}")
-        venue = Venue("SIM")
+        venue = Venue(self.strategy_params["venue_name"])
 
         # Calculate metrics using Nautilus built-in analyzer
         metrics = self._compute_metrics(engine=engine, venue=venue, strategy_params_flat=strategy_params_flat)
@@ -698,7 +698,7 @@ class OptunaHparamsTuner:
         # Initialize Venue configs
         venue_configs = [
             BacktestVenueConfig(
-                name="SIM",
+                name=self.strategy_params["venue_name"],
                 book_type="L1_MBP",         # bars are inluded in L1 market-by-price
                 oms_type = "NETTING",
                 account_type=backtest_cfg["STRATEGY"]["account_type"],

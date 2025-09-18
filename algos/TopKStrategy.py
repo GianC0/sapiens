@@ -30,8 +30,8 @@ import pandas_market_calendars as market_calendars
 import torch
 from dataclasses import dataclass, field
 import logging
+from nautilus_trader.model.identifiers import Venue
 
-from make_requirements import HERE
 logger = logging.getLogger(__name__)
 
 from nautilus_trader.model.currencies import USD,EUR
@@ -54,7 +54,6 @@ from nautilus_trader.model.events import (
 )
 
 # ----- project imports -----------------------------------------------------
-from algos import config
 from models.interfaces import MarketModel
 from algos.engine.data_loader import CsvBarLoader, FeatureBarData
 from algos.engine.OptimizerFactory import create_optimizer
@@ -143,9 +142,11 @@ class TopKStrategy(Strategy):
         
         
         # Loader for data access
+        venue_name = self.strategy_params["venue_name"]
+        self.venue = Venue(venue_name)
         loader_cfg = {k: v for k, v in self.strategy_params.items() if k in ["freq", "calendar", "data_dir", "currency"]}
-        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name="SIM", columns_to_load=self.model_params["features_to_load"], adjust=self.model_params["adjust"])
-
+        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name=self.venue.value, columns_to_load=self.model_params["features_to_load"], adjust=self.model_params["adjust"])
+        
         # State tracking
         self.universe: List[str] = []  # Ordered list of instruments
         self.active_mask: Optional[torch.Tensor] = None  # (I,)
@@ -210,11 +211,14 @@ class TopKStrategy(Strategy):
                     bar_spec=self.bar_spec
                 )
                 self.subscribe_bars(self.bar_type)
+                
 
         # Build and initialize model
-        self._initialize_model()
+        self.model = self._initialize_model()
+        self.model._universe = self.universe
 
         # Set initial update time to avoid immediate firing
+        self.active_mask = torch.ones(len(self.loader.instruments), dtype=torch.bool)
         self._last_update_time = pd.Timestamp(self.clock.utc_now(),)
         self._last_retrain_time = pd.Timestamp(self.clock.utc_now(),)
 
@@ -251,9 +255,14 @@ class TopKStrategy(Strategy):
         if event.name != "update_timer":
             return
 
-        assert event.ts_event > self._last_update_time 
+        assert pd.to_datetime(event.ts_event, unit="ns", utc=True) > self._last_update_time 
 
         now = pd.Timestamp(self.clock.utc_now(),)
+        
+        # check if "now" falls outside market trading hours
+        d_r = self.calendar.schedule(start_date=self._last_update_time, end_date= now + freq2pdoffset(self.strategy_params["freq"]) )
+        if now not in  market_calendars.date_range(d_r, frequency=self.strategy_params["freq"]).normalize():
+            return
 
         # Skip if no update needed
         if self._last_update_time and now < (self._last_update_time + freq2pdoffset(self.strategy_params["freq"])):
@@ -263,7 +272,7 @@ class TopKStrategy(Strategy):
         logger.info(f"Update timer fired at {now}")
         
         # Check if drowdown stop is needed
-        self._check_drowdown_stop
+        self._check_drowdown_stop(self.venue)
 
         if not self.model.is_initialized:
             logger.warning("MODEL NOT INITIALIZED WITHIN STRATEGY UPDATE() CALL")
@@ -281,6 +290,14 @@ class TopKStrategy(Strategy):
         assert torch.equal(self.active_mask, self._compute_active_mask(data_dict) ) , "Active mask mismatch between strategy and data engine"
 
         assert self.universe == self.model._universe, "Universe mismatch between strategy and model"
+
+        # ensure the model has enough data for prediction
+        lookback_periods = self.pred_len + 1  # Need L+1 bars for prediction
+        start_date = now - freq2pdoffset(self.strategy_params["freq"]) * ( lookback_periods - 1) 
+        days_range = self.calendar.schedule(start_date=start_date, end_date=now)
+        timestamps = market_calendars.date_range(days_range, frequency=self.strategy_params["freq"]).normalize()
+        if len(timestamps) < lookback_periods:
+            return
 
         preds = self.model.predict(data=data_dict, current_time=now, active_mask=self.active_mask) #  preds: Dict[str, float]
 
@@ -342,12 +359,12 @@ class TopKStrategy(Strategy):
         # assuming on_timer happens before then on_bars are called first,
         #ts = bar.ts_event
         sym = bar.bar_type.instrument_id.symbol.value
-        
+        venue = bar.bar_type.instrument_id.venue
         # ------------ trailing-stop  ----------------------
         self._check_trailing_stop(sym, bar.close)  
 
         # ------------ drawdown-stop ------------------------
-        self._check_drowdown_stop()
+        self._check_drowdown_stop(venue)
         
         return
 
@@ -525,7 +542,7 @@ class TopKStrategy(Strategy):
         logger.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates")
         self.universe = sorted(selected)
 
-    def _initialize_model(self):
+    def _initialize_model(self) -> MarketModel:
         """Build and initialize the model."""
         # Import model class dynamically
         mod = importlib.import_module(f"models.{self.model_name}.{self.model_name}")
@@ -536,10 +553,10 @@ class TopKStrategy(Strategy):
         # Check if model hparam was trained already and stored so no init needed
         if (self.model_params["model_dir"] / "init.pt").exists():
 
-            logger.info(f"Model {self.model_name} not found in {self.model_params["model_dir"]} . Loading in process...")
+            logger.info(f"Model {self.model_name} found in {self.model_params["model_dir"]} . Loading in process...")
             model = ModelClass(**self.model_params)
             state_dict = torch.load(self.model_params["model_dir"] / "init.pt", map_location=model._device, weights_only=False)
-            self.model = model.load_state_dict(state_dict)
+            model.load_state_dict(state_dict)
             logger.info(f"Model {self.model_name} stored in {self.model_params["model_dir"]} loaded successfully")
 
         
@@ -549,9 +566,9 @@ class TopKStrategy(Strategy):
             model = ModelClass(**self.model_params)
             train_data = self._get_data(start = self.train_start , end = self.train_end)
             model.initialize(train_data)
-            self.model = model
+            
 
-        return
+        return model
 
         
     def _cache_to_dict(self, window: int) -> Dict[str, pd.DataFrame]:
@@ -576,22 +593,33 @@ class TopKStrategy(Strategy):
                 continue
             
             # ensure there is at least one new bar after the last predition
-            assert bars[0].ts_event > self._last_update_time
+            assert pd.to_datetime(bars[0].ts_event, unit="ns", utc=True ) > self._last_update_time
             
+            # Collect all bar data into lists
+            bar_data = {
+                "Date": [],
+                "Open": [],
+                "High": [],
+                "Low": [],
+                "Close": [],
+                "Volume": [],
+            }
             # Convert bars to DataFrame
-            for b in bars:
-                bar_data = {
-                    "Date": [b.ts_event],
-                    "Open": [b.open ],
-                    "High": [b.high],
-                    "Low": [b.low ],
-                    "Close": [b.close],    #TODO: verify if Close or CLose Adj
-                    "Volume": [b.volume],
-                }
-                df = pd.DataFrame(bar_data)
-                df.set_index("Date", inplace=True)
-                df.sort_index(inplace=True)  # Ensure chronological order
-                data_dict[iid.symbol.value] = df
+            for b in reversed(bars):
+                
+                bar_data["Date"].append(pd.to_datetime(b.ts_event, unit="ns", utc=True)),
+                bar_data["Open"].append(float(b.open))
+                bar_data["High"].append(float(b.high))
+                bar_data["Low"].append(float(b.low))
+                bar_data["Close"].append(float(b.close))
+                bar_data["Volume"].append(float(b.volume))
+
+            # Create DataFrame from collected data
+            df = pd.DataFrame(bar_data)
+            df.set_index("Date", inplace=True)
+            df.sort_index(inplace=True)  # Ensure chronological order
+            
+            data_dict[iid.symbol.value] = df
 
         return data_dict 
     
@@ -601,14 +629,12 @@ class TopKStrategy(Strategy):
         mask = ~torch.ones(len(self.universe), dtype=torch.bool)
         
         for i, symbol in enumerate(self.universe):
-            df = data_dict[symbol]
+            #df = data_dict[symbol]
             # Check if data is recent enough
-            if len(df) > 0:
-                last_date = df.index[-1]
-                now = pd.Timestamp(self.clock.utc_now(),)
-                if now < last_date:
-                    mask[i] = True
-        
+            last_time = self.loader._frames[symbol].index[-1]
+            now = pd.Timestamp(self.clock.utc_now(),)
+            mask[i] = last_time >= now
+    
         return mask
     
     # ----- weight optimiser ------------------------------------------
@@ -667,14 +693,14 @@ class TopKStrategy(Strategy):
         # Benchmark volatility
         benchmark_vol = self._get_benchmark_volatility(now)
         # Current portfolio net asset value
-        nav = self.portfolio.net_liquidation
+        nav = self.portfolio.net_exposures(self.venue).get(self.strategy_params["currency"], 0.0)
 
         # Max % of average daily traded volume to use for weights
         max_adv_pct = self.strategy_params["liquidity"]["max_adv_pct"]
         #max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
 
         # Check if we can short (margin account) or only long (cash account)
-        can_short = self.strategy_params.get["account_type"] == "MARGIN"
+        can_short = self.strategy_params["account_type"] == "MARGIN"
 
 
         # ASSET SELECTION: select from whole universe or only from portfolio
@@ -725,7 +751,7 @@ class TopKStrategy(Strategy):
             prices[symbol] = float(bars[-1].close)
             
             # Compute ADV and constraints
-            position = self.portfolio.position(instrument_id)
+            position = self.strategy.cache.positions(instrument_id=instrument_id)
             current_w = (position.quantity * prices[symbol] / nav) if position else 0.0
             
             volumes = [float(b.volume) for b in bars[-self.adv_lookback:]]
@@ -802,10 +828,11 @@ class TopKStrategy(Strategy):
                 self.order_manager.close_position(instrument, reason="trailing_stop")
                 self.trailing_stops.pop(sym, None)
 
-    def _check_drowdown_stop(self):
-        #TODO: implement how to get nav HERE
-        assert False
-        nav = self.portfolio.net_exposure()
+    def _check_drowdown_stop(self, venue: Venue):
+        nav_dict = self.portfolio.net_exposures(venue)
+        if len(nav_dict) == 0:
+            return
+        nav = nav_dict[self.strategy_params["currency"]].value
         self.max_registered_portfolio_nav = max(self.max_registered_portfolio_nav, nav)
         #self.equity_analyzer.on_equity(ts, nav)
         

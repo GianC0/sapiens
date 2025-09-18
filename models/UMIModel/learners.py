@@ -169,7 +169,7 @@ class MarketLevelFactorLearning(nn.Module):
                 m = active_mask.unsqueeze(1).unsqueeze(-1)        # (B,1,I,1)
                 e_window = e_window * m
             else:
-                active_mask = torch.ones(self.I, dtype=torch.bool).unsqueeze(0).expand(B,-1)   # (B,I)
+                active_mask = torch.ones(self.I, dtype=torch.bool).unsqueeze(0)   # (B,I)
             e_t   = e_window[:, -1]                     # (B,I,F)
             k_win = self.W_s(e_window)                  # (B,Lτ,I,F)
             q_t   = self.W_s(e_t)                       # (B,I,F)
@@ -183,7 +183,7 @@ class MarketLevelFactorLearning(nn.Module):
             eta_in = self.W_iota(stockID_b) + r_t                    # (B,I,2F)
             eta    = F.relu(torch.einsum("bif,f->bi", eta_in, self.w_eta)) # (B,I)
 
-            m_t    = self._weighted_mean(eta[:, active_mask[1]], r_t[:, active_mask[1]])  #(1)               # (B,2F)
+            m_t    = self._weighted_mean(eta[:, active_mask[0]], r_t[:, active_mask[0]])  #(1)               # (B,2F)
             return r_t, m_t, eta
 
     def forward(
@@ -224,8 +224,8 @@ class MarketLevelFactorLearning(nn.Module):
 
             Lτ = min(self.L, τ + 1)
             r_τ, m_τ, eta_τ= self._compute_m_t(e_seq[:, τ - Lτ + 1 : τ + 1], stockID_b, active_mask)  # (B,I,2F), (B,2F), (B,I,2F)
-            m1 = self._weighted_mean(eta_τ[:, active_mask[1]][:, S1], r_τ[:, active_mask[1], :][:, S1])  # (B,2F)
-            m2 = self._weighted_mean(eta_τ[:, active_mask[1]][:, S2], r_τ[:, active_mask[1], :][:, S2])  # (B,2F)
+            m1 = self._weighted_mean(eta_τ[:, active_mask[0]][:, S1], r_τ[:, active_mask[0], :][:, S1])  # (B,2F)
+            m2 = self._weighted_mean(eta_τ[:, active_mask[0]][:, S2], r_τ[:, active_mask[0], :][:, S2])  # (B,2F)
             m1_list.append(m1) ; m2_list.append(m2)
             period_ids.append(torch.full((B,), τ, device=e_seq.device, dtype=torch.long))
 

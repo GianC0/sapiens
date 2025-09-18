@@ -250,7 +250,7 @@ class UMIModel(nn.Module):
         # Build panel from current data
         lookback_periods = self.L + 1  # Need L+1 bars for prediction
         # Calculate the start date for the historical window
-        start_date = current_time - freq2pdoffset(self.freq) * lookback_periods
+        start_date = current_time - freq2pdoffset(self.freq) * (lookback_periods - 1) 
         days_range = self.market_calendar.schedule(start_date=start_date, end_date=current_time)
         timestamps = market_calendars.date_range(days_range, frequency=self.freq).normalize()
         data_tensor, data_mask = build_pred_tensor(data, timestamps, feature_dim=self.F, device=self._device)
@@ -279,7 +279,7 @@ class UMIModel(nn.Module):
         
         # Use provided mask or dataset mask
         assert active_mask is not None
-        mask = active_mask.to(self._device)
+        mask = active_mask.unsqueeze(0).to(self._device)
         
         
         # Forward pass
@@ -854,7 +854,7 @@ class UMIModel(nn.Module):
     def _stage1_forward(self, prices_seq, feat_seq, active_mask):
         """Run stock-level & market-level factor learning *concurrently*."""
 
-        assert active_mask.ndim == 2 , f"active_mask should have 2 dims, got instead {list(active_mask.shape)}"
+        assert active_mask.ndim == 2 , f"active_mask should have 2 dims, got instead {active_mask.ndim}"
         # assert active_mask.shape == (self.batch_size, self.I)  NOT TRUE for last batch with batch_size smaller
         stockIDs = self._eye.to(prices_seq.device)
         if torch.cuda.is_available():
