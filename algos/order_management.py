@@ -25,6 +25,7 @@ from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.objects import Quantity, Price
 from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.orders import MarketOrder, LimitOrder
 import logging
 
 logger = logging.getLogger(__name__)
@@ -167,7 +168,13 @@ class OrderManager:
             target_weights: Dict[symbol, weight] where weight is fraction of NAV
             universe: List of all symbols in the universe
         """
-        nav = self.strategy.portfolio.net_exposures(self.strategy.venue).get(self.strategy.strategy_params["currency"], 0.0)
+
+        account = self.strategy.portfolio.account(self.strategy.venue)
+        if account:
+            nav = float(account.balance_total(self.strategy.strategy_params["currency"]))
+        else:
+            nav = self.strategy.strategy_params["initial_cash"]
+        logger.info(f"Portfolio NAV: {nav}")
         
         for symbol in universe:
             target_weight = target_weights.get(symbol, 0.0)
@@ -191,6 +198,8 @@ class OrderManager:
             
             # Calculate order quantity needed
             order_qty = target_qty - current_qty
+            
+            logger.info(f"{symbol}: Current qty={current_qty}, Target qty={target_qty}, Order qty={order_qty}")
             
             if order_qty != 0:
                 
@@ -408,63 +417,6 @@ class OrderManager:
     # Order Execution Methods (Internal)
     # =========================================================================
     
-    def submit_order(
-        self,
-        order: Order,
-        order_type: OrderType,
-        params: Dict[str, Any],            # order parameters
-    ) -> Optional[Any]:
-        """
-        Submit an order to the market.
-        
-        Args:
-            instrument_id: Instrument to trade
-            quantity: Signed quantity (positive for buy, negative for sell)
-            order_type: 
-                        MARKET
-                        LIMIT
-                        STOP_MARKET
-                        STOP_LIMIT
-                        MARKET_TO_LIMIT
-                        MARKET_IF_TOUCHED
-                        LIMIT_IF_TOUCHED
-                        TRAILING_STOP_MARKET
-                        TRAILING_STOP_LIMIT
-            price: Limit/stop price (if applicable)
-            
-        Returns:
-            Submitted order or None if failed
-        """
-        
-        # validate order params:
-        try:
-            if order_type not in ORDER_SPECS:
-                raise ValueError(f"Unknown order_type: {order_type!r}. Valid: {sorted(ORDER_SPECS.keys())}")
-            spec = ORDER_SPECS[order_type]
-            keys = set(params.keys())
-            missing = spec["required"] - keys
-            allowed = spec["required"] | spec["optional"]
-            extra = keys - allowed
-            is_valid = (len(missing) == 0) and (len(extra) == 0) and set(params.keys()).issubset(spec["required"] | spec["optional"])
-            
-            # param-specific checks
-            params["quantity"] = abs(params["quantity"])
-            assert params["quantity"] >= 0
-            assert params["order_side"] in [OrderSide.BUY, OrderSide.SELL]
-            assert params["trailing_offset_type"] in [TrailingOffsetType.BASIS_POINTS, TrailingOffsetType.PRICE]
-            assert params["trigger_type"] in [TriggerType.NO_TRIGGER, TriggerType.BID_ASK, TriggerType.LAST, TriggerType.LAST_OR_BID_ASK]
-            
-
-            if is_valid:            
-                self.strategy.submit_order(order)
-                return order
-            else:
-                raise Exception("Paramters are not a subset of allowed order parameters")
-            
-        except Exception as e:
-            logger.error(f"Failed to submit order: {e}")
-            return None
-    
     def cancel_all_orders(self, instrument_id: Optional[InstrumentId] = None) -> None:
         """
         Cancel all pending orders, optionally for a specific instrument.
@@ -560,17 +512,9 @@ class OrderManager:
         current_price = float(last_bar.close)
         
         
-        # Determine if TWAP should be used
-        if use_twap is None:
-            # Use TWAP for large orders (>2% of ADV or configured threshold)
-            adv_threshold = self.max_adv_pct * 0.4  # Use TWAP if > 40% of max ADV
-            bars_for_adv = bars[-self.adv_lookback:] if len(bars) >= self.adv_lookback else bars
-            avg_volume = np.mean([float(b.volume) for b in bars_for_adv]) if bars_for_adv else 0
-            
-            use_twap = (avg_volume > 0 and abs_quantity > avg_volume * adv_threshold) and self.twap_slices > 1
-        
-        # Execute with TWAP if needed
-        if use_twap and self.twap_slices > 1:
+        # Execute with TWAP 
+        # TODO: properly implement twap logic
+        if self.strategy.exec_algo == "twap" :
             logger.info(f"Executing TWAP order for {instrument_id}: {abs_quantity} units")
             self.execute_twap(
                 instrument_id=instrument_id,
@@ -614,6 +558,38 @@ class OrderManager:
                 f"Submitted {order_type} {order_side.name} order for {instrument_id}: "
                 f"{abs_quantity} units at {current_price:.2f}"
             )
+        else:
+            logger.error("Failed to create order")
+
+    def _create_market_order(
+        self,
+        instrument_id: InstrumentId,
+        quantity: int,
+        order_side: OrderSide
+    ) -> MarketOrder:
+        """Create a market order."""
+        return self.strategy.order_factory.market(
+            instrument_id=instrument_id,
+            order_side=order_side,
+            quantity=Quantity.from_int(quantity),
+            time_in_force=self.timing_force,
+        )
+
+    def _create_limit_order(
+        self,
+        instrument_id: InstrumentId,
+        quantity: int,
+        order_side: OrderSide,
+        price: float
+    ) -> LimitOrder:
+        """Create a limit order."""
+        return self.strategy.order_factory.limit(
+            instrument_id=instrument_id,
+            order_side=order_side,
+            quantity=Quantity.from_int(quantity),
+            price=Price.from_str(str(price)),
+            time_in_force=self.timing_force,
+        )
         
     # =========================================================================
     # Helper Methods
@@ -681,7 +657,7 @@ class OrderManager:
             quantity = schedule['slice_quantity']
         
         # Submit the slice order
-        self.submit_order(
+        self.strategy.submit_order(
             instrument_id=schedule['instrument_id'],
             quantity=quantity,
             order_type="MARKET"

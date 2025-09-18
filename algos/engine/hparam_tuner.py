@@ -537,7 +537,7 @@ class OptunaHparamsTuner:
         # Run backtest
         node.run()
 
-        engine = node.get_engine(f"Backtest-{config["MODEL"]["model_name"]}-{config["STRATEGY"]["strategy_name"]}")
+        engine = node.get_engines()
         venue = Venue(self.strategy_params["venue_name"])
 
         # Calculate metrics using Nautilus built-in analyzer

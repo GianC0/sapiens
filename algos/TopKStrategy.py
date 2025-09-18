@@ -170,9 +170,11 @@ class TopKStrategy(Strategy):
         self.target_volatility = self.strategy_params.get("risk_target_volatility_annual", 0.05)
         self.trailing_stop_pct = self.strategy_params.get("risk_trailing_stop_pct", 0.05)
         self.drawdown_pct = self.strategy_params.get("risk_drawdown_pct", 0.15)
-        adv_lookback = self.strategy_params.get("liquidity", {}).get("adv_lookback", 30)
-        max_adv_pct = self.strategy_params.get("liquidity", {}).get("max_adv_pct", 0.05)
+        self.adv_lookback = self.strategy_params.get("liquidity", {}).get("adv_lookback", 30)
+        self.max_adv_pct = self.strategy_params.get("liquidity", {}).get("max_adv_pct", 0.05)
+        self.exec_algo = self.strategy_params.get("execution", {}).get("exec_algo", "twap")
         self.twap_slices = self.strategy_params.get("execution", {}).get("twap", {}).get("slices", 4)
+        self.twap_interval_secs = self.strategy_params.get("execution", {}).get("twap", {}).get("interval_secs", 2.5)
 
         # Portfolio optimizer
         # TODO: add risk_aversion config parameter for MaxQuadraticUtilityOptimizer
@@ -181,7 +183,7 @@ class TopKStrategy(Strategy):
         weight_bounds = (-1, 1)   # (+) = long position , (-) = short position
         if self.strategy_params["account_type"] == "CASH":
             weight_bounds = (0, 1)  # long-only positions
-        self.optimizer = create_optimizer(name = optimizer_name, adv_lookback = adv_lookback, max_adv_pct = max_adv_pct, weight_bounds = weight_bounds)
+        self.optimizer = create_optimizer(name = optimizer_name, adv_lookback = self.adv_lookback, max_adv_pct = self.max_adv_pct, weight_bounds = weight_bounds)
         self.rebalance_only = self.strategy_params.get("rebalance_only", False)  # Rebalance mode
         self.top_k = self.strategy_params.get("top_k", 50)  # Portfolio size
         
@@ -695,9 +697,6 @@ class TopKStrategy(Strategy):
         # Current portfolio net asset value
         nav = self.portfolio.net_exposures(self.venue).get(self.strategy_params["currency"], 0.0)
 
-        # Max % of average daily traded volume to use for weights
-        max_adv_pct = self.strategy_params["liquidity"]["max_adv_pct"]
-        #max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
 
         # Check if we can short (margin account) or only long (cash account)
         can_short = self.strategy_params["account_type"] == "MARGIN"
@@ -751,12 +750,12 @@ class TopKStrategy(Strategy):
             prices[symbol] = float(bars[-1].close)
             
             # Compute ADV and constraints
-            position = self.strategy.cache.positions(instrument_id=instrument_id)
+            position = self.cache.positions(instrument_id=instrument_id)
             current_w = (position.quantity * prices[symbol] / nav) if position else 0.0
             
             volumes = [float(b.volume) for b in bars[-self.adv_lookback:]]
             adv = float(np.mean(volumes)) if volumes else 0.0
-            max_w_relative = min((adv * max_adv_pct * prices[symbol]) / nav, self.max_w_abs) if nav > 0 else self.max_w_abs
+            max_w_relative = min((adv * self.max_adv_pct * prices[symbol]) / nav, self.max_w_abs) if nav > 0 else self.max_w_abs
             
             # Set allowed range
             if can_short:
@@ -790,7 +789,7 @@ class TopKStrategy(Strategy):
             benchmark_vol = benchmark_vol,
             cov=cov,
             rf=current_rf,
-            max_weight_change=np.array(allowed_weight_ranges)
+            allowed_weight_ranges=np.array(allowed_weight_ranges)
         )
 
         # Map back to full universe

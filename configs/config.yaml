@@ -174,15 +174,22 @@ STRATEGY:
     # Order execution algorithm
     execution:
       timing_force: "DAY"      # Specifies how long the order will remain open or active before any remaining quantity is canceled.
+      exec_algo: whole          # Specifies to use TWAP execution algorithm, Default: whole
       twap:                    # Split parent order into 4 TWAP child orders, each after 2.5 seconds 
-        horizon_secs: 10.0
-        interval_secs: 2.5
+        slices: 4              # 4 separate orders
+        interval_secs: 2.5     # 2.5 seconds between orders
+      use_limit_orders: false  # whether to use LIMIT orders or MARKET-only
+      limit_offset_bps: 0.005  # +-5% LIMIT order placed
+      max_retries: 3           # n of retries if order is unsuccessfull before cancelling the remaining portion
+
 
     # Liquidity constraints   
     liquidity:
       adv_lookback: 30     # Look-back window to compute Average Daily Volume (ADV)
-      max_adv_pct:  0.05   # Max trade size = 5 % ADV 
+      max_adv_pct:  0.05   # Max trade size = 5% of average daily traded volume for that instrument to use for weights 
 
+        
+      #max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
 
   # Hyperparameters to optimize
   HPARAMS:
