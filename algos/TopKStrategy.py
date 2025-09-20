@@ -166,7 +166,6 @@ class TopKStrategy(Strategy):
         # Extract risk parameters from config
         self.selector_k = self.strategy_params.get("top_k", 30)
         self.max_w_abs = self.strategy_params.get("risk_max_weight_abs", 0.03)
-        self.max_w_rel = self.strategy_params.get("risk_max_weight_rel", 0.20)
         self.target_volatility = self.strategy_params.get("risk_target_volatility_annual", 0.05)
         self.trailing_stop_pct = self.strategy_params.get("risk_trailing_stop_pct", 0.05)
         self.drawdown_pct = self.strategy_params.get("risk_drawdown_pct", 0.15)
@@ -175,13 +174,14 @@ class TopKStrategy(Strategy):
         self.exec_algo = self.strategy_params.get("execution", {}).get("exec_algo", "twap")
         self.twap_slices = self.strategy_params.get("execution", {}).get("twap", {}).get("slices", 4)
         self.twap_interval_secs = self.strategy_params.get("execution", {}).get("twap", {}).get("interval_secs", 2.5)
+        self.can_short = self.strategy_params.get("oms_type", "NETTING") == "HEDGING"
 
         # Portfolio optimizer
         # TODO: add risk_aversion config parameter for MaxQuadraticUtilityOptimizer
         # TODO: make sure to pass proper params to create_optimizer depending on the optimizer all __init__ needed by any optimizer
         optimizer_name = self.strategy_params.get("optimizer_name", "max_sharpe")
-        weight_bounds = (-1, 1)   # (+) = long position , (-) = short position
-        if self.strategy_params["account_type"] == "CASH":
+        weight_bounds = (-1, 1)   # (-) = short position ,  (+) = long position 
+        if not self.can_short:
             weight_bounds = (0, 1)  # long-only positions
         self.optimizer = create_optimizer(name = optimizer_name, adv_lookback = self.adv_lookback, max_adv_pct = self.max_adv_pct, weight_bounds = weight_bounds)
         self.rebalance_only = self.strategy_params.get("rebalance_only", False)  # Rebalance mode
@@ -306,10 +306,13 @@ class TopKStrategy(Strategy):
         assert preds is not None, "Model predictions are empty"
 
         # Compute new portfolio target weights for all universe stocks.
+        # TODO: IMPORTANT TO REMOVE -> USED ONLY FOR TESTING
+        #preds = {key: abs(value) for key, value in preds.items()}
         weights = self._compute_target_weights(preds)
 
         # Portolio Managerment through order manager
-        self.order_manager.rebalance_portfolio(weights, self.universe)
+        if weights:
+            self.order_manager.rebalance_portfolio(weights, self.universe)
 
         # update last updated time
         self._last_update_time = now
@@ -484,9 +487,10 @@ class TopKStrategy(Strategy):
             self.order_manager.on_order_filled(event)
         
         # Update trailing stops for position management
-        instrument_id = event.order.instrument_id
-        position = self.portfolio.position(instrument_id)
-        if position and position.quantity != 0:
+        instrument_id = event.instrument_id
+        
+        position = self.cache.positions(instrument_id=instrument_id)
+        if position and position[0].quantity != 0:
             symbol = instrument_id.symbol.value
             if symbol not in self.trailing_stops:
                 self.trailing_stops[symbol] = float(event.last_px)
@@ -695,14 +699,15 @@ class TopKStrategy(Strategy):
         # Benchmark volatility
         benchmark_vol = self._get_benchmark_volatility(now)
         # Current portfolio net asset value
-        nav = self.portfolio.net_exposures(self.venue).get(self.strategy_params["currency"], 0.0)
+        nav = self._calculate_portfolio_nav()
 
 
         # Check if we can short (margin account) or only long (cash account)
-        can_short = self.strategy_params["account_type"] == "MARGIN"
+        
 
 
         # ASSET SELECTION: select from whole universe or only from portfolio
+        # TODO: this will not work if old open positions != portfolio or at 1st iteration
         if self.strategy_params["rebalance_only"]:
             # Only rebalance current positions
             selected_symbols = [pos.instrument_id.symbol.value for pos in self.cache.positions_open()]
@@ -710,21 +715,23 @@ class TopKStrategy(Strategy):
             # Select top-k based on predictions
             pred_series = pd.Series(preds)
             
-            if can_short:
+            if self.can_short:
                 l_n = self.selector_k // 2
                 longs = pred_series.nlargest(l_n).index.tolist()
                 shorts = pred_series.nsmallest(self.selector_k - l_n).index.tolist()
                 selected_symbols = longs + shorts
             else:
+                # TODO: ensure that this loss minimization is also working for pred_series all with negative samples
+                # TODO: if all < 0, ensure that taxes + errors/inefficiencies for this allocation are taken into account. 
                 selected_symbols = pred_series[pred_series > 0].nlargest(self.selector_k).index.tolist()
-        
-        
+                if not selected_symbols:
+                    selected_symbols = pred_series[pred_series <=  0].nlargest(self.selector_k).index.tolist()
+                    #TODO: assicurati che i symboli siano già nel portafolio, altrimenti lascia il cash
         # MIN/MAX WEIGHT COMPUTATION + USEFULL VARS
         # Get historical returns for covariance
         returns_data = []
         valid_symbols = [] # error handling
         prices = {}      # last close per symbol
-        adv_volumes = {} # ADV shares per symbol
         allowed_weight_ranges = [] # min-max portfolio-relative weight for instrument computed from ADV and relative portolio contraints
 
         # Single loop over selected symbols only
@@ -736,12 +743,13 @@ class TopKStrategy(Strategy):
             bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
             bars = self.cache.bars(bar_type)
             
-            if len(bars) <= 2:
+            if len(bars) < 2:
                 continue
                 
             # Get returns
             closes = [float(b.close) for b in bars[-self.optimizer_lookback.n:]]
             returns = pd.Series(closes).pct_change().dropna()
+
             if len(returns) == 0:
                 continue
                 
@@ -749,16 +757,20 @@ class TopKStrategy(Strategy):
             valid_symbols.append(symbol)
             prices[symbol] = float(bars[-1].close)
             
-            # Compute ADV and constraints
-            position = self.cache.positions(instrument_id=instrument_id)
-            current_w = (position.quantity * prices[symbol] / nav) if position else 0.0
+            
+            # Calculate current weight (aggregate all positions for this instrument)
+            net_position = 0.0
+            for position in self.cache.positions_open():
+                if position.instrument_id == instrument_id:
+                    net_position += float(position.signed_qty)
+            current_w = (net_position * prices[symbol] / nav) if (net_position & nav > 0) else 0.0
             
             volumes = [float(b.volume) for b in bars[-self.adv_lookback:]]
             adv = float(np.mean(volumes)) if volumes else 0.0
             max_w_relative = min((adv * self.max_adv_pct * prices[symbol]) / nav, self.max_w_abs) if nav > 0 else self.max_w_abs
             
-            # Set allowed range
-            if can_short:
+            # Set allowed range based on oms_type
+            if self.can_short:
                 w_min = max(current_w - max_w_relative, -self.max_w_abs, self.weight_bounds[0])
                 w_max = min(current_w + max_w_relative, self.max_w_abs, self.weight_bounds[1])
             else:
@@ -779,9 +791,6 @@ class TopKStrategy(Strategy):
         
         # Optimize with valid symbols only
         valid_mu = np.array([preds[s] for s in valid_symbols])
-         
-        
-
         
         # Call optimizer
         w_opt = self.optimizer.optimize(
@@ -817,14 +826,14 @@ class TopKStrategy(Strategy):
             if price > high:
                 self.trailing_stops[sym] = price
             elif price <= high * (1 - self.trailing_stop_pct):
-                self.order_manager.close_position(instrument, reason="trailing_stop")
+                self.order_manager.close_all_positions(instrument, reason="trailing_stop")
                 self.trailing_stops.pop(sym, None)
         else:                             # short
             low = self.trailing_stops.get(sym, price)
             if price < low:
                 self.trailing_stops[sym] = price
             elif price >= low * (1 + self.trailing_stop_pct):
-                self.order_manager.close_position(instrument, reason="trailing_stop")
+                self.order_manager.close_all_positions(instrument, reason="trailing_stop")
                 self.trailing_stops.pop(sym, None)
 
     def _check_drowdown_stop(self, venue: Venue):
@@ -857,3 +866,38 @@ class TopKStrategy(Strategy):
                 data[ticker] = df.reindex(timestamps).dropna()
                 #logger.info(f"  {ticker}: {len(data[ticker])} bars")
         return data
+    
+def _calculate_portfolio_nav(self) -> float:
+    """Calculate total portfolio value: cash + market value of all positions."""
+    # Get cash balance
+    account = self.portfolio.account(self.venue)
+    if account:
+        cash_balance = float(account.balance_total(self.strategy_params["currency"]))
+    else:
+        cash_balance = float(self.strategy_params["initial_cash"])
+    
+    # Add market value of all open positions (handles multiple positions per instrument)
+    total_positions_value = 0.0
+    positions_by_instrument = {}
+    
+    for position in self.cache.positions_open():
+        instrument_id = position.instrument_id
+        
+        # Aggregate positions for each instrument (for HEDGING accounts)
+        if instrument_id not in positions_by_instrument:
+            positions_by_instrument[instrument_id] = 0.0
+        positions_by_instrument[instrument_id] += float(position.signed_qty)
+    
+    # Calculate market value for net positions
+    for instrument_id, net_quantity in positions_by_instrument.items():
+        bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
+        bars = self.cache.bars(bar_type)
+        
+        if bars:
+            current_price = float(bars[-1].close)
+            position_value = net_quantity * current_price
+            total_positions_value += position_value
+    
+    nav = cash_balance + total_positions_value
+    logger.info(f"NAV Calculation: Cash={cash_balance:.2f}, Positions={total_positions_value:.2f}, Total={nav:.2f}")
+    return nav

@@ -373,6 +373,9 @@ class ForecastingLearning(nn.Module):
         final_in = torch.cat([c_t, d_t, m_expand], -1)          # (B,I,mlp_in)
         out = self.mlp(final_in).squeeze(-1)                    # (B,I)
 
+        # apply activation function to bound stock return to [-1 , +inf ]
+        out = -1 + F.softplus(out)
+
         # ── 5. Loss (MSE + λ·RankIC) ──────────────────────────────── #
         loss      = torch.tensor(0.0, device=e_seq.device)
         rank_loss = torch.tensor(0.0, device=e_seq.device)

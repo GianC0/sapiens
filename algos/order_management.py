@@ -24,6 +24,7 @@ from nautilus_trader.model.enums import OrderSide, TimeInForce, OrderStatus, Ord
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.objects import Quantity, Price
+from nautilus_trader.model import Position
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.orders import MarketOrder, LimitOrder
 import logging
@@ -169,43 +170,55 @@ class OrderManager:
             universe: List of all symbols in the universe
         """
 
-        account = self.strategy.portfolio.account(self.strategy.venue)
-        if account:
-            nav = float(account.balance_total(self.strategy.strategy_params["currency"]))
-        else:
-            nav = self.strategy.strategy_params["initial_cash"]
+        nav = self.strategy._calculate_portfolio_nav()
+        if nav <= 0:
+            logger.error(f"Invalid NAV: {nav}. Skipping rebalance.")
+            return
+        
         logger.info(f"Portfolio NAV: {nav}")
         
+        can_short = self.strategy.can_short
+
         for symbol in universe:
             target_weight = target_weights.get(symbol, 0.0)
             instrument_id = InstrumentId(Symbol(symbol), self.strategy.venue)
             
-            # Get current position
-            position = self.strategy.cache.positions(instrument_id=instrument_id)
-            current_qty = position.quantity if position else 0
+            # Get current net quantity
+            # TODO: ensure that for HEDGING oms_type this manages any position
+            # Aggregate current positions for this instrument
+            net_current_qty = 0.0
+            positions_list = []
+            
+            for pos in self.strategy.cache.positions_open():
+                if pos.instrument_id == instrument_id:
+                    positions_list.append(pos)
+                    net_current_qty += float(pos.signed_qty)
             
             # Get current price
             bar_type = BarType(instrument_id=instrument_id, bar_spec=self.strategy.bar_spec)
             bars = self.strategy.cache.bars(bar_type)
             if not bars:
+                logger.warning(f"No bars available for {symbol}, skipping")
                 continue
             
             current_price = float(bars[-1].close)
             
             # Calculate target quantity
             target_value = target_weight * nav
-            target_qty = int(target_value / current_price)
+            target_qty = int(target_value / current_price) if current_price > 0 else 0
             
             # Calculate order quantity needed
-            order_qty = target_qty - current_qty
+            order_qty = target_qty - net_current_qty
             
             logger.info(f"{symbol}: Current qty={current_qty}, Target qty={target_qty}, Order qty={order_qty}")
             
-            if order_qty != 0:
-                
-                if order_qty != 0:
-                    # Execute order (with TWAP if configured)
-                    self.execute_order(instrument_id, order_qty)
+            if abs(order_qty) > 0:
+                # For HEDGING accounts, close opposite positions first if switching sides
+                if can_short and positions_list:
+                    self._handle_hedging_positions(instrument_id, positions_list, order_qty, target_qty)
+                else:
+                    # Standard execution for NETTING/CASH accounts
+                    self.execute_order(instrument_id, int(order_qty))
     
     def execute_position_change(
         self, 
@@ -232,19 +245,61 @@ class OrderManager:
             logger.info(f"Position change for {instrument_id}: {current_qty} -> {target_quantity} ({reason})")
             self.execute_order(instrument_id, order_qty)
     
-    def close_position(self, instrument: Instrument, reason: str = "close") -> None:
+    def close_all_positions(self, instrument: Instrument, reason: str = "close") -> None:
         """
-        Close a position completely.
+        Close all positions for an instrument (handles LONG and SHORT positions).
         
         Args:
             instrument: Instrument to close
             reason: Reason for closing (stop_loss, trailing_stop, etc.)
         """
-        position = self.strategy.portfolio.analyzer.net_position(instrument)
-        if position and position.quantity != 0:
-            logger.info(f"Closing position {instrument}: {position.quantity} units ({reason})")
-            self.execute_order(instrument, -position.quantity)
+        positions_closed = False
+
+         # Close all positions for this instrument (handles HEDGING)
+        for position in self.strategy.cache.positions_open():
+            if position.instrument_id == instrument.id:
+                logger.info(f"Closing position {position.id}: {position.signed_qty} units ({reason})")
+                
+                # Determine order side to close position
+                if position.is_long:
+                    order_side = OrderSide.SELL
+                else:
+                    order_side = OrderSide.BUY
+                
+                # create order
+                close_order = self.strategy.order_factory.market(
+                    instrument_id=position.instrument_id,
+                    order_side=order_side,
+                    quantity=Quantity.from_int(abs(int(position.quantity))),
+                    time_in_force=self.timing_force,
+                )
+                if close_order:
+                    self.strategy.submit_order(close_order)
+                    positions_closed = True
+        if not positions_closed:
+            logger.info(f"No positions to close for {instrument.id}")
     
+    def close_position(self, position: Position):
+        """Close a specific position."""
+        # Determine order side to close position
+        if position.is_long:
+            order_side = OrderSide.SELL
+        else:
+            order_side = OrderSide.BUY
+        
+        order =self.strategy.order_factory.market(
+            instrument_id=position.instrument_id,
+            order_side=order_side,
+            quantity=Quantity.from_int(abs(int(position.quantity))),
+            time_in_force=self.timing_force,
+        )
+        
+        # Submit order
+        if order:
+            self.strategy.submit_order(order)
+
+
+
     def liquidate_all(self, symbols: List[str]) -> None:
         """
         Emergency liquidation of all positions.
@@ -257,7 +312,7 @@ class OrderManager:
         # Close all positions abd  Unsubscribe from all data
         for symbol in symbols:
             instrument_id = InstrumentId(Symbol(symbol), self.strategy.venue)
-            self.close_position(instrument_id, reason="emergency_liquidation")
+            self.close_all_positions(instrument_id, reason="emergency_liquidation")
             self.strategy.unsubscribe_instrument(instrument_id = instrument_id)
         
         # Cancel all pending orders
@@ -591,6 +646,7 @@ class OrderManager:
             time_in_force=self.timing_force,
         )
         
+    
     # =========================================================================
     # Helper Methods
     # =========================================================================
@@ -708,3 +764,40 @@ class OrderManager:
             metrics['max_slippage_bps'] = 0
         
         return metrics
+    
+    def _handle_hedging_positions(
+        self, 
+        instrument_id: InstrumentId, 
+        positions_list: list, 
+        order_qty: float,
+        target_qty: float
+    ) -> None:
+        """
+        Handle position changes for HEDGING accounts.
+        Close opposite positions before opening new ones.
+        
+        Args:
+            instrument_id: Instrument to trade
+            positions_list: List of existing positions
+            order_qty: Desired order quantity
+            target_qty: Target position
+        """
+        # Separate LONG and SHORT positions
+        long_positions = [p for p in positions_list if p.is_long]
+        short_positions = [p for p in positions_list if p.is_short]
+        
+        # If target is LONG and we have SHORTs, close shorts first
+        if target_qty > 0 and short_positions:
+            for pos in short_positions:
+                logger.info(f"Closing SHORT position {pos.id} before going LONG")
+                self.close_position(pos)
+        
+        # If target is SHORT and we have LONGs, close longs first
+        elif target_qty < 0 and long_positions:
+            for pos in long_positions:
+                logger.info(f"Closing LONG position {pos.id} before going SHORT")
+                self.close_position(pos)
+                
+        # Execute the main order
+        if order_qty != 0:
+            self.execute_order(instrument_id, int(order_qty))

@@ -700,7 +700,7 @@ class OptunaHparamsTuner:
             BacktestVenueConfig(
                 name=self.strategy_params["venue_name"],
                 book_type="L1_MBP",         # bars are inluded in L1 market-by-price
-                oms_type = "NETTING",
+                oms_type = backtest_cfg["STRATEGY"]["oms_type"],
                 account_type=backtest_cfg["STRATEGY"]["account_type"],
                 base_currency=backtest_cfg["STRATEGY"]["currency"],
                 starting_balances=[str(backtest_cfg["STRATEGY"]["initial_cash"])+" "+str(backtest_cfg["STRATEGY"]["currency"])],

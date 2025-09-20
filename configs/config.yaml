@@ -127,13 +127,14 @@ STRATEGY:
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
     freq: 1D                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
     train_start:  2019-01-01     # Initial date where the
-    backtest_end: 2020-01-01     # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= train_start + train_offset [+ valid_offset] + pred_len
+    backtest_end: 2021-01-01     # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= train_start + train_offset [+ valid_offset] + pred_len
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     currency: USD
     warm_start:      true        # Enable warm-start                   
     rebalance_only: false        # false = all universe instruments are considered for top_k. true = portoflio instruments stay the same, with dynamic reallocation 
-    account_type: CASH           # "CASH" = long positions only or sells. "MARGIN" can short as well
+    account_type: CASH           # "CASH" = spot trading. "MARGIN" can trade derivatives and options as welll. TODO: not implememted
+    oms_type: NETTING            # Order Management System type. NETTING = only long positions. HEDGING = long and short
     venue_name: SIM              # name of the venue to use for trading
 
     # Paths
@@ -181,7 +182,6 @@ STRATEGY:
       use_limit_orders: false  # whether to use LIMIT orders or MARKET-only
       limit_offset_bps: 0.005  # +-5% LIMIT order placed
       max_retries: 3           # n of retries if order is unsuccessfull before cancelling the remaining portion
-
 
     # Liquidity constraints   
     liquidity:
@@ -258,27 +258,27 @@ STRATEGY:
       default: 0.03
       optuna:
         optuna_type: low-high
-        low: 0.02
-        high: 0.05
+        low: 0.001
+        high: 0.99
     
-    risk_max_weight_rel:              # Max 20 % of gross exposure in one name
-      default: 0.20
-      optuna:
-        optuna_type: low-high
-        low: 0.15
-        high: 0.30
+    #risk_max_weight_rel:              # Max 20 % of gross exposure in one name
+    #  default: 0.20
+    #  optuna:
+    #    optuna_type: low-high
+    #    low: 0.15
+    #    high: 0.30
 
     # Allocation constraints
-    allocation_gross_leverage:        # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
-      default: 2.0
-      optuna:
-        optuna_type: low-high
-        low: 1.0
-        high: 3.0
+    #allocation_gross_leverage:        # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
+    #  default: 2.0
+    #  optuna:
+    #    optuna_type: low-high
+    #    low: 1.0
+    #    high: 3.0
     
-    allocation_net_exposure:          # Σwᵢ ≈ 0 (market-neutral)
-      default: 0.0
-      optuna:
-        optuna_type: low-high
-        low: -0.2
-        high: 0.2
+    #allocation_net_exposure:          # Σwᵢ ≈ 0 (market-neutral)
+    #  default: 0.0
+    #  optuna:
+    #    optuna_type: low-high
+    #    low: -0.2
+    #    high: 0.2
