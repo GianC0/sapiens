@@ -92,7 +92,7 @@ class CsvBarLoader:
 
         stock_dir = self._root / "stocks" / cfg["calendar"]
         self._stock_files = sorted(stock_dir.glob("*.csv"))
-        benchmarks_file = self._root / "benchmarks" / "benchmarks.csv"
+        benchmarks_file = self._root / "benchmarks" / "bond_etfs.csv"
 
         self._universe: List[str] = (
             universe
@@ -121,16 +121,27 @@ class CsvBarLoader:
         self._benchmark_data = None
         self._risk_free_df = None
         if benchmarks_file.exists():
-            df = pd.read_csv(benchmarks_file, parse_dates=['dt'])
-            df.rename(columns={"dt": "Date"}, inplace=True)
+            df = pd.read_csv(benchmarks_file, parse_dates=['Date'])
+            #df.rename(columns={"dt": "Date"}, inplace=True)
             df.set_index('Date', inplace=True)
             df.index = pd.to_datetime(df.index, utc=True)
             
             # Risk-free rate from US Treasury 3-months yield column (already in %)
-            self._risk_free_df = df[['us3m']] / 100.0  # Double brackets → DataFrame
-            self._risk_free_df.rename(columns={"us3m": "risk_free"}, inplace=True)
-            self._risk_free_df.sort_index(inplace=True)
+            #self._risk_free_df = df[['us3m']] / 100.0  # Double brackets → DataFrame
+            #self._risk_free_df.rename(columns={"us3m": "risk_free"}, inplace=True)
+            #self._risk_free_df.sort_index(inplace=True)
             
+            # Risk-free rate from US Treasury 3-months by following SGOV ETF index.
+            self._risk_free_df = df[['SGOV']].copy() # Double brackets → DataFrame
+
+            # Ensure time order
+            self._risk_free_df.sort_index(inplace=True)
+
+            # Convert to daily returns (percentage change)
+            self._risk_free_df['return'] = self._risk_free_df['SGOV'].pct_change()
+            self._risk_free_df.rename(columns={"SGOV": "risk_free"}, inplace=True)
+            self._risk_free_df.sort_index(inplace=True)
+
             
             # Benchmark using S&P500
             if benchmark == "SPY":

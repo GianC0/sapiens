@@ -763,7 +763,7 @@ class TopKStrategy(Strategy):
             for position in self.cache.positions_open():
                 if position.instrument_id == instrument_id:
                     net_position += float(position.signed_qty)
-            current_w = (net_position * prices[symbol] / nav) if (net_position & nav > 0) else 0.0
+            current_w = (net_position * prices[symbol] / nav) if (net_position and nav > 0) else 0.0
             
             volumes = [float(b.volume) for b in bars[-self.adv_lookback:]]
             adv = float(np.mean(volumes)) if volumes else 0.0
@@ -792,6 +792,8 @@ class TopKStrategy(Strategy):
         # Optimize with valid symbols only
         valid_mu = np.array([preds[s] for s in valid_symbols])
         
+        #TODO: ensure that if all stocks have returns less than the risk free rate, then invest in risk free.
+
         # Call optimizer
         w_opt = self.optimizer.optimize(
             mu=valid_mu,
@@ -867,37 +869,37 @@ class TopKStrategy(Strategy):
                 #logger.info(f"  {ticker}: {len(data[ticker])} bars")
         return data
     
-def _calculate_portfolio_nav(self) -> float:
-    """Calculate total portfolio value: cash + market value of all positions."""
-    # Get cash balance
-    account = self.portfolio.account(self.venue)
-    if account:
-        cash_balance = float(account.balance_total(self.strategy_params["currency"]))
-    else:
-        cash_balance = float(self.strategy_params["initial_cash"])
-    
-    # Add market value of all open positions (handles multiple positions per instrument)
-    total_positions_value = 0.0
-    positions_by_instrument = {}
-    
-    for position in self.cache.positions_open():
-        instrument_id = position.instrument_id
+    def _calculate_portfolio_nav(self) -> float:
+        """Calculate total portfolio value: cash + market value of all positions."""
+        # Get cash balance
+        account = self.portfolio.account(self.venue)
+        if account:
+            cash_balance = float(account.balance_total(self.strategy_params["currency"]))
+        else:
+            cash_balance = float(self.strategy_params["initial_cash"])
         
-        # Aggregate positions for each instrument (for HEDGING accounts)
-        if instrument_id not in positions_by_instrument:
-            positions_by_instrument[instrument_id] = 0.0
-        positions_by_instrument[instrument_id] += float(position.signed_qty)
-    
-    # Calculate market value for net positions
-    for instrument_id, net_quantity in positions_by_instrument.items():
-        bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
-        bars = self.cache.bars(bar_type)
+        # Add market value of all open positions (handles multiple positions per instrument)
+        total_positions_value = 0.0
+        positions_by_instrument = {}
         
-        if bars:
-            current_price = float(bars[-1].close)
-            position_value = net_quantity * current_price
-            total_positions_value += position_value
-    
-    nav = cash_balance + total_positions_value
-    logger.info(f"NAV Calculation: Cash={cash_balance:.2f}, Positions={total_positions_value:.2f}, Total={nav:.2f}")
-    return nav
+        for position in self.cache.positions_open():
+            instrument_id = position.instrument_id
+            
+            # Aggregate positions for each instrument (for HEDGING accounts)
+            if instrument_id not in positions_by_instrument:
+                positions_by_instrument[instrument_id] = 0.0
+            positions_by_instrument[instrument_id] += float(position.signed_qty)
+        
+        # Calculate market value for net positions
+        for instrument_id, net_quantity in positions_by_instrument.items():
+            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
+            bars = self.cache.bars(bar_type)
+            
+            if bars:
+                current_price = float(bars[-1].close)
+                position_value = net_quantity * current_price
+                total_positions_value += position_value
+        
+        nav = cash_balance + total_positions_value
+        logger.info(f"NAV Calculation: Cash={cash_balance:.2f}, Positions={total_positions_value:.2f}, Total={nav:.2f}")
+        return nav
