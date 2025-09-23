@@ -210,7 +210,7 @@ class OrderManager:
             # Calculate order quantity needed
             order_qty = target_qty - net_current_qty
             
-            logger.info(f"{symbol}: Current qty={current_qty}, Target qty={target_qty}, Order qty={order_qty}")
+            logger.info(f"{symbol}: Current qty={net_current_qty}, Target qty={target_qty}, Order qty={order_qty}")
             
             if abs(order_qty) > 0:
                 # For HEDGING accounts, close opposite positions first if switching sides
@@ -797,7 +797,7 @@ class OrderManager:
             for pos in long_positions:
                 logger.info(f"Closing LONG position {pos.id} before going SHORT")
                 self.close_position(pos)
-                
+
         # Execute the main order
         if order_qty != 0:
             self.execute_order(instrument_id, int(order_qty))

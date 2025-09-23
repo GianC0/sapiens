@@ -76,7 +76,6 @@ class CsvBarLoader:
         universe: Optional[List[str]] = None,
         columns_to_load: str = "candles", 
         adjust: bool = False,
-        benchmark: str = "SPY"
     ):
         root = Path(cfg["data_dir"])
         freq = cfg["freq"]
@@ -92,7 +91,12 @@ class CsvBarLoader:
 
         stock_dir = self._root / "stocks" / cfg["calendar"]
         self._stock_files = sorted(stock_dir.glob("*.csv"))
-        benchmarks_file = self._root / "benchmarks" / "bond_etfs.csv"
+
+        benchmarks_file = self._root / "benchmarks" / "benchmarks.csv"
+        benchmark = cfg["benchmark_ticker"]
+        
+        risk_free_ticker = cfg["risk_free_ticker"]
+        risk_free_path = self._root / "etf"/ f"{risk_free_ticker}.csv"   # risk free taken as returns of etf following T-Bills 
 
         self._universe: List[str] = (
             universe
@@ -104,9 +108,10 @@ class CsvBarLoader:
         self._frames: Dict[str, pd.DataFrame] = {}    
         self._instruments: Dict[str, Equity] = {}
         
+        # load stocks
         for path in self._stock_files:
             symbol = path.stem.upper()
-            if symbol in self._universe:
+            if symbol in self._universe: 
                 df = self._parse_stock_csv(path, adjust = adjust)
                 if columns_to_load == "candles":
                     available_cols = [col for col in ["Open","High","Low","Close","Volume"] if col in df.columns]
@@ -116,31 +121,34 @@ class CsvBarLoader:
                 # Create instrument for each stock
                 self._instruments[symbol] = self._create_equity_instrument(symbol)
         
+        # Include SGOV or risk_free ETF as tradable instrument
+        df_rf = self._parse_stock_csv(risk_free_path, adjust=adjust)
+        if risk_free_path.exists() and risk_free_ticker not in self._frames:
+            if columns_to_load == "candles":
+                available_cols = [col for col in ["Open","High","Low","Close","Volume"] if col in df_rf.columns]
+                self._frames[risk_free_ticker] = df_rf[available_cols]
+            else:
+                self._frames[risk_free_ticker] = df_rf
+            self._instruments[risk_free_ticker] = self._create_equity_instrument(risk_free_ticker)
+        self._universe.append(risk_free_ticker)
+        
+        # Create risk free to use for sharpe ratio
+        self._risk_free_df = (
+            df_rf[["Adj Close"]]                   # keep only Close col
+            .rename(columns={"Adj Close": "risk_free"})
+            .pct_change()
+            .fillna(0.0)
+            )
+        
+        
         # Load benchmark data
         
         self._benchmark_data = None
-        self._risk_free_df = None
+        
         if benchmarks_file.exists():
-            df = pd.read_csv(benchmarks_file, parse_dates=['Date'])
-            #df.rename(columns={"dt": "Date"}, inplace=True)
-            df.set_index('Date', inplace=True)
+            df = pd.read_csv(benchmarks_file, parse_dates=['dt'])
+            df.rename(columns={"dt": "Date"}, inplace=True)
             df.index = pd.to_datetime(df.index, utc=True)
-            
-            # Risk-free rate from US Treasury 3-months yield column (already in %)
-            #self._risk_free_df = df[['us3m']] / 100.0  # Double brackets → DataFrame
-            #self._risk_free_df.rename(columns={"us3m": "risk_free"}, inplace=True)
-            #self._risk_free_df.sort_index(inplace=True)
-            
-            # Risk-free rate from US Treasury 3-months by following SGOV ETF index.
-            self._risk_free_df = df[['SGOV']].copy() # Double brackets → DataFrame
-
-            # Ensure time order
-            self._risk_free_df.sort_index(inplace=True)
-
-            # Convert to daily returns (percentage change)
-            self._risk_free_df['return'] = self._risk_free_df['SGOV'].pct_change()
-            self._risk_free_df.rename(columns={"SGOV": "risk_free"}, inplace=True)
-            self._risk_free_df.sort_index(inplace=True)
 
             
             # Benchmark using S&P500
@@ -334,22 +342,48 @@ class CsvBarLoader:
 
     @staticmethod
     def _compute_adj_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute adjusted OHLC prices using either:
+        1. Adj Close / Close ratio if both columns exist
+        2. Dividends and Stock Splits if available
+        """
         df = df.sort_index().copy()
-        factors = np.ones(len(df))
-        div  = df.get("Dividends", pd.Series(0.0, index=df.index)).fillna(0.0)
-        splt = df.get("Stock Splits", pd.Series(0.0, index=df.index)).fillna(0.0)
-
-        factor = 1.0
-        for i in range(len(df) - 1, -1, -1):
-            c = df.iloc[i]["Close"]
-            factor *= (1.0 - div.iat[i] / c) / (1.0 + splt.iat[i])
-            factors[i] = factor
-        df["Open"] = df["Open"] * factors
-        df["High"] = df["High"] * factors
-        df["Low"] = df["Low"] * factors
-        df["Close"] = df["Close"] * factors
-
-
+        
+        # Method 1: If Adj Close exists, use it to compute factors
+        if "Adj Close" in df.columns and "Close" in df.columns:
+            # Calculate adjustment factors from Adj Close / Close ratio
+            factors = df["Adj Close"] / df["Close"]
+            factors = factors.fillna(1.0)  # Handle any NaN values
+            
+            # Apply factors to OHLC
+            df["Open"] = df["Open"] * factors
+            df["High"] = df["High"] * factors
+            df["Low"] = df["Low"] * factors
+            df["Close"] = df["Adj Close"]  # Use Adj Close as the adjusted close
+            
+            logger.info(f"Using Adj Close column for adjustment factors")
+        
+        # Method 2: Fall back to dividends and splits calculation
+        else:
+            factors = np.ones(len(df))
+            div = df.get("Dividends", pd.Series(0.0, index=df.index)).fillna(0.0)
+            splt = df.get("Stock Splits", pd.Series(0.0, index=df.index)).fillna(0.0)
+            
+            factor = 1.0
+            for i in range(len(df) - 1, -1, -1):
+                c = df.iloc[i]["Close"]
+                if c > 0:  # Avoid division by zero
+                    factor *= (1.0 - div.iat[i] / c) / (1.0 + splt.iat[i])
+                factors[i] = factor
+            
+            # Apply factors to OHLC
+            df["Open"] = df["Open"] * factors
+            df["High"] = df["High"] * factors
+            df["Low"] = df["Low"] * factors
+            df["Close"] = df["Close"] * factors
+            
+            logger.info(f"Using Dividends/Splits for adjustment factors")
+        
         return df
 
     @staticmethod

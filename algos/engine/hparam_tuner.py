@@ -106,8 +106,7 @@ class OptunaHparamsTuner:
         self.seed = seed
 
         # --- Data Loader and Data Augmentation setup -------------------------------------------
-        loader_cfg = {k: v for k, v in self.strategy_params.items() if k in ["freq", "calendar", "data_dir", "currency"]}
-        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name=self.strategy_params["venue_name"], columns_to_load=self.model_params["features_to_load"], adjust = self.model_params["adjust"])
+        self.loader = CsvBarLoader(cfg=self.strategy_params, venue_name=self.strategy_params["venue_name"], columns_to_load=self.model_params["features_to_load"], adjust = self.model_params["adjust"])
         
         # Setup MLflow
         self._setup_mlflow()
@@ -231,7 +230,7 @@ class OptunaHparamsTuner:
                 
                 # setting train_offset and model_dir to model flatten config dictionary
                 # adding train_offset here to avoid type overwite later  (pandas.offset -> str)
-                train_offset = trial_hparams.get("train_offset")
+                train_offset = trial_hparams["train_offset"]
                 model_dir = self.run_dir / "model" /  f"trial_{trial.number}"
                 model_dir.mkdir(parents=True, exist_ok=True)
                 model_params_flat  = self._add_dates(self.model_params, train_offset ) # merged dictionary
@@ -298,6 +297,9 @@ class OptunaHparamsTuner:
             # Get best trial
             best_trial = study.best_trial
             self.best_model_params_flat = best_trial.user_attrs["best_model_params_flat"]
+            # quick and dirty fix
+            self.best_model_params_flat["train_offset"] = self.best_model_params_flat["train_offset"]
+
             self.best_model_path = Path(best_trial.user_attrs["model_path"])
             
             # Log best results
@@ -378,6 +380,7 @@ class OptunaHparamsTuner:
 
                 offset = self.best_model_params_flat["train_offset"]
                 strategy_params_flat = self._add_dates(self.strategy_params, offset ) | trial_hparams
+                self.best_model_params_flat["train_offset"] = freq2pdoffset(offset)
                 
                 # Start MLflow run for this trial
                 with mlflow.start_run(
@@ -395,6 +398,8 @@ class OptunaHparamsTuner:
                     mlflow.log_param("phase", "strategy_optimization")
                     mlflow.log_param("model_path", str(self.best_model_path))
                     
+
+
                     # Run backtest with these strategy parameters
                     metrics = self._backtest(
                         model_params_flat= self.best_model_params_flat,  # type: ignore
@@ -721,7 +726,8 @@ class OptunaHparamsTuner:
         ]
 
         # Initialize Strategy
-        strategy_name = self.strategy_params.get('strategy_name', 'TopKStrategy')
+        strategy_name = self.strategy_params['strategy_name']
+        model_name = self.model_params["model_name"]
         try:
             # Try to import from algos module
             strategy_module = importlib.import_module(f"algos.{strategy_name}")
@@ -735,9 +741,10 @@ class OptunaHparamsTuner:
             logger.error(f"Failed to import strategy {strategy_name}: {e}")
             raise
         #strategy = StrategyClass(config=backtest_cfg)
+        # TODO: add the fees from cfg
         config=BacktestRunConfig(
                 engine=BacktestEngineConfig(
-                    trader_id=f"Backtest-{backtest_cfg["MODEL"]["model_name"]}-{backtest_cfg["STRATEGY"]["strategy_name"]}",
+                    trader_id=f"Backtest-{model_name}-{strategy_name}",
                     strategies=[ImportableStrategyConfig(
                         strategy_path=f"algos.{strategy_name}:{strategy_name}",
                         config_path = f"algos.{strategy_name}:{strategy_name}Config",

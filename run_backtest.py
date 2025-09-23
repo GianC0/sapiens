@@ -34,7 +34,8 @@ def main():
 
     # Setup directories
     logs_dir = Path(cfg["STRATEGY"]["PARAMS"]["logs_dir"]).parent  # log_dir is parent directory of strategy
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    #timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = "20250922_066666"
     run_dir = logs_dir / "backtests" / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -111,7 +112,6 @@ def main():
         final_metrics = tuner._backtest(
             model_params_flat = optimized_config_flat["MODEL"],
             strategy_params_flat = optimized_config_flat["STRATEGY"],
-            strategy_params_path=strategy_results["strategy_params_path"],
             start = backtest_start,
             end = backtest_end,
         )

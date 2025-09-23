@@ -38,14 +38,14 @@ MODEL:
       optuna:
         optuna_type: "categorical"
         #choices: ["3BME", "6BME", "12BME"]
-        choices: ["1BME", "2BME", "3BME"]
+        choices: ["5BME"] #, "2BME", "3BME"]
 
     # L : look-back window length
     window_len:  
       default: 10
       optuna:
         optuna_type: "categorical"
-        choices: [1,2,3]
+        choices: [10,15]
         #choices: [7, 30, 60, 150, 365]
 
     # λ_IC   : independence loss weight
@@ -75,7 +75,7 @@ MODEL:
       optuna:
         optuna_type: low-high
         low: 0.03
-        high: 0.2
+        high: 0.1
     
     # θ_sync : threshold for stock synchrony
     sync_thr:
@@ -126,8 +126,8 @@ STRATEGY:
     # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
     freq: 1D                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
-    train_start:  2019-01-01     # Initial date where the
-    backtest_end: 2021-01-01     # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= train_start + train_offset [+ valid_offset] + pred_len
+    train_start:  2021-01-01     # Initial date where the
+    backtest_end: 2025-01-01     # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= train_start + train_offset [+ valid_offset] + pred_len
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     currency: USD
@@ -136,6 +136,8 @@ STRATEGY:
     account_type: CASH           # "CASH" = spot trading. "MARGIN" can trade derivatives and options as welll. TODO: not implememted
     oms_type: NETTING            # Order Management System type. NETTING = only long positions. HEDGING = long and short
     venue_name: SIM              # name of the venue to use for trading
+    risk_free_ticker: "SGOV"     # Risk-free ETF to include in portfolio
+    benchmark_ticker: "SPY"      # Benchmark for M2 optimization
 
     # Paths
     data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
@@ -151,7 +153,7 @@ STRATEGY:
     # Objectives: sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown, total_return, annual_return, daily_vol
     tune_hparams: true
     n_trials: 10
-    valid_split : 0.2    # meaning 80/20 train/valid split of full training dataset. NOTE: used also for model split
+    valid_split : 0.3    # meaning 80/20 train/valid split of full training dataset. NOTE: used also for model split
     objectives:          # use only nautilus_trader portfolio_analyzer statistics
       sharpe_ratio: maximize
       #total_return: maximize
@@ -209,7 +211,7 @@ STRATEGY:
       default: "30D"                    # D = Day
       optuna:
         optuna_type: "categorical"
-        choices: ["7D", "14D", "30D", "60D"]
+        choices: ["30D", "60D"]
     
     # Light fine-tune epochs
     warm_training_epochs:      
@@ -230,7 +232,7 @@ STRATEGY:
       default: "60B"
       optuna:
         optuna_type: categorical
-        choices: ["30B", "60B", "90B", "120B"]
+        choices: ["30B", "60B"]
     
     # Risk management overlays
     risk_trailing_stop_pct:           # % trailing stop from HWM/LWM 5%

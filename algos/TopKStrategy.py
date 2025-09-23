@@ -137,15 +137,14 @@ class TopKStrategy(Strategy):
         self.model_name = self.model_params["model_name"]
         self.bar_type = None  # Set in on_start
         self.bar_spec = freq2barspec( self.strategy_params["freq"])
-        self.min_bars_required = self.model_params["window_len"] + self.model_params["pred_len"]
+        self.min_bars_required = self.model_params["window_len"] + 1
         self.optimizer_lookback = freq2pdoffset( self.strategy_params["optimizer_lookback"])
         
         
         # Loader for data access
         venue_name = self.strategy_params["venue_name"]
         self.venue = Venue(venue_name)
-        loader_cfg = {k: v for k, v in self.strategy_params.items() if k in ["freq", "calendar", "data_dir", "currency"]}
-        self.loader = CsvBarLoader(cfg=loader_cfg, venue_name=self.venue.value, columns_to_load=self.model_params["features_to_load"], adjust=self.model_params["adjust"])
+        self.loader = CsvBarLoader(cfg=self.strategy_params, venue_name=self.venue.value, columns_to_load=self.model_params["features_to_load"], adjust=self.model_params["adjust"])
         
         # State tracking
         self.universe: List[str] = []  # Ordered list of instruments
@@ -183,13 +182,14 @@ class TopKStrategy(Strategy):
         weight_bounds = (-1, 1)   # (-) = short position ,  (+) = long position 
         if not self.can_short:
             weight_bounds = (0, 1)  # long-only positions
+        self.weight_bounds = weight_bounds
         self.optimizer = create_optimizer(name = optimizer_name, adv_lookback = self.adv_lookback, max_adv_pct = self.max_adv_pct, weight_bounds = weight_bounds)
         self.rebalance_only = self.strategy_params.get("rebalance_only", False)  # Rebalance mode
         self.top_k = self.strategy_params.get("top_k", 50)  # Portfolio size
         
 
         # Risk free rate dataframe to use for Sharpe Ratio
-        self.rf_rate = self.loader.risk_free_df
+        self.risk_free_df = self.loader.risk_free_df
 
         # Order Manager for any strategy
         self.order_manager = OrderManager(self, self.strategy_params)
@@ -294,7 +294,7 @@ class TopKStrategy(Strategy):
         assert self.universe == self.model._universe, "Universe mismatch between strategy and model"
 
         # ensure the model has enough data for prediction
-        lookback_periods = self.pred_len + 1  # Need L+1 bars for prediction
+        lookback_periods = self.model_params["window_len"] + 1  # Need L+1 bars for prediction
         start_date = now - freq2pdoffset(self.strategy_params["freq"]) * ( lookback_periods - 1) 
         days_range = self.calendar.schedule(start_date=start_date, end_date=now)
         timestamps = market_calendars.date_range(days_range, frequency=self.strategy_params["freq"]).normalize()
@@ -334,9 +334,14 @@ class TopKStrategy(Strategy):
             return
         
         logger.info(f"Starting model retrain at {now}")
+
+        # comput how much data to load
+        days_range = self.calendar.schedule(start_date= self._last_retrain_time, end_date=now)
+        timestamps = market_calendars.date_range(days_range, frequency=self.strategy_params["freq"]).normalize()
+        rolling_window_size = len(timestamps)
         
         # Get updated data window
-        data_dict = self._cache_to_dict(window=0)  # Get all available data
+        data_dict = self._cache_to_dict(window= (rolling_window_size))  # Get all latest
         if not data_dict:
             return
         
@@ -347,9 +352,10 @@ class TopKStrategy(Strategy):
         self.model.update(
             data=data_dict,
             current_time=now,
+            retrain_start_date = self._last_retrain_time,
             active_mask=self.active_mask,
             warm_start=self.strategy_params.get("warm_start", False),
-            warm_training_epochs=self.strategy_params.get("warm_training_epochs", 1)
+            warm_training_epochs=self.strategy_params.get("warm_training_epochs", 1),
         )
         
         self._last_retrain_time = now
@@ -545,7 +551,7 @@ class TopKStrategy(Strategy):
                 
             selected.append(ticker)
             
-        logger.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates")
+        logger.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates (including risk-free) ")
         self.universe = sorted(selected)
 
     def _initialize_model(self) -> MarketModel:
@@ -589,15 +595,17 @@ class TopKStrategy(Strategy):
             if iid.symbol.value not in self.universe:
                 continue
             bar_type = BarType(instrument_id=iid, bar_spec= self.bar_spec)
+
+            count = self.cache.bar_count(bar_type)
+            if count < self.min_bars_required:
+                logger.warning(f"Insufficient bars for {iid.symbol}: {count} < {self.min_bars_required}")
+                continue
             
             # Get bars from cache
             if window == 0: # load all cache
                 window = self.strategy_params["engine"]["cache"]["bar_capacity"]
             bars = self.cache.bars(bar_type)[:window]  # Get last 'window' bars (nautilus cache notation is opposite to pandas)
-            if not bars or len(bars) < self.min_bars_required:
-                logger.warning(f"Insufficient bars for {iid.symbol}: {len(bars)} < {self.min_bars_required}")
-                continue
-            
+
             # ensure there is at least one new bar after the last predition
             assert pd.to_datetime(bars[0].ts_event, unit="ns", utc=True ) > self._last_update_time
             
@@ -644,12 +652,12 @@ class TopKStrategy(Strategy):
         return mask
     
     # ----- weight optimiser ------------------------------------------
-    def _get_risk_free_rate(self, timestamp: pd.Timestamp) -> float:
+    def _get_risk_free_rate_return(self, timestamp: pd.Timestamp) -> float:
         """Get risk-free rate for given timestamp with average fallback logic."""
         if self.loader._benchmark_data is None:
             return 0.0
         
-        df = self.rf_rate
+        df = self.risk_free_df
         
         # Try exact date first
         if timestamp.normalize() in df.index:
@@ -689,21 +697,19 @@ class TopKStrategy(Strategy):
 
         return volatility
 
-    def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
+    def _compute_target_weights_old(self, preds: Dict[str, float]) -> Dict[str, float]:
         """Compute target portfolio weights from predictions using optimizer."""
         
         # Convert predictions to array aligned with universe
         now = pd.Timestamp(self.clock.utc_now(),)
         # Current risk-free rate
-        current_rf = self._get_risk_free_rate(now)
+        current_rf = self._get_risk_free_rate_return(now)
         # Benchmark volatility
         benchmark_vol = self._get_benchmark_volatility(now)
         # Current portfolio net asset value
         nav = self._calculate_portfolio_nav()
-
-
-        # Check if we can short (margin account) or only long (cash account)
-        
+        # ASSET SELECTION: Include risk-free ETF
+        risk_free_ticker = self.strategy_params["risk_free_ticker"]
 
 
         # ASSET SELECTION: select from whole universe or only from portfolio
@@ -713,12 +719,14 @@ class TopKStrategy(Strategy):
             selected_symbols = [pos.instrument_id.symbol.value for pos in self.cache.positions_open()]
         else:
             # Select top-k based on predictions
-            pred_series = pd.Series(preds)
+            # Filter predictions excluding risk-free first
+            stock_preds = {k: v for k, v in preds.items() if k != risk_free_ticker}
+            pred_series = pd.Series(stock_preds)
             
             if self.can_short:
                 l_n = self.selector_k // 2
-                longs = pred_series.nlargest(l_n).index.tolist()
-                shorts = pred_series.nsmallest(self.selector_k - l_n).index.tolist()
+                longs = pred_series.nlargest(l_n).index.tolist()   # largest for small positions
+                shorts = pred_series.nsmallest(self.selector_k - l_n).index.tolist()  #largst negative for short positions
                 selected_symbols = longs + shorts
             else:
                 # TODO: ensure that this loss minimization is also working for pred_series all with negative samples
@@ -810,6 +818,126 @@ class TopKStrategy(Strategy):
         
         return w.to_dict()
 
+    def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
+        """Compute target portfolio weights using M2 optimizer and optional sign enforcement.
+
+        Behavior controlled by self.enforce_pred_sign (True -> force sign to match preds,
+        False -> keep optimizer sign).
+        """
+        now = pd.Timestamp(self.clock.utc_now())
+        current_rf = self._get_risk_free_rate_return(now)
+
+        # build candidate list excluding risk free ticker
+        risk_free_ticker = self.strategy_params["risk_free_ticker"]
+        candidate_symbols = [s for s in self.universe] # risk_free etf is included as tradable asset. otherwise enforce  if s != risk_free_ticker
+
+        # gather return series and allowed ranges for valid symbols
+        returns_data = []
+        valid_symbols = []
+        prices = {}
+        allowed_weight_ranges = []
+
+        # Current portfolio net asset value
+        nav = self._calculate_portfolio_nav()
+
+        for symbol in candidate_symbols:
+            instrument_id = InstrumentId(Symbol(symbol), self.venue)
+            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
+            bars = self.cache.bars(bar_type)
+            if not bars or len(bars) < 2:
+                continue
+
+            # returns per single period (same freq as preds' base period)
+            lookback_n = max(2, int(self.optimizer_lookback.n))
+            closes = [float(b.close) for b in bars[-lookback_n:]]
+            returns = pd.Series(closes).pct_change().dropna()
+            if len(returns) == 0:
+                continue
+
+            returns_data.append(returns.values)
+            valid_symbols.append(symbol)
+            prices[symbol] = float(bars[-1].close)
+
+            # compute allowed weight ranges (same logic you already had)
+            net_position = 0.0
+            for position in self.cache.positions_open():
+                if position.instrument_id == instrument_id:
+                    net_position += float(position.signed_qty)
+            current_w = (net_position * prices[symbol] / nav) if (net_position and nav > 0) else 0.0
+
+            # ADV
+            volumes = [float(b.volume) for b in bars[-self.adv_lookback:]] if len(bars) >= self.adv_lookback else [float(b.volume) for b in bars]
+            adv = float(np.mean(volumes)) if volumes else 0.0
+            max_w_relative = min((adv * self.max_adv_pct * prices[symbol]) / nav, self.max_w_abs) if nav > 0 else self.max_w_abs
+
+            # compute min or min/max weight for instrument in portfolio 
+            if self.can_short:
+                w_min = max(current_w - max_w_relative, -self.max_w_abs, self.weight_bounds[0])
+                w_max = min(current_w + max_w_relative, self.max_w_abs, self.weight_bounds[1])
+            else:
+                w_min = 0.0
+                w_max = min(current_w + max_w_relative, self.max_w_abs) if current_w > 0 else min(max_w_relative, self.max_w_abs)
+
+            allowed_weight_ranges.append([w_min, w_max])
+
+        if len(returns_data) <= 1:
+            return {}
+
+        # Build covariance per single period and scale to pred_horizon
+        returns_df = pd.DataFrame(returns_data).T  # rows = times, cols = assets
+        cov_per_period = returns_df.cov().values
+        cov_horizon = cov_per_period * float(self.pred_len)  # scale to pred_len horizon
+
+        # prepare mu 
+        valid_mu = np.array([preds.get(s, 0.0) for s in valid_symbols])
+
+        # If all expected returns <= rf_horizon then allocate to risk-free ticker (if available)
+        if np.all(valid_mu <= current_rf):
+            w_series = pd.Series(0.0, index=self.universe)
+            if risk_free_ticker in self.universe:
+                w_series[risk_free_ticker] = 1.0
+            return w_series.to_dict()
+
+        # Call optimizer (M2) with horizon-scaled cov and rf_h
+        w_opt = self.optimizer.optimize(
+            mu=valid_mu,
+            cov=cov_horizon,
+            rf=current_rf,
+            benchmark_vol=self._get_benchmark_vol(now),
+            allowed_weight_ranges=np.array(allowed_weight_ranges)
+        )
+
+        if len(w_opt) != len(valid_symbols):
+            logger.warning("Optimizer returned unexpected vector length. Falling back to equal weights.")
+            w_opt = np.ones(len(valid_symbols)) / len(valid_symbols)
+
+        # Take top-K by absolute weight
+        k = min(self.selector_k, len(valid_symbols))
+        idx_sorted = np.argsort(-np.abs(w_opt))
+        top_idx = idx_sorted[:k]
+
+        final_arr = np.zeros_like(w_opt)
+
+        for i in top_idx:
+            val = w_opt[i]
+            # clip to allowed range
+            w_min, w_max = allowed_weight_ranges[i]
+            final_arr[i] = float(np.clip(val, w_min, w_max))
+
+        # Optional renormalization: preserve total abs exposure of the selected set from optimizer
+        abs_selected_sum = float(np.sum(np.abs(w_opt[top_idx])))
+        abs_final_sum = float(np.sum(np.abs(final_arr[top_idx])))
+        if abs_final_sum > 0 and abs_selected_sum > 0:
+            scale = abs_selected_sum / abs_final_sum
+            final_arr[top_idx] = final_arr[top_idx] * scale
+
+        # Map back to full universe
+        w_series = pd.Series(0.0, index=self.universe)
+        for i, symbol in enumerate(valid_symbols):
+            w_series[symbol] = final_arr[i]
+
+        return w_series.to_dict()
+
 
     # ----- trailing and drawdown stops for risk --------------------------------------------
     def _check_trailing_stop(self, sym: str, price: float):  # Removed async
@@ -842,7 +970,7 @@ class TopKStrategy(Strategy):
         nav_dict = self.portfolio.net_exposures(venue)
         if len(nav_dict) == 0:
             return
-        nav = nav_dict[self.strategy_params["currency"]].value
+        nav = float(nav_dict[self.strategy_params["currency"]])
         self.max_registered_portfolio_nav = max(self.max_registered_portfolio_nav, nav)
         #self.equity_analyzer.on_equity(ts, nav)
         

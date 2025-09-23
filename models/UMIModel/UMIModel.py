@@ -54,8 +54,6 @@ class UMIModel(nn.Module):
                                             # hybrid -> stage1 factors for few epochs, then stage2 altogether
                                             # sequential -> stage1 first until early stopping, then stage2
         target_idx: int = 3,  # usually "close" is at index 3
-        warm_start : bool= False,
-        warm_training_epochs: int = 5,
         save_backups: bool = False,         # Flag for saving backups during walk-forward
         model_dir: Path = Path("logs/UMIModel"),
         logger: Logger = Logger("INFO"),
@@ -146,10 +144,13 @@ class UMIModel(nn.Module):
         # Train from scratch
         if self.logger:
             self.logger.info(f"[initialize] Training for {self.n_epochs} epochs...")
-        best_val = self._train(data, self.n_epochs, active_mask )
+        start = self.train_end - self.train_offset + freq2pdoffset(self.freq)
+        end = self.valid_end
+        best_val = self._train(data, self.n_epochs, active_mask, start=start, end=end)
         
         # Save initial state
         torch.save(self.state_dict(), self.model_dir / "init.pt")
+        torch.save(self.state_dict(), self.model_dir / "latest.pt")
         
         # Mark as initialized
         self._is_initialized = True
@@ -162,7 +163,7 @@ class UMIModel(nn.Module):
 
         return best_val
 
-    def update(self, data: Dict[str, DataFrame], current_time: Timestamp, active_mask: torch.Tensor, warm_start: Optional[bool] = False, warm_training_epochs: Optional[int] = None):
+    def update(self, data: Dict[str, DataFrame], current_time: Timestamp, retrain_start_date: Timestamp, active_mask: torch.Tensor, warm_start: Optional[bool] = False, warm_training_epochs: Optional[int] = None):
         """
         One-off training (train + valid).
         """
@@ -198,7 +199,7 @@ class UMIModel(nn.Module):
             if self.logger:
                 self.logger.info(f"[update] Loading weights from {latest_path}")
             try:
-                self.load_state_dict(torch.load(latest_path, map_location=self._device))
+                self.load_state_dict(torch.load(latest_path, map_location=self._device, weights_only=False))
             except Exception as e:
                 if self.logger:
                     self.logger.info(f"[update] Failed to load weights: {e}, training from scratch")
@@ -209,7 +210,7 @@ class UMIModel(nn.Module):
             raise ImportError("Could not find latest.pt warmed-up model in ", self.model_dir)
         
         # Train
-        _ = self._train(data, epochs, active_mask)
+        _ = self._train(data, epochs, active_mask, start=retrain_start_date, end=current_time)
         
         # Save backup if requested
         if self.save_backups:
@@ -383,7 +384,7 @@ class UMIModel(nn.Module):
     # ----------------------------------------------------------------- #
     # ---------------- training utilities ----------------------------- #
     # ----------------------------------------------------------------- #
-    def _train(self, data: Dict[str, DataFrame], n_epochs: int, active_mask: torch.Tensor) -> float:
+    def _train(self, data: Dict[str, DataFrame], n_epochs: int, active_mask: torch.Tensor, start: Timestamp, end: Timestamp) -> float:
         """
         Unified training function that handles all three training modes:
         - "joint": Train all components together
@@ -402,9 +403,14 @@ class UMIModel(nn.Module):
         if self.valid_end < self.train_end:
             raise ValueError(f"Validation end date: {self.valid_end} is earlier that end train end date {self.train_end}")
 
+        
+        # quick and dirty fix
+        if isinstance(self.train_offset, str):
+            self.train_offset = freq2pdoffset(self.train_offset)
+
         # Create common timestamp index. This solves the start= -1 bar problem
         start_date = self.train_end - self.train_offset + freq2pdoffset(self.freq)
-        days_range = self.market_calendar.schedule(start_date= start_date, end_date=self.valid_end)
+        days_range = self.market_calendar.schedule(start_date= start, end_date=end)
         timestamps = market_calendars.date_range(days_range, frequency=self.freq).normalize()
         
         assert len(data) > 0
