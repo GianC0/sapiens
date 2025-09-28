@@ -31,19 +31,19 @@ import torch
 from dataclasses import dataclass, field
 import logging
 from nautilus_trader.model.identifiers import Venue
-
-logger = logging.getLogger(__name__)
-
 from nautilus_trader.model.currencies import USD,EUR
 from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Logger
+from nautilus_trader.core.data import Data
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose
+from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.orders import MarketOrder
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.model.instruments import Instrument
+from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from nautilus_trader.model.position import Position
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
@@ -53,6 +53,7 @@ from nautilus_trader.model.events import (
     OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated
 )
 
+logger = logging.getLogger(__name__)
 # ----- project imports -----------------------------------------------------
 from models.interfaces import MarketModel
 from algos.engine.data_loader import CsvBarLoader, FeatureBarData
@@ -135,7 +136,6 @@ class TopKStrategy(Strategy):
         # Model and data parameters
         self.model: Optional[MarketModel] = None
         self.model_name = self.model_params["model_name"]
-        self.bar_type = None  # Set in on_start
         self.bar_spec = freq2barspec( self.strategy_params["freq"])
         self.min_bars_required = self.model_params["window_len"] + 1
         self.optimizer_lookback = freq2pdoffset( self.strategy_params["optimizer_lookback"])
@@ -145,8 +145,7 @@ class TopKStrategy(Strategy):
         venue_name = self.strategy_params["venue_name"]
         self.venue = Venue(venue_name)
         self.loader = CsvBarLoader(cfg=self.strategy_params, venue_name=self.venue.value, columns_to_load=self.model_params["features_to_load"], adjust=self.model_params["adjust"])
-        
-        # State tracking
+        #self.catalog = ParquetDataCatalog( path = self.strategy_params["catalog_path"], fs_protocol="file")
         self.universe: List[str] = []  # Ordered list of instruments
         self.active_mask: Optional[torch.Tensor] = None  # (I,)
 
@@ -208,12 +207,23 @@ class TopKStrategy(Strategy):
         # Subscribe to bars for selected universe
         for instrument in self.loader.instruments.values():
             if instrument.id.symbol.value in self.universe:
-                self.bar_type = BarType(
+                bar_type = BarType(
                     instrument_id=instrument.id,
                     bar_spec=self.bar_spec
                 )
-                self.subscribe_bars(self.bar_type)
+
+                # compute load date for historical data up to now - ( window_len - 1 )
+                calendar = market_calendars.get_calendar(self.model_params["calendar"])
+                days_range = calendar.schedule(start_date=self.train_start, end_date=self.valid_start)
+                timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"]).normalize()
+                start = timestamps[-self.min_bars_required].to_pydatetime()
+
+                # request historical bars
+                self.request_bars(bar_type = bar_type,  start = start )
                 
+                # subscribe bars for walk forward
+                self.subscribe_bars(bar_type)
+
 
         # Build and initialize model
         self.model = self._initialize_model()
@@ -221,6 +231,11 @@ class TopKStrategy(Strategy):
 
         # Set initial update time to avoid immediate firing
         self.active_mask = torch.ones(len(self.loader.instruments), dtype=torch.bool)
+        
+        # initialize the chache with the latest historical window_length data
+        #self._initialize_cache_with_historical_data()
+
+        # initialize timers
         self._last_update_time = pd.Timestamp(self.clock.utc_now(),)
         self._last_retrain_time = pd.Timestamp(self.clock.utc_now(),)
 
@@ -392,14 +407,16 @@ class TopKStrategy(Strategy):
         # update the model mask and ensure the loader still provides same input shape to the model for prediction
         # remove from cache ??
         pass
-    def on_historical_data(self, data) -> None:
+    def on_historical_data(self, data: Data) -> None:
         """Process historical data for model training."""
+        assert False
         # Historical data is loaded at startup via loader
         pass
 
 
     # Unused ATM
-    def on_data(self, data) -> None:  # Custom data passed to this handler
+    def on_data(self, data: Data) -> None:  # Custom data passed to this handler
+        assert False
         return
     def on_signal(self, signal) -> None:  # Custom signals passed to this handler
         return
@@ -651,6 +668,23 @@ class TopKStrategy(Strategy):
     
         return mask
     
+    def _initialize_cache_with_historical_data(self):
+        """Load historical data into strategy's internal buffer for immediate use."""
+        now = pd.Timestamp(self.clock.utc_now())
+        lookback_periods = self.model_params["window_len"] + 1
+        
+        # Store historical data in a buffer
+        self._historical_buffer = {}
+        
+        for symbol in self.universe:
+            if symbol in self.loader._frames:
+                df = self.loader._frames[symbol]
+                # Get data up to current time
+                historical_data = df[df.index < now]
+                if len(historical_data) >= lookback_periods:
+                    # Keep last lookback_periods of historical data
+                    self._historical_buffer[symbol] = historical_data.iloc[-lookback_periods:]
+
     # ----- weight optimiser ------------------------------------------
     def _get_risk_free_rate_return(self, timestamp: pd.Timestamp) -> float:
         """Get risk-free rate for given timestamp with average fallback logic."""
@@ -1010,8 +1044,11 @@ class TopKStrategy(Strategy):
         total_positions_value = 0.0
         positions_by_instrument = {}
         
-        for position in self.cache.positions_open():
+        for position in self.cache.positions_open(venue = self.venue):
             instrument_id = position.instrument_id
+            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
+            market_value = self.cache.bars(bar_type)[-1].close
+            
             
             # Aggregate positions for each instrument (for HEDGING accounts)
             if instrument_id not in positions_by_instrument:

@@ -126,8 +126,9 @@ STRATEGY:
     # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
     freq: 1D                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
-    train_start:  2021-01-01     # Initial date where the
-    backtest_end: 2025-01-01     # End of walk-forward evaluation (2 years). # TODO: Ensure that backtest_end >= train_start + train_offset [+ valid_offset] + pred_len
+    train_start:  2021-01-01     # Initial date where the model training starts
+    backtest_start: 2024-01-01   # Start of walk-forward evaluation.
+    backtest_end: 2024-12-31     # End of walk-forward evaluation.
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     currency: USD
@@ -152,7 +153,7 @@ STRATEGY:
     # Hyperparameter tuning Settings and Objectives
     # Objectives: sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown, total_return, annual_return, daily_vol
     tune_hparams: true
-    n_trials: 10
+    n_trials: 1
     valid_split : 0.3    # meaning 80/20 train/valid split of full training dataset. NOTE: used also for model split
     objectives:          # use only nautilus_trader portfolio_analyzer statistics
       sharpe_ratio: maximize

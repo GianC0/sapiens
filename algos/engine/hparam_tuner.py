@@ -68,11 +68,8 @@ class OptunaHparamsTuner:
         
         Args:
             cfg: Configuration dictionary
-            model_train_data: Train data for hp optimization of model
-            strategy_train_data: Train data for hp optimization of strategy
-            logs_dir: Root directory for logs
-            n_model_trials: Override for model HP trials (None = use config)
-            n_strategy_trials: Override for strategy HP trials (None = use config)
+            run_timestamp: timestamp of this run to use for IDs and paths
+            run_dir: Root directory for logs
             seed: Seed for reproducibility of hp tuning runs
         """
         # Load configuration
@@ -334,6 +331,7 @@ class OptunaHparamsTuner:
             raise ValueError("Must run optimize_model() before optimize_strategy()")
         
         strategy_name = self.strategy_params.get('strategy_name', 'TopKStrategy')
+
         try:
             # Try to import from algos module
             strategy_module = importlib.import_module(f"algos.{strategy_name}")
@@ -380,6 +378,7 @@ class OptunaHparamsTuner:
 
                 offset = self.best_model_params_flat["train_offset"]
                 strategy_params_flat = self._add_dates(self.strategy_params, offset ) | trial_hparams
+                strategy_params_flat["catalog_path"] = str(self.run_dir / "catalog")
                 self.best_model_params_flat["train_offset"] = freq2pdoffset(offset)
                 
                 # Start MLflow run for this trial
@@ -501,27 +500,17 @@ class OptunaHparamsTuner:
             'STRATEGY': strategy_params_flat ,
         }
 
-        # Train model on Train + Valid with best HP
-        # (DONE THROUGH THE STRATEGY)
-        catalog_path = self.run_dir / "catalog"
-        catalog = ParquetDataCatalog(
-            path = catalog_path, 
-            fs_protocol="file",
-        )
-        backtest_cfg = self._produce_backtest_config(config, str(catalog_path), start, end)
-
-        
-        node = BacktestNode(configs=[backtest_cfg])
-
-        
-
-        
         # Add data
         bars = []
+        calendar = market_calendars.get_calendar(model_params_flat["calendar"])
+        days_range = calendar.schedule(start_date=pd.Timestamp(strategy_params_flat["train_start"]), end_date=start)
+        timestamps = market_calendars.date_range(days_range, frequency=model_params_flat["freq"]).normalize()
+        # start date including the initial window data needed for prediting at time t=0 of walk-frwd
+        data_load_start = timestamps[-(model_params_flat["window_len"] + 1)]
         for bar_or_feature in self.loader.bar_iterator():
             if isinstance(bar_or_feature, Bar):
                 bar_ts = pd.Timestamp(bar_or_feature.ts_event, unit='ns', tz='UTC')
-                if start <= bar_ts <= end:
+                if data_load_start <= bar_ts <= end:
                     bars.append(bar_or_feature)
         
         # Error Handling
@@ -533,11 +522,20 @@ class OptunaHparamsTuner:
                 'max_drawdown': 0.0,
                 'win_rate': 0.0,
                 'num_trades': 0,
-                'total_return': 0.0,
             }
 
+        catalog = ParquetDataCatalog(path = strategy_params_flat["catalog_path"],  fs_protocol="file")
         catalog.write_data(list(self.loader.instruments.values()))
         catalog.write_data(bars)
+
+
+        # Train model on Train + Valid with best HP
+        # (DONE THROUGH THE STRATEGY)
+        backtest_cfg = self._produce_backtest_config(config, start, end)
+
+
+        node = BacktestNode(configs=[backtest_cfg])
+
 
         # Run backtest
         node.run()
@@ -652,6 +650,8 @@ class OptunaHparamsTuner:
     def _add_dates(self, cfg, offset) -> Dict:
         # TODO: to verify this is also working for strategy
         # take some params from strategy
+
+        
         
         # trial HPARAMS -> model PARAMS 
         # Calculate proper date ranges
@@ -698,12 +698,12 @@ class OptunaHparamsTuner:
                 #logger.info(f"  {ticker}: {len(data[ticker])} bars")
         return data
     
-    def _produce_backtest_config(self, backtest_cfg, catalog_path, start, end) -> BacktestRunConfig:
+    def _produce_backtest_config(self, backtest_cfg, start, end) -> BacktestRunConfig:
 
         # Initialize Venue configs
         venue_configs = [
             BacktestVenueConfig(
-                name=self.strategy_params["venue_name"],
+                name=backtest_cfg["STRATEGY"]["venue_name"],
                 book_type="L1_MBP",         # bars are inluded in L1 market-by-price
                 oms_type = backtest_cfg["STRATEGY"]["oms_type"],
                 account_type=backtest_cfg["STRATEGY"]["account_type"],
@@ -716,7 +716,7 @@ class OptunaHparamsTuner:
 
         data_configs=[
             BacktestDataConfig(
-                catalog_path=catalog_path,
+                catalog_path=backtest_cfg["STRATEGY"]["catalog_path"],
                 data_cls=Bar,
                 start_time=pd.Timestamp.isoformat(start),
                 end_time=pd.Timestamp.isoformat(end),
@@ -741,7 +741,7 @@ class OptunaHparamsTuner:
             logger.error(f"Failed to import strategy {strategy_name}: {e}")
             raise
         #strategy = StrategyClass(config=backtest_cfg)
-        # TODO: add the fees from cfg
+        # TODO: add the fees from transactions and costs from config
         config=BacktestRunConfig(
                 engine=BacktestEngineConfig(
                     trader_id=f"Backtest-{model_name}-{strategy_name}",
