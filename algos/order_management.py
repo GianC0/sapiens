@@ -205,7 +205,7 @@ class OrderManager:
             
             # Calculate target quantity
             target_value = target_weight * nav
-            target_qty = int(target_value / current_price) if current_price > 0 else 0
+            target_qty = float(target_value / current_price) if current_price > 0 else 0.0
             
             # Calculate order quantity needed
             order_qty = target_qty - net_current_qty
@@ -245,7 +245,7 @@ class OrderManager:
             logger.info(f"Position change for {instrument_id}: {current_qty} -> {target_quantity} ({reason})")
             self.execute_order(instrument_id, order_qty)
     
-    def close_all_positions(self, instrument: Instrument, reason: str = "close") -> None:
+    def close_all_positions(self, instrument_id: InstrumentId, reason: str = "close") -> None:
         """
         Close all positions for an instrument (handles LONG and SHORT positions).
         
@@ -257,7 +257,7 @@ class OrderManager:
 
          # Close all positions for this instrument (handles HEDGING)
         for position in self.strategy.cache.positions_open():
-            if position.instrument_id == instrument.id:
+            if position.instrument_id == instrument_id:
                 logger.info(f"Closing position {position.id}: {position.signed_qty} units ({reason})")
                 
                 # Determine order side to close position
@@ -277,7 +277,7 @@ class OrderManager:
                     self.strategy.submit_order(close_order)
                     positions_closed = True
         if not positions_closed:
-            logger.info(f"No positions to close for {instrument.id}")
+            logger.info(f"No positions to close for {instrument_id}")
     
     def close_position(self, position: Position):
         """Close a specific position."""

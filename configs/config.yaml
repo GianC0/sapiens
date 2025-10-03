@@ -126,7 +126,7 @@ STRATEGY:
     # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
     freq: 1D                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
-    train_start:  2021-01-01     # Initial date where the model training starts
+    #train_offset:               # Optimized during model hp tuning
     backtest_start: 2024-01-01   # Start of walk-forward evaluation.
     backtest_end: 2024-12-31     # End of walk-forward evaluation.
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
@@ -212,7 +212,7 @@ STRATEGY:
       default: "30D"                    # D = Day
       optuna:
         optuna_type: "categorical"
-        choices: ["30D", "60D"]
+        choices: ["7D", "14D"]
     
     # Light fine-tune epochs
     warm_training_epochs:      

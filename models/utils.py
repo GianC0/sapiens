@@ -269,7 +269,7 @@ def build_input_tensor(
 
 def build_pred_tensor(    
     data: Dict[str, pd.DataFrame],
-    timestamps: pd.DatetimeIndex,
+    indexes: int,
     feature_dim: int,
     device: torch.device,
     ) -> Tuple[torch.Tensor, torch.BoolTensor, pd.DatetimeIndex]:
@@ -278,7 +278,7 @@ def build_pred_tensor(
     
     Args:
         data: Dict mapping ticker to DataFrame with features
-        timestamps: DatetimeIndex of all timestamps
+        indexes: n of rows for each instrument.
         universe: List of tickers to include (in order)
         feature_dim: Number of features per instrument (e.g. 5 for OHLCV)
         split_valid_timestamp: Timestamp to split training and validation data
@@ -301,7 +301,7 @@ def build_pred_tensor(
     
     # Pre-allocate array for efficiency
     F = feature_dim
-    T = len(timestamps)
+    T = indexes
     I = len(universe)
     
     # Use float32 to save memory (matches PyTorch default)
@@ -319,12 +319,13 @@ def build_pred_tensor(
         raise ValueError("All data is NaN - no valid observations")
     
     # Check for completely empty timestamps
-    empty_timestamps = torch.isnan(tensor_array).all(dim=2).all(dim=1)  # (T,)
-    if torch.any(empty_timestamps):
-        n_empty = torch.sum(empty_timestamps)
-        raise ValueError(
-            f"Found {n_empty} completely empty timestamps. "
-        )
+    # taken care by nautilus data catalog
+    #empty_timestamps = torch.isnan(tensor_array).all(dim=2).all(dim=1)  # (T,)
+    #if torch.any(empty_timestamps):
+    #    n_empty = torch.sum(empty_timestamps)
+    #    raise ValueError(
+    #        f"Found {n_empty} completely empty timestamps. "
+    #    )
     
 
     # train tensor and mask

@@ -11,6 +11,7 @@
 ###############################################################################
 
 
+from operator import index
 import os, math, json, shutil, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -43,8 +44,10 @@ class UMIModel(nn.Module):
         feature_dim: int,
         window_len: int,
         pred_len: int,
-        train_offset: BaseOffset,
+        train_start: pd.Timestamp,
         train_end: pd.Timestamp,
+        train_offset: pd.tseries.offsets.DateOffset,
+        valid_start: pd.Timestamp,
         valid_end: pd.Timestamp,
         n_epochs: int = 20,
         batch_size: int = 64,
@@ -73,8 +76,9 @@ class UMIModel(nn.Module):
         self.market_calendar = market_calendars.get_calendar(calendar)
         self.freq           = freq                                                                  # e.g. "1d", "15m", "1h"  
         self.pred_len    = pred_len                                                                 # number of bars to predict
-        self.train_offset   = train_offset                                                          # time window for training
+        self.train_start =   train_start                                                            # train start date
         self.train_end      = pd.Timestamp(train_end)                                               # end of training date
+        self.train_offset   = train_offset                                               # time window for training
         self.valid_end      = pd.Timestamp(valid_end)                                               # end of validation date
         assert self.valid_end >= self.train_end, "Validation end date must be after training end date."
 
@@ -144,7 +148,7 @@ class UMIModel(nn.Module):
         # Train from scratch
         if self.logger:
             self.logger.info(f"[initialize] Training for {self.n_epochs} epochs...")
-        start = self.train_end - self.train_offset + freq2pdoffset(self.freq)
+        start = self.train_start #+ freq2pdoffset(self.freq)
         end = self.valid_end
         best_val = self._train(data, self.n_epochs, active_mask, start=start, end=end)
         
@@ -230,13 +234,13 @@ class UMIModel(nn.Module):
         # mlflow.log_metric("update_timestamp", current_time.timestamp())
         # mlflow.log_artifact(str(self.model_dir / "latest.pt"))       
 
-    def predict(self, data: Dict[str, DataFrame], current_time: pd.Timestamp, active_mask: torch.Tensor) -> Dict[str, float]:
+    def predict(self, data: Dict[str, DataFrame], indexes: int, active_mask: torch.Tensor) -> Dict[str, float]:
         """
         Generate predictions for current market state.
         
         Args:
             data_dict: Dict[ticker, DataFrame] with current market data
-            current_time: pd.Timestamp indicating the current time
+            indexes: int indicating the number of historical data points common for all instruments
             active_mask: pre-computed mask for active instruments for verification
             
         Returns:
@@ -244,17 +248,18 @@ class UMIModel(nn.Module):
         """
         assert self._is_initialized, "Model must be initialized before prediction"
         assert torch.numel(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
+        assert indexes == self.L + 1
         
         # Assert universe
         assert self._universe == list(data.keys()), "Universe error!"
 
         # Build panel from current data
-        lookback_periods = self.L + 1  # Need L+1 bars for prediction
+        #lookback_periods = self.L + 1  # Need L+1 bars for prediction
         # Calculate the start date for the historical window
-        start_date = current_time - freq2pdoffset(self.freq) * (lookback_periods - 1) 
-        days_range = self.market_calendar.schedule(start_date=start_date, end_date=current_time)
-        timestamps = market_calendars.date_range(days_range, frequency=self.freq).normalize()
-        data_tensor, data_mask = build_pred_tensor(data, timestamps, feature_dim=self.F, device=self._device)
+        #start_date = current_time - freq2pdoffset(self.freq) * (lookback_periods - 1) 
+        #days_range = self.market_calendar.schedule(start_date=start_date, end_date=current_time)
+        #timestamps = market_calendars.date_range(days_range, frequency=self.freq).normalize()
+        data_tensor, data_mask = build_pred_tensor(data, indexes, feature_dim=self.F, device=self._device)
         
         # assertion on the universe size
         assert torch.equal(data_mask, active_mask), "Active mask mismatch during prediction"
@@ -405,11 +410,11 @@ class UMIModel(nn.Module):
 
         
         # quick and dirty fix
-        if isinstance(self.train_offset, str):
-            self.train_offset = freq2pdoffset(self.train_offset)
+        #if isinstance(self.train_offset, str):
+        #    self.train_offset = freq2pdoffset(self.train_offset)
 
         # Create common timestamp index. This solves the start= -1 bar problem
-        start_date = self.train_end - self.train_offset + freq2pdoffset(self.freq)
+        #start_date = self.train_end - self.train_offset + freq2pdoffset(self.freq)
         days_range = self.market_calendar.schedule(start_date= start, end_date=end)
         timestamps = market_calendars.date_range(days_range, frequency=self.freq).normalize()
         

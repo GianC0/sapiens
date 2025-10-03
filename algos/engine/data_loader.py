@@ -273,58 +273,6 @@ class CsvBarLoader:
                     ts_init=ts_init,
                 )
     
-    def bars(self) -> List[Bar]:
-        """
-        Returns List of either FeatureBarData or Bar :
-            1. FeatureBarData   (all numeric columns)
-            2. Bar              (OHLCV with adjusted close)
-
-        They share the VERY SAME ts_event so the cache keeps them aligned.
-        """
-        all_ts = sorted({ts for f in self._frames.values() for ts in f.index})
-
-        for ts in all_ts:
-            ts_init = pd.to_datetime([ts]).astype(int).item()
-
-            for sym in self._universe:
-                if sym not in self._frames:
-                    continue
-                    
-                df = self._frames[sym]
-                if ts not in df.index:
-                    continue        # missing bar – universe padding
-
-                row = df.loc[ts]
-                numeric_vector = row.values.astype(np.float32)
-                
-                instrument = self._instruments[sym]
-
-                # ---- 1) full-feature object -------------------------
-                yield FeatureBarData(
-                    instrument=sym,
-                    ts_event=ts_init,
-                    ts_init=ts_init,
-                    features=numeric_vector,
-                )
-
-                # ---- 2) traditional Bar with ADJUSTED CLOSE ---------
-                # Always use adjusted close as the close price
-                def _get(col): return float(row[col]) if col in row else 0.0
-                
-                yield Bar(
-                    bar_type=BarType(
-                        instrument_id=instrument.id,
-                        bar_spec= freq2barspec(self.cfg["freq"])
-                        ),
-                    open=Price.from_str(f"{_get('Open'):.2f}"),
-                    high=Price.from_str(f"{_get('High'):.2f}"),
-                    low=Price.from_str(f"{_get('Low'):.2f}"),
-                    close=Price.from_str(f"{_get('Close'):.2f}"),  # Always use adjusted close
-                    volume=Quantity.from_int(int(_get('Volume'))),
-                    ts_event=ts_init,
-                    ts_init=ts_init,
-                )
-        ret
     # ------------------------------------------------------------------ #
     # parsing helpers
     # ------------------------------------------------------------------ #

@@ -15,7 +15,7 @@ from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.config import BacktestDataConfig, CacheConfig
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.models import FillModel
-from nautilus_trader.model.data import Bar
+from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.backtest.node import BacktestEngineConfig, BacktestRunConfig
 from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig
 from nautilus_trader.model.enums import OmsType
@@ -38,7 +38,7 @@ import mlflow
 from mlflow import MlflowClient
 from xlrd import Book
 import yaml
-from datetime import datetime
+from datetime import datetime, time
 import importlib
 import logging
 logger = logging.getLogger(__name__)
@@ -230,7 +230,7 @@ class OptunaHparamsTuner:
                 train_offset = trial_hparams["train_offset"]
                 model_dir = self.run_dir / "model" /  f"trial_{trial.number}"
                 model_dir.mkdir(parents=True, exist_ok=True)
-                model_params_flat  = self._add_dates(self.model_params, train_offset ) # merged dictionary
+                model_params_flat  = self._add_dates(self.model_params, train_offset, to_strategy=False ) # merged dictionary
                 model_params_flat["model_dir"] = model_dir
 
                 # init data timestamps for data loader
@@ -377,7 +377,7 @@ class OptunaHparamsTuner:
                 trial_hparams = self._suggest_params(trial, self.strategy_defaults, self.strategy_search)
 
                 offset = self.best_model_params_flat["train_offset"]
-                strategy_params_flat = self._add_dates(self.strategy_params, offset ) | trial_hparams
+                strategy_params_flat = self._add_dates(self.strategy_params, offset, to_strategy=True ) | trial_hparams
                 strategy_params_flat["catalog_path"] = str(self.run_dir / "catalog")
                 self.best_model_params_flat["train_offset"] = freq2pdoffset(offset)
                 
@@ -500,13 +500,9 @@ class OptunaHparamsTuner:
             'STRATEGY': strategy_params_flat ,
         }
 
-        # Add data
+        # Add data starting from t = - (windows_len + 1)
         bars = []
-        calendar = market_calendars.get_calendar(model_params_flat["calendar"])
-        days_range = calendar.schedule(start_date=pd.Timestamp(strategy_params_flat["train_start"]), end_date=start)
-        timestamps = market_calendars.date_range(days_range, frequency=model_params_flat["freq"]).normalize()
-        # start date including the initial window data needed for prediting at time t=0 of walk-frwd
-        data_load_start = timestamps[-(model_params_flat["window_len"] + 1)]
+        data_load_start = strategy_params_flat["data_load_start"]
         for bar_or_feature in self.loader.bar_iterator():
             if isinstance(bar_or_feature, Bar):
                 bar_ts = pd.Timestamp(bar_or_feature.ts_event, unit='ns', tz='UTC')
@@ -647,7 +643,7 @@ class OptunaHparamsTuner:
 
         return metrics
     
-    def _add_dates(self, cfg, offset) -> Dict:
+    def _add_dates(self, cfg, offset, to_strategy = False) -> Dict:
         # TODO: to verify this is also working for strategy
         # take some params from strategy
 
@@ -655,15 +651,24 @@ class OptunaHparamsTuner:
         
         # trial HPARAMS -> model PARAMS 
         # Calculate proper date ranges
-        train_start = pd.Timestamp(self.strategy_params["train_start"], tz="UTC")
-        train_offset = freq2pdoffset(offset)
-        train_end = train_start + train_offset
-        valid_split = self.strategy_params["valid_split"]
-        valid_offset = (train_end - train_start) / (1 - valid_split) * valid_split
-        valid_start = train_end + pd.Timedelta("1ns")
-        valid_end = train_end + valid_offset
-        backtest_start = valid_end + pd.Timedelta("1ns")
+        backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC")
         backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC")
+        train_offset = freq2pdoffset(offset)
+        valid_split =  self.strategy_params["valid_split"]
+
+        
+        calendar = market_calendars.get_calendar(self.model_params["calendar"])
+        days_range = calendar.schedule(start_date= ( backtest_start - train_offset ), end_date=backtest_start)
+        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"]).normalize()
+        
+        # compute traing and validation dates
+        valid_offset = (timestamps[-1] - timestamps[0]) / (1 - valid_split) * valid_split
+        train_start = backtest_start - train_offset - valid_offset
+        train_end = train_start + train_offset
+        valid_start = train_end + pd.Timedelta("1ns")
+        valid_end = backtest_start - pd.Timedelta("1ns")
+        
+        
 
         # This should always be true even if validation is not run
         assert backtest_end > backtest_start, f"Backtest start {backtest_start} must come before backtest end {backtest_end}"
@@ -676,6 +681,15 @@ class OptunaHparamsTuner:
         cfg["valid_end"] = valid_end
         cfg["backtest_start"] = backtest_start
         cfg["backtest_end"] = backtest_end
+
+        if to_strategy:
+            # compute data load date for validation: t = valid_start - (window_len + 1)
+            days_range = calendar.schedule(start_date=train_start, end_date=valid_start)
+            timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"]).normalize()
+            # start date including the initial window data needed for prediting at time t=0 of walk-frwd
+            data_load_start = timestamps[-(self.best_model_params_flat["window_len"] + 1)]
+            cfg["data_load_start"] = data_load_start
+        
 
         return cfg
     
@@ -713,15 +727,16 @@ class OptunaHparamsTuner:
                 
             ),
         ]
-
+        bar_spec = freq2barspec(backtest_cfg["STRATEGY"]["freq"])
         data_configs=[
             BacktestDataConfig(
                 catalog_path=backtest_cfg["STRATEGY"]["catalog_path"],
                 data_cls=Bar,
                 start_time=pd.Timestamp.isoformat(start),
                 end_time=pd.Timestamp.isoformat(end),
-                bar_spec=freq2barspec(backtest_cfg["STRATEGY"]["freq"]),
-                instrument_ids =  [inst.id.value for inst in self.loader.instruments.values()]
+                bar_spec=bar_spec,
+                #instrument_ids =  [inst.id.value for inst in self.loader.instruments.values()],
+                bar_types = [BarType(instrument_id=inst.id, bar_spec=bar_spec) for inst in self.loader.instruments.values()],
             )
         ]
 
