@@ -40,7 +40,14 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Logging
-    logging.basicConfig(filename=f'{run_dir}/backtest.log', encoding='utf-8', level=logging.INFO)
+    logging.basicConfig(    
+            level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(f'{run_dir}/backtest.log', encoding='utf-8'),
+            logging.StreamHandler()  # This adds console output
+        ]
+    )
     logger = logging.getLogger(__name__)
 
     

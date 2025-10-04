@@ -335,9 +335,14 @@ class TopKStrategy(Strategy):
         # Compute new portfolio target weights for predicted instruments.
         weights = self._compute_target_weights(preds)
 
+        # Check if we have valid weights
+        if not weights or all(abs(w) < 1e-6 for w in weights.values()):
+            logger.warning("No valid weights computed, skipping rebalance")
+            self._last_update_time = now
+            return
+
         # Portolio Managerment through order manager
-        if weights:
-            self.order_manager.rebalance_portfolio(weights, self.universe)
+        self.order_manager.rebalance_portfolio(weights, self.universe)
 
         # update last updated time
         self._last_update_time = now
@@ -399,11 +404,10 @@ class TopKStrategy(Strategy):
         self._check_trailing_stop(instrument, bar.close)  
 
         # ------------ drawdown-stop ------------------------
-        dwd_s = self._check_drowdown_stop()
-
-        if dwd_s:
-            self.on_dispose()
-            return
+        #dwd_s = self._check_drowdown_stop()
+        #if dwd_s:
+        #    self.on_dispose()
+        #    return
         
         return
 
@@ -842,6 +846,8 @@ class TopKStrategy(Strategy):
             w_series = pd.Series(0.0, index=self.universe)
             if risk_free_ticker in self.universe:
                 w_series[risk_free_ticker] = 1.0
+                
+            logger.info(f"All assets underperform risk-free rate {current_rf:.4f}, allocating 100% to {risk_free_ticker}")
             return w_series.to_dict()
 
         # Call optimizer (M2) with horizon-scaled cov and rf_h
@@ -916,10 +922,19 @@ class TopKStrategy(Strategy):
     def _check_drowdown_stop(self) -> bool:
         
         nav = self._calculate_portfolio_nav()
-        self.max_registered_portfolio_nav = max(self.max_registered_portfolio_nav, self.nav)
+        
+        # Initialize max NAV on first real calculation
+        if self.max_registered_portfolio_nav <= 0:
+            self.max_registered_portfolio_nav = nav
+            logger.info(f"Initialized max NAV to {nav:.2f}")
+            return False  # Don't trigger drawdown on initialization
+        
+        self.max_registered_portfolio_nav = max(self.max_registered_portfolio_nav, nav)
         #self.equity_analyzer.on_equity(ts, nav)
         
-        if nav < self.max_registered_portfolio_nav * (1 - self.drawdown_pct):
+        threshold = self.max_registered_portfolio_nav * (1 - self.drawdown_pct)
+        if nav < threshold:
+            logger.warning(f"Drawdown stop triggered: NAV={nav:.2f} < Threshold={threshold:.2f} (Max={self.max_registered_portfolio_nav:.2f})")
             self.order_manager.liquidate_all(self.universe) 
             return True
 
@@ -978,5 +993,12 @@ class TopKStrategy(Strategy):
                 total_positions_value += position_value
         
         nav = cash_balance + total_positions_value
+        
+        # Sanity check
+        if nav <= 0 and cash_balance > 0:
+            logger.warning(f"NAV calculation may be incorrect: cash={cash_balance:.2f}, positions={total_positions_value:.2f}")
+            nav = cash_balance  # Use cash as fallback
+        
         logger.info(f"NAV Calculation: Cash={cash_balance:.2f}, Positions={total_positions_value:.2f}, Total={nav:.2f}")
+
         return nav

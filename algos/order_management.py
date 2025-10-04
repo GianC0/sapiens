@@ -173,7 +173,14 @@ class OrderManager:
             logger.error(f"Invalid NAV: {nav}. Skipping rebalance.")
             return
         
-        logger.info(f"Portfolio NAV: {nav}")
+        logger.info(f"Rebalancing portfolio with NAV: {nav:.2f}")
+
+        # Special handling for risk-free only allocation
+        risk_free_ticker = self.strategy.strategy_params["risk_free_ticker"]
+        non_zero_weights = {k: v for k, v in target_weights.items() if abs(v) > 1e-6}
+        
+        if len(non_zero_weights) == 1 and risk_free_ticker in non_zero_weights:
+            logger.info(f"Portfolio fully allocated to risk-free asset {risk_free_ticker}")
         
         can_short = self.strategy.can_short
 
