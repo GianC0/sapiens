@@ -772,6 +772,11 @@ class TopKStrategy(Strategy):
         nav = self._calculate_portfolio_nav()
 
         for symbol in self.universe:
+            
+            # Risk-free rate is the only one who can take up to 100% of portfolio
+            if symbol == risk_free_ticker:
+                allowed_weight_ranges.append([0, 1])
+                continue
             instrument_id = InstrumentId(Symbol(symbol), self.venue)
             bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
             bars = self.cache.bars(bar_type)
@@ -823,11 +828,11 @@ class TopKStrategy(Strategy):
         valid_mu = np.array([preds.get(s, 0.0) for s in valid_symbols])
 
         # If all expected returns <= rf_horizon then allocate to risk-free ticker (if available)
-        if np.all(valid_mu <= current_rf):
-            w_series = pd.Series(0.0, index=self.universe)
-            if risk_free_ticker in self.universe:
-                w_series[risk_free_ticker] = 1.0
-            return w_series.to_dict()
+        #if np.all(valid_mu <= current_rf):
+        #    w_series = pd.Series(0.0, index=self.universe)
+        #    if risk_free_ticker in self.universe:
+        #        w_series[risk_free_ticker] = 1.0
+        #    return w_series.to_dict()
 
         # Call optimizer (M2) with horizon-scaled cov and rf_h
         w_opt = self.optimizer.optimize(

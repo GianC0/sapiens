@@ -178,7 +178,7 @@ STRATEGY:
     # Order execution algorithm
     execution:
       timing_force: "DAY"      # Specifies how long the order will remain open or active before any remaining quantity is canceled.
-      exec_algo: whole          # Specifies to use TWAP execution algorithm, Default: whole
+      #exec_algo: twap          # Specifies to use TWAP execution algorithm, Default: whole
       twap:                    # Split parent order into 4 TWAP child orders, each after 2.5 seconds 
         slices: 4              # 4 separate orders
         interval_secs: 2.5     # 2.5 seconds between orders

@@ -1,3 +1,4 @@
+from multiprocessing import shared_memory
 import numpy as np
 import pandas as pd
 from pypfopt import EfficientFrontier, objective_functions
@@ -40,8 +41,12 @@ class PortfolioOptimizer:
         self.solver = solver
         self.adv_lookback = adv_lookback
         self.max_adv_pct = max_adv_pct
+        self._last_valid_weights = None
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float, allowed_weight_ranges: np.ndarray, **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float, 
+                 allowed_weight_ranges: np.ndarray, 
+                 current_weights: np.ndarray,
+                **kwargs) -> np.ndarray:
         """
         Optimize portfolio weights.
         
@@ -50,6 +55,7 @@ class PortfolioOptimizer:
             cov: Covariance matrix (n, n)
             rf: Risk-free rate
             allowed_weight_ranges: Per-asset weight bounds (n, 2) considering liquidity
+            current_weights: Current portfolio weights (for fallback)
         """
         raise NotImplementedError
     
@@ -78,6 +84,38 @@ class PortfolioOptimizer:
             if w_max < self.weight_bounds[1]:
                 ef.add_constraint(lambda w, idx=i, wmax=w_max: w[idx] <= wmax)
 
+    def _get_safe_fallback_weights(
+        self, 
+        n_assets: int, 
+        allowed_weight_ranges: np.ndarray,
+        current_weights: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Production-ready fallback when optimization fails.
+        Priority order:
+        1. Maintain current positions if within constraints
+        2. Return zero weights (hold cash or all to risk free index)
+        """
+        
+        # Option 1: Try to maintain current positions if provided
+        if current_weights and len(current_weights) == n_assets:
+            # Check if current weights are within new constraints
+            if allowed_weight_ranges:
+                valid_current = True
+                for i in range(n_assets):
+                    w_min, w_max = allowed_weight_ranges[i]
+                    if current_weights[i] < w_min or current_weights[i] > w_max:
+                        valid_current = False
+                        break
+                
+                if valid_current:
+                    logger.info("Optimization failed: maintaining current positions")
+                    return current_weights
+        
+        # Option 2: Return zero weights (hold cash outside of portfolio)
+        logger.warning("Optimization failed: no feasible allocation, holding cash or all to risk free")
+        return np.zeros(n_assets)
+    
 class MaxSharpeOptimizer(PortfolioOptimizer):
     """Maximum Sharpe ratio optimizer using PyPortfolioOpt."""
     
@@ -85,7 +123,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
         self.risk_free_rate = risk_free_rate
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float, allowed_weight_ranges: np.ndarray, **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, **kwargs) -> np.ndarray:
         """
         Find weights that maximize Sharpe ratio.
         
@@ -113,17 +151,26 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
             
             # Clean and return weights
             cleaned_weights = ef.clean_weights()
-            return self._to_array(cleaned_weights)
+            self._last_valid_weights = self._to_array(cleaned_weights)
+            return self._last_valid_weights
             
         except (OptimizationError, Exception) as e:
-            logger.warning(f"Max Sharpe optimization failed: {e}. Using equal weights.")
-            return np.ones(len(mu)) / len(mu)
+            logger.warning(f"Max Sharpe optimization failed: {e}. Using safe fallback.")
+            
+            # Try to use last valid weights first
+            fallback_current = current_weights if current_weights is not None else self._last_valid_weights
+            
+            return self._get_safe_fallback_weights(
+                n_assets=len(mu),
+                allowed_weight_ranges=allowed_weight_ranges,
+                current_weights=fallback_current,
+            )
 
 
 class MinVarianceOptimizer(PortfolioOptimizer):
     """Minimum variance portfolio optimizer using PyPortfolioOpt."""
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, allowed_weight_ranges: np.ndarray, **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, **kwargs) -> np.ndarray:
         """
         Find minimum variance portfolio.
         
@@ -147,11 +194,20 @@ class MinVarianceOptimizer(PortfolioOptimizer):
             
             # Clean and return weights
             cleaned_weights = ef.clean_weights()
-            return self._to_array(cleaned_weights)
+            self._last_valid_weights = self._to_array(cleaned_weights)
+            return self._last_valid_weights
             
         except (OptimizationError, Exception) as e:
-            logger.warning(f"Min variance optimization failed: {e}. Using equal weights.")
-            return np.ones(len(mu)) / len(mu)
+            logger.warning(f"Max Sharpe optimization failed: {e}. Using safe fallback.")
+            
+            # Try to use last valid weights first
+            fallback_current = current_weights if current_weights is not None else self._last_valid_weights
+            
+            return self._get_safe_fallback_weights(
+                n_assets=len(mu),
+                allowed_weight_ranges=allowed_weight_ranges,
+                current_weights=fallback_current,
+            )
 
 
 class M2Optimizer(PortfolioOptimizer):
@@ -170,7 +226,7 @@ class M2Optimizer(PortfolioOptimizer):
         """
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float, benchmark_vol: float, allowed_weight_ranges: np.ndarray , **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, rf: float, benchmark_vol: float, allowed_weight_ranges: np.ndarray , current_weights: np.ndarray, **kwargs) -> np.ndarray:
         """
         Find weights that maximize M² measure.
         
@@ -221,13 +277,23 @@ class M2Optimizer(PortfolioOptimizer):
                 # Renormalize if needed
                 weight_sum = np.sum(np.abs(scaled_weights))
                 if weight_sum > 0:
-                    return scaled_weights / weight_sum
-                    
-            return sharpe_array
+                    self._last_valid_weights = scaled_weights / weight_sum
+                    return  self._last_valid_weights
+            
+            self._last_valid_weights = sharpe_array
+            return  self._last_valid_weights
             
         except (OptimizationError, Exception) as e:
-            logger.warning(f"M² optimization failed: {e}. Using equal weights.")
-            return np.ones(len(mu)) / len(mu)
+            logger.warning(f"Max Sharpe optimization failed: {e}. Using safe fallback.")
+            
+            # Try to use last valid weights first
+            fallback_current = current_weights if current_weights is not None else self._last_valid_weights
+            
+            return self._get_safe_fallback_weights(
+                n_assets=len(mu),
+                allowed_weight_ranges=allowed_weight_ranges,
+                current_weights=fallback_current,
+            )
 
 
 class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
@@ -246,7 +312,7 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
         self.risk_aversion = risk_aversion
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, allowed_weight_ranges: np.ndarray, **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, **kwargs) -> np.ndarray:
         """
         Find weights that maximize quadratic utility.
         
@@ -269,11 +335,21 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
             
             # Clean and return weights
             cleaned_weights = ef.clean_weights()
-            return self._to_array(cleaned_weights)
+            self._last_valid_weights = self._to_array(cleaned_weights)
+            return self._last_valid_weights
+            
             
         except (OptimizationError, Exception) as e:
-            logger.warning(f"Quadratic utility optimization failed: {e}. Using equal weights.")
-            return np.ones(len(mu)) / len(mu)
+            logger.warning(f"Max Sharpe optimization failed: {e}. Using safe fallback.")
+            
+            # Try to use last valid weights first
+            fallback_current = current_weights if current_weights is not None else self._last_valid_weights
+            
+            return self._get_safe_fallback_weights(
+                n_assets=len(mu),
+                allowed_weight_ranges=allowed_weight_ranges,
+                current_weights=fallback_current
+            )
 
 
 class EfficientRiskOptimizer(PortfolioOptimizer):
@@ -291,7 +367,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
         """
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
     
-    def optimize(self, mu: np.ndarray, allowed_weight_ranges: np.ndarray, target_volatility: float, **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, allowed_weight_ranges: np.ndarray, target_volatility: float, current_weights: np.ndarray, **kwargs) -> np.ndarray:
         """
         Find weights that maximize return for given risk level.
         """
@@ -311,20 +387,18 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
             
             # Clean and return weights
             cleaned_weights = ef.clean_weights()
-            return self._to_array(cleaned_weights)
+            self._last_valid_weights = self._to_array(cleaned_weights)
+            return self._last_valid_weights
             
         except (OptimizationError, Exception) as e:
-            logger.warning(f"Efficient risk optimization failed: {e}. Using equal weights.")
-            return np.ones(len(mu)) / len(mu)
+            logger.warning(f"Max Sharpe optimization failed: {e}. Using safe fallback.")
+            
+            # Try to use last valid weights first
+            fallback_current = current_weights if current_weights is not None else self._last_valid_weights
+            
+            return self._get_safe_fallback_weights(
+                n_assets=len(mu),
+                allowed_weight_ranges=allowed_weight_ranges,
+                current_weights=fallback_current,
+            )
 
-
-class EqualWeightOptimizer(PortfolioOptimizer):
-    """Simple equal weight optimizer (no optimization needed)."""
-    
-    def __init__(self, adv_lookback: int, max_adv_pct: float, **kwargs):
-        super().__init__(adv_lookback, max_adv_pct)
-    
-    def optimize(self, mu: np.ndarray, allowed_weight_ranges: np.ndarray = None, **kwargs) -> np.ndarray:
-        """Return equal weights for all assets."""
-        n = len(mu)
-        return np.ones(n) / n

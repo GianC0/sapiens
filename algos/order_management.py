@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Any
 from collections import defaultdict
 import numpy as np
 from datetime import datetime, timedelta
+from nautilus_trader.model import ExecAlgorithmId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
@@ -272,6 +273,9 @@ class OrderManager:
                     order_side=order_side,
                     quantity=Quantity.from_int(abs(int(position.quantity))),
                     time_in_force=self.timing_force,
+                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
+                    exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
+
                 )
                 if close_order:
                     self.strategy.submit_order(close_order)
@@ -292,6 +296,8 @@ class OrderManager:
             order_side=order_side,
             quantity=Quantity.from_int(abs(int(position.quantity))),
             time_in_force=self.timing_force,
+            exec_algorithm_id=ExecAlgorithmId("TWAP"),
+            exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
         )
         
         # Submit order
@@ -628,6 +634,8 @@ class OrderManager:
             order_side=order_side,
             quantity=Quantity.from_int(quantity),
             time_in_force=self.timing_force,
+            exec_algorithm_id=ExecAlgorithmId("TWAP"),
+            exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
         )
 
     def _create_limit_order(
@@ -644,6 +652,8 @@ class OrderManager:
             quantity=Quantity.from_int(quantity),
             price=Price.from_str(str(price)),
             time_in_force=self.timing_force,
+            exec_algorithm_id=ExecAlgorithmId("TWAP"),
+            exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
         )
         
     

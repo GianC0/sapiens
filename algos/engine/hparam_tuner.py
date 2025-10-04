@@ -9,17 +9,19 @@ Orchestrates two-phase hyperparameter optimization:
 Each phase gets its own Optuna study and MLflow experiment.
 """
 
+from fastapi import params
 from matplotlib.pyplot import bar
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.config import BacktestDataConfig, CacheConfig
+from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, LoggingConfig
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.models import FillModel
 from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.backtest.node import BacktestEngineConfig, BacktestRunConfig
+from nautilus_trader.backtest.node import BacktestEngineConfig
+#from nautilus_trader.common.component import RiskEngine   to fix
 from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig
 from nautilus_trader.model.enums import OmsType
-from nautilus_trader.config import ImportableStrategyConfig, LoggingConfig
+from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm, TWAPExecAlgorithmConfig
 from nautilus_trader.backtest.node import BacktestNode
 from pathlib import Path
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
@@ -756,7 +758,7 @@ class OptunaHparamsTuner:
             logger.error(f"Failed to import strategy {strategy_name}: {e}")
             raise
         #strategy = StrategyClass(config=backtest_cfg)
-        # TODO: add the fees from transactions and costs from config
+        # TODO: add the fees from transactions and costs from config, add risk engine
         config=BacktestRunConfig(
                 engine=BacktestEngineConfig(
                     trader_id=f"Backtest-{model_name}-{strategy_name}",
@@ -765,6 +767,9 @@ class OptunaHparamsTuner:
                         config_path = f"algos.{strategy_name}:{strategy_name}Config",
                         config = {"config":yaml_safe(backtest_cfg)},
                     )],
+                    exec_algorithms=[TWAPExecAlgorithm(TWAPExecAlgorithmConfig())],
+                    #risk_engine = RiskEngine
+
                     cache=CacheConfig(
                         bar_capacity=backtest_cfg["STRATEGY"].get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
                         ),
