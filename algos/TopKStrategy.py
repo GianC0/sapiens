@@ -123,7 +123,12 @@ class TopKStrategy(Strategy):
         self.train_end = pd.Timestamp(self.strategy_params["train_end"])
         self.valid_start = pd.Timestamp(self.strategy_params["valid_start"])
         self.valid_end = pd.Timestamp(self.strategy_params["valid_end"])
-        self.data_load_start = pd.Timestamp(self.strategy_params["data_load_start"])
+
+        # data load start should be conservative: 
+        # if bars within retrain_date - data_load_start < min_bars_required, then on_historical fails to load necessary data.  
+
+        #self.data_load_start = pd.Timestamp(self.strategy_params["data_load_start"])     # NON-CONSERVATIVE
+        self.data_load_start = self.train_start                                           # CONSERVATIVE
 
         # NOT NEEDED
         #self.backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC")
@@ -159,6 +164,7 @@ class TopKStrategy(Strategy):
 
         # Initialize tracking variables
         self.max_registered_portfolio_nav = 0.0
+        self.nav = 0.0
         self.realised_returns = []
         self.trailing_stops = {}
 
@@ -296,7 +302,7 @@ class TopKStrategy(Strategy):
         logger.info(f"Update timer fired at {now}")
         
         # Check if drowdown stop is needed
-        self._check_drowdown_stop(self.venue)
+        self._check_drowdown_stop()
 
         if not self.model.is_initialized:
             logger.warning("MODEL NOT INITIALIZED WITHIN STRATEGY UPDATE() CALL")
@@ -388,13 +394,12 @@ class TopKStrategy(Strategy):
     def on_bar(self, bar: Bar):  
         # assuming on_timer happens before then on_bars are called first,
         #ts = bar.ts_event
-        sym = bar.bar_type.instrument_id.symbol.value
-        venue = bar.bar_type.instrument_id.venue
+        instrument = self.cache.instrument(bar.bar_type.instrument_id)
         # ------------ trailing-stop  ----------------------
-        tls = self._check_trailing_stop(sym, bar.close)  
+        self._check_trailing_stop(instrument, bar.close)  
 
         # ------------ drawdown-stop ------------------------
-        dwd_s = self._check_drowdown_stop(venue)
+        dwd_s = self._check_drowdown_stop()
 
         if dwd_s:
             self.on_dispose()
@@ -420,11 +425,11 @@ class TopKStrategy(Strategy):
         # Historical data is loaded at startup via loader
         bars = []
 
-        for bar_or_feature in self.loader.bar_iterator():
+        for bar_or_feature in self.loader.bar_iterator(start_time=start, end_time=self.train_end, symbols=[bar_type.instrument_id.symbol.value]):
             if isinstance(bar_or_feature, Bar):
                 bar_ts = pd.Timestamp(bar_or_feature.ts_event, unit='ns', tz='UTC')
-                if start <= bar_ts <= self.train_end and bar_or_feature.bar_type == bar_type:
-                    bars.append(bar_or_feature)
+                assert start <= bar_ts <= self.train_end and bar_or_feature.bar_type == bar_type
+                bars.append(bar_or_feature)
         
         self.cache.add_bars(bars)
         logger.info(f"Added {len(bars)}  bars for {bar_type.instrument_id.value}")
@@ -537,10 +542,10 @@ class TopKStrategy(Strategy):
             if symbol not in self.trailing_stops:
                 self.trailing_stops[symbol] = float(event.last_px)
    
-    def on_order_event(self, event: OrderEvent) -> None:
-        """Catch-all for any unhandled order events."""
-        if self.order_manager:
-            self.order_manager.handle_order_event(event)
+#    def on_order_event(self, event: OrderEvent) -> None:
+#        """Catch-all for any unhandled order events."""
+#        if self.order_manager:
+#            self.order_manager.handle_order_event(event)
 
     # ================================================================= #
     # POSITION MANAGEMENT
@@ -767,16 +772,14 @@ class TopKStrategy(Strategy):
         valid_symbols = []
         prices = {}
         allowed_weight_ranges = []
+        # Calculate current weights for fallback
+        current_weights = []
 
         # Current portfolio net asset value
-        nav = self._calculate_portfolio_nav()
+        self.nav = self._calculate_portfolio_nav()
 
-        for symbol in self.universe:
+        for i, symbol in enumerate(self.universe):
             
-            # Risk-free rate is the only one who can take up to 100% of portfolio
-            if symbol == risk_free_ticker:
-                allowed_weight_ranges.append([0, 1])
-                continue
             instrument_id = InstrumentId(Symbol(symbol), self.venue)
             bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
             bars = self.cache.bars(bar_type)
@@ -794,17 +797,23 @@ class TopKStrategy(Strategy):
             valid_symbols.append(symbol)
             prices[symbol] = float(bars[-1].close)
 
-            # compute allowed weight ranges (same logic you already had)
+            # compute allowed weight ranges
+            # Risk-free rate is the only one who can take up to 100% of portfolio
+            if symbol == risk_free_ticker:
+                allowed_weight_ranges.append([0, 1])
+                continue
+
             net_position = 0.0
             for position in self.cache.positions_open():
                 if position.instrument_id == instrument_id:
                     net_position += float(position.signed_qty)
-            current_w = (net_position * prices[symbol] / nav) if (net_position and nav > 0) else 0.0
+            current_w = (net_position * prices[symbol] / self.nav) if (net_position and self.nav > 0) else 0.0
+            current_weights.append(current_w) 
 
             # ADV
             volumes = [float(b.volume) for b in bars[-self.adv_lookback:]] if len(bars) >= self.adv_lookback else [float(b.volume) for b in bars]
             adv = float(np.mean(volumes)) if volumes else 0.0
-            max_w_relative = min((adv * self.max_adv_pct * prices[symbol]) / nav, self.max_w_abs) if nav > 0 else self.max_w_abs
+            max_w_relative = min((adv * self.max_adv_pct * prices[symbol]) / self.nav, self.max_w_abs) if self.nav > 0 else self.max_w_abs
 
             # compute min or min/max weight for instrument in portfolio 
             if self.can_short:
@@ -828,11 +837,12 @@ class TopKStrategy(Strategy):
         valid_mu = np.array([preds.get(s, 0.0) for s in valid_symbols])
 
         # If all expected returns <= rf_horizon then allocate to risk-free ticker (if available)
-        #if np.all(valid_mu <= current_rf):
-        #    w_series = pd.Series(0.0, index=self.universe)
-        #    if risk_free_ticker in self.universe:
-        #        w_series[risk_free_ticker] = 1.0
-        #    return w_series.to_dict()
+        # TODO: this has to be ensured it's worth with commissions
+        if np.all(valid_mu <= current_rf):
+            w_series = pd.Series(0.0, index=self.universe)
+            if risk_free_ticker in self.universe:
+                w_series[risk_free_ticker] = 1.0
+            return w_series.to_dict()
 
         # Call optimizer (M2) with horizon-scaled cov and rf_h
         w_opt = self.optimizer.optimize(
@@ -840,7 +850,8 @@ class TopKStrategy(Strategy):
             cov=cov_horizon,
             rf=current_rf,
             benchmark_vol=self._get_benchmark_volatility(now),
-            allowed_weight_ranges=np.array(allowed_weight_ranges)
+            allowed_weight_ranges=np.array(allowed_weight_ranges),
+            current_weights = np.array(current_weights),
         )
 
         if len(w_opt) != len(valid_symbols):
@@ -876,8 +887,8 @@ class TopKStrategy(Strategy):
 
 
     # ----- trailing and drawdown stops for risk --------------------------------------------
-    def _check_trailing_stop(self, sym: str, price: float):  # Removed async
-        instrument = self.loader.instruments[sym]
+    def _check_trailing_stop(self, instrument: Instrument, price: float):
+        sym = instrument.symbol.value
         if len(self.portfolio.analyzer._positions) == 0:
             return
         position = self.portfolio.analyzer.net_position(instrument)
@@ -902,12 +913,10 @@ class TopKStrategy(Strategy):
                 self.order_manager.close_all_positions(instrument, reason="trailing_stop")
                 self.trailing_stops.pop(sym, None)
 
-    def _check_drowdown_stop(self, venue: Venue) -> bool:
-        nav_dict = self.portfolio.net_exposures(venue)
-        if len(nav_dict) == 0:
-            return
-        nav = float(nav_dict[self.strategy_params["currency"]])
-        self.max_registered_portfolio_nav = max(self.max_registered_portfolio_nav, nav)
+    def _check_drowdown_stop(self) -> bool:
+        
+        nav = self._calculate_portfolio_nav()
+        self.max_registered_portfolio_nav = max(self.max_registered_portfolio_nav, self.nav)
         #self.equity_analyzer.on_equity(ts, nav)
         
         if nav < self.max_registered_portfolio_nav * (1 - self.drawdown_pct):

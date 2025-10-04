@@ -142,9 +142,6 @@ class OrderManager:
         self.target_positions: Dict[str, int] = {}
         self.current_positions: Dict[str, int] = {}
         
-        # TWAP execution tracking
-        self.twap_schedules: Dict[str, Dict] = {}
-        self.parent_orders: Dict[str, Dict] = {}
         
         # Performance metrics
         self.order_metrics = {
@@ -219,7 +216,7 @@ class OrderManager:
                     self._handle_hedging_positions(instrument_id, positions_list, order_qty, target_qty)
                 else:
                     # Standard execution for NETTING/CASH accounts
-                    self.execute_order(instrument_id, int(order_qty))
+                    self.execute_order(instrument_id, int(order_qty), current_price)
     
     def execute_position_change(
         self, 
@@ -466,9 +463,6 @@ class OrderManager:
         
         # Calculate slippage if this was a market order
         self._calculate_slippage(event)
-        
-        # Check if this completes a TWAP execution
-        self._check_twap_completion(event)
     
     def on_order_event(self, event: OrderEvent) -> None:
         """Handle any order event not specifically handled above."""
@@ -492,58 +486,12 @@ class OrderManager:
                 self.strategy.cancel_order(order)
                 logger.info(f"Canceling order: {order.client_order_id}")
 
-    def execute_twap(
-        self,
-        instrument_id: InstrumentId,
-        total_quantity: int,
-        duration_seconds: Optional[float] = None
-    ) -> None:
-        """
-        Execute a TWAP (Time-Weighted Average Price) order.
-        
-        Args:
-            instrument_id: Instrument to trade
-            total_quantity: Total signed quantity to execute
-            duration_seconds: Total duration for TWAP execution
-        """
-
-        # TODO: should follow this implementation https://nautilustrader.io/docs/latest/concepts/execution/#twap-time-weighted-average-price
-        # _submit_twap_slice is specifying order type. this should be passed directly
-        if total_quantity == 0:
-            return
-        
-        duration = duration_seconds or (self.twap_slices * self.twap_interval)
-        slice_qty = total_quantity // self.twap_slices
-        remainder = total_quantity % self.twap_slices
-        
-        # Create TWAP schedule
-        schedule_id = f"TWAP_{instrument_id}_{self.strategy.clock.timestamp_ns()}"
-        self.twap_schedules[schedule_id] = {
-            'instrument_id': instrument_id,
-            'remaining_slices': self.twap_slices,
-            'slice_quantity': slice_qty,
-            'remainder': remainder,
-            'interval': self.twap_interval,
-            'start_time': self.strategy.clock.timestamp_ns()
-        }
-        
-        # Submit first slice immediately
-        self._submit_twap_slice(schedule_id)
-        
-        # Schedule remaining slices
-        for i in range(1, self.twap_slices):
-            self.strategy.clock.set_timer(
-                name=f"{schedule_id}_slice_{i}",
-                interval=timedelta(seconds=self.twap_interval * i),
-                callback=lambda: self._submit_twap_slice(schedule_id)
-            )
-    
     def execute_order(
         self,
         instrument_id: InstrumentId,
         quantity: int,
+        current_price: float,
         order_type: Optional[str] = None,
-        use_twap: Optional[bool] = None
     ) -> None:
         """
         Execute an order for the given instrument and quantity.
@@ -552,7 +500,6 @@ class OrderManager:
             instrument_id: Instrument to trade
             quantity: Signed quantity (positive for buy, negative for sell)
             order_type: Optional order type override (MARKET, LIMIT, etc.)
-            use_twap: Optional TWAP override (None = use size-based logic)
         """
         if quantity == 0:
             return
@@ -560,28 +507,6 @@ class OrderManager:
         # Determine order side
         order_side = OrderSide.BUY if quantity > 0 else OrderSide.SELL
         abs_quantity = abs(quantity)
-        
-        # Get current market data
-        bar_type = BarType(instrument_id=instrument_id, bar_spec=self.strategy.bar_spec)
-        bars = self.strategy.cache.bars(bar_type)
-        
-        if not bars:
-            logger.warning(f"No market data for {instrument_id}, skipping order")
-            return
-        
-        last_bar = bars[-1]
-        current_price = float(last_bar.close)
-        
-        
-        # Execute with TWAP 
-        # TODO: properly implement twap logic
-        if self.strategy.exec_algo == "twap" :
-            logger.info(f"Executing TWAP order for {instrument_id}: {abs_quantity} units")
-            self.execute_twap(
-                instrument_id=instrument_id,
-                total_quantity=abs_quantity if order_side == OrderSide.BUY else -abs_quantity
-            )
-            return
         
         # Single order execution
         order_type = order_type or ("LIMIT" if self.use_limit_orders else "MARKET")
@@ -703,50 +628,6 @@ class OrderManager:
         # In production, you'd compare fill price to mid-price at submission
         pass
     
-    def _submit_twap_slice(self, schedule_id: str) -> None:
-        """
-        Submit a single TWAP slice.
-        
-        Args:
-            schedule_id: TWAP schedule identifier
-        """
-        if schedule_id not in self.twap_schedules:
-            return
-        
-        schedule = self.twap_schedules[schedule_id]
-        
-        # Determine slice quantity
-        if schedule['remaining_slices'] == 1:
-            # Last slice includes remainder
-            quantity = schedule['slice_quantity'] + schedule['remainder']
-        else:
-            quantity = schedule['slice_quantity']
-        
-        # Submit the slice order
-        self.strategy.submit_order(
-            instrument_id=schedule['instrument_id'],
-            quantity=quantity,
-            order_type="MARKET"
-        )
-        
-        # Update schedule
-        schedule['remaining_slices'] -= 1
-        
-        if schedule['remaining_slices'] == 0:
-            del self.twap_schedules[schedule_id]
-            logger.info(f"TWAP execution completed: {schedule_id}")
-    
-    def _check_twap_completion(self, fill_event: OrderFilled) -> None:
-        """
-        Check if an order fill completes a TWAP execution.
-        
-        Args:
-            fill_event: Order fill event
-        """
-        # Check if this fill is part of a TWAP execution
-        # and update parent order tracking if needed
-        # TODO
-        pass
     
     def get_order_metrics(self) -> Dict[str, Any]:
         """

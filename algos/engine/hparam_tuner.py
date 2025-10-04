@@ -13,7 +13,7 @@ from fastapi import params
 from matplotlib.pyplot import bar
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, LoggingConfig
+from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, ImportableExecAlgorithmConfig, LoggingConfig
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.models import FillModel
 from nautilus_trader.model.data import Bar, BarType
@@ -767,7 +767,11 @@ class OptunaHparamsTuner:
                         config_path = f"algos.{strategy_name}:{strategy_name}Config",
                         config = {"config":yaml_safe(backtest_cfg)},
                     )],
-                    exec_algorithms=[TWAPExecAlgorithm(TWAPExecAlgorithmConfig())],
+                    exec_algorithms=[ ImportableExecAlgorithmConfig(
+                        exec_algorithm_path="nautilus_trader.examples.algorithms.twap:TWAPExecAlgorithm",
+                        config_path="nautilus_trader.examples.algorithms.twap:TWAPExecAlgorithmConfig",
+                        config={}  # Empty config or you can pass TWAP-specific params here
+                    )],
                     #risk_engine = RiskEngine
 
                     cache=CacheConfig(

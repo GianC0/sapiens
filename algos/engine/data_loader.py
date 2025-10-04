@@ -221,58 +221,98 @@ class CsvBarLoader:
         """Return DataFrame with column risk_free"""
         return self._risk_free_df
 
-    def bar_iterator(self) -> Iterator[Bar]:
+    def bar_iterator(self, start_time: Optional[pd.Timestamp] = None, 
+                    end_time: Optional[pd.Timestamp] = None,
+                    symbols: Optional[List[str]] = None) -> Iterator[Bar]:
         """
-        Yield **two** events per symbol/time-stamp:
-            1. FeatureBarData   (all numeric columns)
-            2. Bar              (OHLCV with adjusted close)
-
-        They share the VERY SAME ts_event so the cache keeps them aligned.
+        Efficiently yield Bar and FeatureBarData events for each symbol.
+        
+        Args:
+            start_time: Optional start timestamp filter
+            end_time: Optional end timestamp filter  
+            symbols: Optional list of symbols to iterate (defaults to universe)
+            
+        Yields:
+            FeatureBarData and Bar objects in chronological order per symbol
         """
-        all_ts = sorted({ts for f in self._frames.values() for ts in f.index})
-
-        for ts in all_ts:
-            ts_init = pd.to_datetime([ts]).astype(int).item()
-
-            for sym in self._universe:
-                if sym not in self._frames:
-                    continue
-                    
-                df = self._frames[sym]
-                if ts not in df.index:
-                    continue        # missing bar – universe padding
-
-                row = df.loc[ts]
-                numeric_vector = row.values.astype(np.float32)
+        # Pre-compute bar_spec once
+        bar_spec = freq2barspec(self.cfg["freq"])
+        
+        # Determine symbols to process
+        symbols_to_process = symbols if symbols else self._universe
+        
+        # Pre-compile column indices for faster access
+        OHLCV_COLS = ['Open', 'High', 'Low', 'Close', 'Volume']
+        
+        for symbol in symbols_to_process:
+            if symbol not in self._frames:
+                continue
                 
-                instrument = self._instruments[sym]
-
-                # ---- 1) full-feature object -------------------------
-                yield FeatureBarData(
-                    instrument=sym,
-                    ts_event=ts_init,
-                    ts_init=ts_init,
-                    features=numeric_vector,
-                )
-
-                # ---- 2) traditional Bar with ADJUSTED CLOSE ---------
-                # Always use adjusted close as the close price
-                def _get(col): return float(row[col]) if col in row else 0.0
+            df = self._frames[symbol]
+            instrument = self._instruments[symbol]
+            bar_type = BarType(
+                instrument_id=instrument.id,
+                bar_spec=bar_spec
+            )
+            
+            # Apply time filters if provided
+            if start_time or end_time:
+                mask = pd.Series(True, index=df.index)
+                if start_time:
+                    mask &= (df.index >= start_time)
+                if end_time:
+                    mask &= (df.index <= end_time)
+                df_filtered = df[mask]
+            else:
+                df_filtered = df
+            
+            if df_filtered.empty:
+                continue
+            
+            # Pre-calculate column indices for OHLCV
+            col_indices = {}
+            for col in OHLCV_COLS:
+                if col in df_filtered.columns:
+                    col_indices[col] = df_filtered.columns.get_loc(col)
+            
+            # Convert timestamps once for this symbol
+            timestamps_ns = df_filtered.index.astype(np.int64)
+            
+            # Get numpy array for faster iteration
+            values_array = df_filtered.values.astype(np.float32)
+            
+            # Iterate through rows efficiently
+            for i, (ts, ts_ns) in enumerate(zip(df_filtered.index, timestamps_ns)):
+                row_values = values_array[i]
+                
+                # 1) Yield FeatureBarData with all numeric features
+                if self.cfg.get("columns_to_load") != "candles":
+                    yield FeatureBarData(
+                        instrument=symbol,
+                        ts_event=ts_ns,
+                        ts_init=ts_ns,
+                        features=row_values
+                    )
+                
+                # 2) Yield Bar with OHLCV
+                # Direct array access using pre-calculated indices
+                open_val = row_values[col_indices.get('Open', 0)] if 'Open' in col_indices else 0.0
+                high_val = row_values[col_indices.get('High', 0)] if 'High' in col_indices else 0.0
+                low_val = row_values[col_indices.get('Low', 0)] if 'Low' in col_indices else 0.0
+                close_val = row_values[col_indices.get('Close', 0)] if 'Close' in col_indices else 0.0
+                volume_val = row_values[col_indices.get('Volume', 0)] if 'Volume' in col_indices else 0.0
                 
                 yield Bar(
-                    bar_type=BarType(
-                        instrument_id=instrument.id,
-                        bar_spec= freq2barspec(self.cfg["freq"])
-                        ),
-                    open=Price.from_str(f"{_get('Open'):.2f}"),
-                    high=Price.from_str(f"{_get('High'):.2f}"),
-                    low=Price.from_str(f"{_get('Low'):.2f}"),
-                    close=Price.from_str(f"{_get('Close'):.2f}"),  # Always use adjusted close
-                    volume=Quantity.from_int(int(_get('Volume'))),
-                    ts_event=ts_init,
-                    ts_init=ts_init,
+                    bar_type=bar_type,
+                    open=Price.from_str(f"{open_val:.2f}"),
+                    high=Price.from_str(f"{high_val:.2f}"),
+                    low=Price.from_str(f"{low_val:.2f}"),
+                    close=Price.from_str(f"{close_val:.2f}"),
+                    volume=Quantity.from_int(int(volume_val)),
+                    ts_event=ts_ns,
+                    ts_init=ts_ns,
                 )
-    
+        
     # ------------------------------------------------------------------ #
     # parsing helpers
     # ------------------------------------------------------------------ #

@@ -12,7 +12,6 @@ def create_optimizer(name: str, **kwargs):
     optimizers = {
         "max_sharpe": MaxSharpeOptimizer,
         "min_variance": MinVarianceOptimizer,
-        "equal_weight": EqualWeightOptimizer,
         "m2": M2Optimizer,
         "max_quadratic_utility": MaxQuadraticUtilityOptimizer,
         "efficient_risk": EfficientRiskOptimizer,
