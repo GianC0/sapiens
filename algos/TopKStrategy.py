@@ -179,6 +179,7 @@ class TopKStrategy(Strategy):
         self.exec_algo = self.strategy_params.get("execution", {}).get("exec_algo", "twap")
         self.twap_slices = self.strategy_params.get("execution", {}).get("twap", {}).get("slices", 4)
         self.twap_interval_secs = self.strategy_params.get("execution", {}).get("twap", {}).get("interval_secs", 2.5)
+        self.commission_rate = self.strategy_params['costs']['fee_bps'] / 100
         self.can_short = self.strategy_params.get("oms_type", "NETTING") == "HEDGING"
 
         # Portfolio optimizer
@@ -776,8 +777,8 @@ class TopKStrategy(Strategy):
         valid_symbols = []
         prices = {}
         allowed_weight_ranges = []
-        # Calculate current weights for fallback
-        current_weights = []
+        current_weights = [] # Calculate current weights for fallback
+        total_current_exposure = 0.0
 
         # Current portfolio net asset value
         self.nav = self._calculate_portfolio_nav()
@@ -789,6 +790,19 @@ class TopKStrategy(Strategy):
             bars = self.cache.bars(bar_type)
             if not bars or len(bars) < 2:
                 continue
+
+            # Get current price
+            current_price = float(bars[-1].close)
+            prices[symbol] = current_price
+
+            # Calculate current position weight
+            net_position = 0.0
+            for position in self.cache.positions_open():
+                if position.instrument_id == instrument_id:
+                    net_position += float(position.signed_qty)
+            current_w = (net_position * current_price / self.nav) if (net_position and self.nav > 0) else 0.0
+            current_weights.append(current_w)
+            total_current_exposure += abs(current_w) 
 
             # returns per single period (same freq as preds' base period)
             lookback_n = max(2, int(self.optimizer_lookback.n))
@@ -804,22 +818,20 @@ class TopKStrategy(Strategy):
             # compute allowed weight ranges
             # Risk-free rate is the only one who can take up to 100% of portfolio
             if symbol == risk_free_ticker:
-                allowed_weight_ranges.append([0, 1])
+                # Risk-free allocation should account for commissions
+                max = 1 -  ( 2 * self.commission_rate )   # Reserve for round-trip
+                allowed_weight_ranges.append([0, max])
                 continue
 
-            net_position = 0.0
-            for position in self.cache.positions_open():
-                if position.instrument_id == instrument_id:
-                    net_position += float(position.signed_qty)
-            current_w = (net_position * prices[symbol] / self.nav) if (net_position and self.nav > 0) else 0.0
-            current_weights.append(current_w) 
-
-            # ADV
+            # ADV constraints
             volumes = [float(b.volume) for b in bars[-self.adv_lookback:]] if len(bars) >= self.adv_lookback else [float(b.volume) for b in bars]
             adv = float(np.mean(volumes)) if volumes else 0.0
-            max_w_relative = min((adv * self.max_adv_pct * prices[symbol]) / self.nav, self.max_w_abs) if self.nav > 0 else self.max_w_abs
+            
+            # Adjust max weight for commission reserve
+            commission_adjusted_nav = self.nav * (1 - self.commission_rate * 2)  # Reserve for round-trip
+            max_w_relative = min((adv * self.max_adv_pct * current_price) / commission_adjusted_nav, self.max_w_abs) if commission_adjusted_nav > 0 else self.max_w_abs
 
-            # compute min or min/max weight for instrument in portfolio 
+            # compute min or min/max weight for instrument
             if self.can_short:
                 w_min = max(current_w - max_w_relative, -self.max_w_abs, self.weight_bounds[0])
                 w_max = min(current_w + max_w_relative, self.max_w_abs, self.weight_bounds[1])
@@ -837,7 +849,7 @@ class TopKStrategy(Strategy):
         cov_per_period = returns_df.cov().values
         cov_horizon = cov_per_period * float(self.pred_len)  # scale to pred_len horizon
 
-        # prepare mu 
+        # prepare expected returns
         valid_mu = np.array([preds.get(s, 0.0) for s in valid_symbols])
 
         # If all expected returns <= rf_horizon then allocate to risk-free ticker (if available)
@@ -845,12 +857,12 @@ class TopKStrategy(Strategy):
         if np.all(valid_mu <= current_rf):
             w_series = pd.Series(0.0, index=self.universe)
             if risk_free_ticker in self.universe:
-                w_series[risk_free_ticker] = 1.0
+                w_series[risk_free_ticker] = 1 - ( 2 * self.commission_rate) # Reserve for round-trip
                 
             logger.info(f"All assets underperform risk-free rate {current_rf:.4f}, allocating 100% to {risk_free_ticker}")
             return w_series.to_dict()
 
-        # Call optimizer (M2) with horizon-scaled cov and rf_h
+        # Call optimizer with horizon-scaled cov and risk-free rf
         w_opt = self.optimizer.optimize(
             mu=valid_mu,
             cov=cov_horizon,
@@ -865,6 +877,7 @@ class TopKStrategy(Strategy):
             w_opt = np.ones(len(valid_symbols)) / len(valid_symbols)
 
         # Take top-K by absolute weight
+        # TODO: revisit
         k = min(self.selector_k, len(valid_symbols))
         idx_sorted = np.argsort(-np.abs(w_opt))
         top_idx = idx_sorted[:k]
@@ -877,12 +890,13 @@ class TopKStrategy(Strategy):
             w_min, w_max = allowed_weight_ranges[i]
             final_arr[i] = float(np.clip(val, w_min, w_max))
 
-        # Optional renormalization: preserve total abs exposure of the selected set from optimizer
-        abs_selected_sum = float(np.sum(np.abs(w_opt[top_idx])))
-        abs_final_sum = float(np.sum(np.abs(final_arr[top_idx])))
-        if abs_final_sum > 0 and abs_selected_sum > 0:
-            scale = abs_selected_sum / abs_final_sum
-            final_arr[top_idx] = final_arr[top_idx] * scale
+        # Ensure total absolute exposure leaves room for commissions
+        abs_final_sum = float(np.sum(np.abs(final_arr)))
+        if abs_final_sum > 1:
+            # Scale down to respect commission buffer
+            scale = 1 / abs_final_sum
+            final_arr = final_arr * scale
+            logger.info(f"Scaled weights by {scale:.4f} to reserve cash for commissions")
 
         # Map back to full universe
         w_series = pd.Series(0.0, index=self.universe)

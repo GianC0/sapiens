@@ -138,6 +138,11 @@ class OrderManager:
         self.rejected_orders: Dict[str, List[Any]] = defaultdict(list)
         self.order_retries: Dict[str, int] = defaultdict(int)
 
+        # Commission parameters
+        self.fee_bps = config['costs']['fee_bps']  # basis points
+        self.commission_rate = self.strategy.commission_rate
+
+
         # Position tracking for order management
         self.target_positions: Dict[str, int] = {}
         self.current_positions: Dict[str, int] = {}
@@ -160,14 +165,12 @@ class OrderManager:
 
     def rebalance_portfolio(self, target_weights: Dict[str, float], universe: List[str]) -> None:
         """
-        Rebalance entire portfolio to target weights.
-        This is the main entry point for strategy rebalancing.
+        Rebalance entire portfolio to target weights with commission awareness.
         
         Args:
             target_weights: Dict[symbol, weight] where weight is fraction of NAV
             universe: List of all symbols in the universe
         """
-
         nav = self.strategy._calculate_portfolio_nav()
         if nav <= 0:
             logger.error(f"Invalid NAV: {nav}. Skipping rebalance.")
@@ -175,56 +178,99 @@ class OrderManager:
         
         logger.info(f"Rebalancing portfolio with NAV: {nav:.2f}")
 
-        # Special handling for risk-free only allocation
-        risk_free_ticker = self.strategy.strategy_params["risk_free_ticker"]
-        non_zero_weights = {k: v for k, v in target_weights.items() if abs(v) > 1e-6}
+        # Calculate commission buffer (reserve for worst-case scenario)
+        total_target_turnover = 0.0
+        for symbol in universe:
+            target_weight = target_weights.get(symbol, 0.0)
+            current_weight = self._get_current_weight(symbol)
+            turnover = abs(target_weight - current_weight)
+            total_target_turnover += turnover
         
-        if len(non_zero_weights) == 1 and risk_free_ticker in non_zero_weights:
-            logger.info(f"Portfolio fully allocated to risk-free asset {risk_free_ticker}")
+        # Reserve cash for commissions (both buy and sell side)
+        commission_reserve = nav * total_target_turnover * self.commission_rate
+        available_nav = nav - commission_reserve
         
-        can_short = self.strategy.can_short
-
+        if available_nav <= 0:
+            logger.error(f"Insufficient NAV after commission reserve: {available_nav:.2f}")
+            return
+        
+        # Separate symbols into sells and buys
+        sells = []
+        buys = []
+        holds = []
+        
         for symbol in universe:
             target_weight = target_weights.get(symbol, 0.0)
             instrument_id = InstrumentId(Symbol(symbol), self.strategy.venue)
             
-            # Get current net quantity
-            # TODO: ensure that for HEDGING oms_type this manages any position
-            # Aggregate current positions for this instrument
-            net_current_qty = 0.0
-            positions_list = []
-            
-            for pos in self.strategy.cache.positions_open():
-                if pos.instrument_id == instrument_id:
-                    positions_list.append(pos)
-                    net_current_qty += float(pos.signed_qty)
+            # Get current position
+            net_current_qty = self._get_net_position_qty(instrument_id)
             
             # Get current price
-            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.strategy.bar_spec)
-            bars = self.strategy.cache.bars(bar_type)
-            if not bars:
-                logger.warning(f"No bars available for {symbol}, skipping")
+            current_price = self._get_current_price(instrument_id)
+            if current_price is None:
                 continue
             
-            current_price = float(bars[-1].close)
-            
-            # Calculate target quantity
-            target_value = target_weight * nav
+            # Calculate target quantity (adjusted for available NAV)
+            target_value = target_weight * available_nav
             target_qty = float(target_value / current_price) if current_price > 0 else 0.0
             
             # Calculate order quantity needed
             order_qty = target_qty - net_current_qty
             
-            logger.info(f"{symbol}: Current qty={net_current_qty}, Target qty={target_qty}, Order qty={order_qty}")
+            # Categorize orders
+            if order_qty < -0.5:  # Selling (threshold to avoid tiny trades)
+                sells.append((symbol, instrument_id, order_qty, current_price))
+            elif order_qty > 0.5:  # Buying
+                buys.append((symbol, instrument_id, order_qty, current_price))
+            else:  # Holding (no significant change)
+                holds.append(symbol)
+        
+        # Execute sells first to free up capital
+        available_cash = self._get_available_cash()
+        
+        for symbol, instrument_id, order_qty, current_price in sells:
+            logger.info(f"SELL {symbol}: qty={abs(order_qty):.2f}")
+            self._execute_order_with_validation(
+                instrument_id, 
+                int(order_qty), 
+                current_price,
+                available_cash
+            )
+            # Update available cash estimate (add proceeds minus commission)
+            proceeds = abs(order_qty) * current_price
+            available_cash += proceeds * (1 - self.commission_rate)
+        
+        # Then execute buys with available cash
+        for symbol, instrument_id, order_qty, current_price in buys:
+            # Check if we have enough cash for this buy + commission
+            required_cash = abs(order_qty) * current_price * (1 + self.commission_rate)
             
-            if abs(order_qty) > 0:
-                # For HEDGING accounts, close opposite positions first if switching sides
-                if can_short and positions_list:
-                    self._handle_hedging_positions(instrument_id, positions_list, order_qty, target_qty)
+            if required_cash > available_cash
+                # Reduce order size to fit available cash
+                max_qty = (available_cash) / (current_price * (1 + self.commission_rate))
+                if max_qty > 0.5:  # Only execute if meaningful size
+                    adjusted_qty = int(max_qty)
+                    logger.warning(f"BUY {symbol}: Reduced qty from {order_qty:.2f} to {adjusted_qty} due to cash constraint")
+                    order_qty = adjusted_qty
                 else:
-                    # Standard execution for NETTING/CASH accounts
-                    self.execute_order(instrument_id, int(order_qty), current_price)
-    
+                    logger.warning(f"BUY {symbol}: Skipped due to insufficient cash")
+                    continue
+            
+            logger.info(f"BUY {symbol}: qty={order_qty:.2f}")
+            self._execute_order(
+                instrument_id, 
+                int(order_qty), 
+                current_price,
+                available_cash
+            )
+            # Update available cash estimate
+            available_cash -= abs(order_qty) * current_price * (1 + self.commission_rate)
+        
+        # Log holds for completeness
+        if holds:
+            logger.info(f"HOLD positions: {', '.join(holds)}")
+
     def execute_position_change(
         self, 
         instrument_id: InstrumentId, 
@@ -247,8 +293,11 @@ class OrderManager:
         order_qty = target_quantity - current_qty
         
         if order_qty != 0:
-            logger.info(f"Position change for {instrument_id}: {current_qty} -> {target_quantity} ({reason})")
-            self.execute_order(instrument_id, order_qty)
+            current_price = self._get_current_price(instrument_id)
+            if current_price:
+                available_cash = self._get_available_cash()
+                logger.info(f"Position change for {instrument_id}: {current_qty} -> {target_quantity} ({reason})")
+                self._execute_order(instrument_id, order_qty, current_price, available_cash)
     
     def close_all_positions(self, instrument_id: InstrumentId, reason: str = "close") -> None:
         """
@@ -307,8 +356,6 @@ class OrderManager:
         # Submit order
         if order:
             self.strategy.submit_order(order)
-
-
 
     def liquidate_all(self, symbols: List[str]) -> None:
         """
@@ -493,66 +540,50 @@ class OrderManager:
                 self.strategy.cancel_order(order)
                 logger.info(f"Canceling order: {order.client_order_id}")
 
-    def execute_order(
+    def _execute_order(
         self,
         instrument_id: InstrumentId,
         quantity: int,
         current_price: float,
-        order_type: Optional[str] = None,
-    ) -> None:
+        available_cash: float
+    ) -> bool:
         """
-        Execute an order for the given instrument and quantity.
+        Execute order with cash validation.
         
-        Args:
-            instrument_id: Instrument to trade
-            quantity: Signed quantity (positive for buy, negative for sell)
-            order_type: Optional order type override (MARKET, LIMIT, etc.)
+        Returns:
+            bool: True if order was submitted, False otherwise
         """
         if quantity == 0:
-            return
+            return False
+        
+        # For buy orders, validate sufficient cash
+        if quantity > 0:
+            required_cash = abs(quantity) * current_price * (1 + self.commission_rate)
+            if required_cash > available_cash:
+                logger.error(f"Insufficient cash for order: required={required_cash:.2f}, available={available_cash:.2f}")
+                return False
         
         # Determine order side
         order_side = OrderSide.BUY if quantity > 0 else OrderSide.SELL
         abs_quantity = abs(quantity)
         
-        # Single order execution
-        order_type = order_type or ("LIMIT" if self.use_limit_orders else "MARKET")
+        # Create and submit order
+        order = self._create_market_order(
+            instrument_id=instrument_id,
+            quantity=abs_quantity,
+            order_side=order_side
+        )
         
-        # Create order based on type
-        if order_type == "MARKET":
-            order = self._create_market_order(
-                instrument_id=instrument_id,
-                quantity=abs_quantity,
-                order_side=order_side
-            )
-        elif order_type == "LIMIT":
-            # Calculate limit price with offset
-            if order_side == OrderSide.BUY:
-                # For buy orders, place limit slightly above current price
-                limit_price = current_price * (1 + self.limit_order_offset_bps / 10000)
-            else:
-                # For sell orders, place limit slightly below current price
-                limit_price = current_price * (1 - self.limit_order_offset_bps / 10000)
-            
-            order = self._create_limit_order(
-                instrument_id=instrument_id,
-                quantity=abs_quantity,
-                order_side=order_side,
-                price=limit_price
-            )
-        else:
-            logger.error(f"Unsupported order type: {order_type}")
-            return
-        
-        # Submit the order
         if order:
             self.strategy.submit_order(order)
             logger.info(
-                f"Submitted {order_type} {order_side.name} order for {instrument_id}: "
-                f"{abs_quantity} units at {current_price:.2f}"
+                f"Submitted MARKET {order_side.name} order for {instrument_id}: "
+                f"{abs_quantity} units at ~{current_price:.2f}"
             )
+            return True
         else:
-            logger.error("Failed to create order")
+            logger.error(f"Failed to create order for {instrument_id}")
+            return False
 
     def _create_market_order(
         self,
@@ -593,6 +624,50 @@ class OrderManager:
     # Helper Methods
     # =========================================================================
     
+    def _get_current_weight(self, symbol: str) -> float:
+        """Calculate current weight of a symbol in the portfolio."""
+        nav = self.strategy._calculate_portfolio_nav()
+        if nav <= 0:
+            return 0.0
+        
+        instrument_id = InstrumentId(Symbol(symbol), self.strategy.venue)
+        net_qty = self._get_net_position_qty(instrument_id)
+        
+        if abs(net_qty) < 1e-2:
+            return 0.0
+        
+        current_price = self._get_current_price(instrument_id)
+        if current_price is None:
+            return 0.0
+        
+        position_value = net_qty * current_price
+        return position_value / nav
+
+    def _get_net_position_qty(self, instrument_id: InstrumentId) -> float:
+        """Get net position quantity for an instrument."""
+        net_qty = 0.0
+        for pos in self.strategy.cache.positions_open():
+            if pos.instrument_id == instrument_id:
+                net_qty += float(pos.signed_qty)
+        return net_qty
+    
+    def _get_current_price(self, instrument_id: InstrumentId) -> Optional[float]:
+        """Get current price for an instrument."""
+        bar_type = BarType(instrument_id=instrument_id, bar_spec=self.strategy.bar_spec)
+        bars = self.strategy.cache.bars(bar_type)
+        if not bars:
+            logger.warning(f"No bars available for {instrument_id}")
+            return None
+        return float(bars[-1].close)
+    
+    def _get_available_cash(self) -> float:
+        """Get available cash in the account."""
+        account = self.strategy.portfolio.account(self.strategy.venue)
+        if account:
+            return float(account.balance_total(self.strategy.strategy_params["currency"]))
+        else:
+            return float(self.strategy.strategy_params.get("initial_cash", 0))
+
     def _handle_order_failure(self, event: Any) -> None:
         """
         Handle order failure with retry logic.
@@ -634,7 +709,6 @@ class OrderManager:
         # For now, we'll skip detailed slippage calculation
         # In production, you'd compare fill price to mid-price at submission
         pass
-    
     
     def get_order_metrics(self) -> Dict[str, Any]:
         """

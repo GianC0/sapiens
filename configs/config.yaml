@@ -134,7 +134,7 @@ STRATEGY:
     currency: USD
     warm_start:      true        # Enable warm-start                   
     rebalance_only: false        # false = all universe instruments are considered for top_k. true = portoflio instruments stay the same, with dynamic reallocation 
-    account_type: CASH           # "CASH" = spot trading. "MARGIN" can trade derivatives and options as welll. TODO: not implememted
+    account_type: CASH           # "CASH" = spot trading. "MARGIN" can trade derivatives and options as welll. TODO: "MARGIN" not implememted
     oms_type: NETTING            # Order Management System type. NETTING = only long positions. HEDGING = long and short
     venue_name: SIM              # name of the venue to use for trading
     risk_free_ticker: "SGOV"     # Risk-free ETF to include in portfolio
@@ -171,7 +171,7 @@ STRATEGY:
 
     # Trading friction costs
     costs:
-      fee_bps:    0.5          # One-way commission in basis-points of notional    (Tcost literature)
+      fee_bps:    5            # One-way commission in basis-points of notional: 0.05% commission
       prob_slippage: 0.2       # Simulates the probability of experiencing price slippage when executing market orders. When triggered, moves fill price one tick against your order direction
       prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
 
