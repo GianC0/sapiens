@@ -15,6 +15,7 @@ from operator import index
 import os, math, json, shutil, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import time
 from typing import Dict, Optional, Any
 import pandas as pd
 from pandas.tseries.offsets import BaseOffset
@@ -27,7 +28,7 @@ import logging
 from logging import Logger
 logger = logging.getLogger(__name__)
 
-from ..utils import SlidingWindowDataset, build_input_tensor, build_pred_tensor, freq2pdoffset
+from ..utils import SlidingWindowDataset, build_tensor, freq2pdoffset
 from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
 
 # --------------------------------------------------------------------------- #
@@ -50,6 +51,7 @@ class UMIModel(nn.Module):
         train_offset: pd.tseries.offsets.DateOffset,
         valid_start: pd.Timestamp,
         valid_end: pd.Timestamp,
+        valid_split: float,
         n_epochs: int = 20,
         batch_size: int = 64,
         patience:int=10,
@@ -78,8 +80,9 @@ class UMIModel(nn.Module):
         self.pred_len    = pred_len                                                                 # number of bars to predict
         self.train_start =   train_start                                                            # train start date
         self.train_end      = pd.Timestamp(train_end)                                               # end of training date
-        self.train_offset   = train_offset                                               # time window for training
+        self.train_offset   = train_offset                                                          # time window for training
         self.valid_end      = pd.Timestamp(valid_end)                                               # end of validation date
+        self.valid_split = valid_split                                                              # meaning train/valid split of full training dataset.
         assert self.valid_end >= self.train_end, "Validation end date must be after training end date."
 
         self.save_backups   = save_backups                                                          # whether to save backups during walk-forward
@@ -120,7 +123,7 @@ class UMIModel(nn.Module):
         """Check if model has been initialized."""
         return self._is_initialized
     
-    def initialize(self, data: Dict[str, DataFrame]) -> float:
+    def initialize(self, data: Dict[str, DataFrame], total_bars: int) -> float:
         """
         Initial training on historical data.
          
@@ -147,9 +150,9 @@ class UMIModel(nn.Module):
         # Train from scratch
         if logger:
             logger.info(f"[initialize] Training for {self.n_epochs} epochs...")
-        start = self.train_start #+ freq2pdoffset(self.freq)
+        start = self.train_start + freq2pdoffset(self.freq)
         end = self.valid_end
-        best_val = self._train(data, self.n_epochs, active_mask, start=start, end=end)
+        best_val = self._train(data, self.n_epochs, active_mask, total_bars = total_bars, start=start, end=end, )
         
         # Save initial state
         torch.save(self.state_dict(), self.model_dir / "init.pt")
@@ -166,7 +169,7 @@ class UMIModel(nn.Module):
 
         return best_val
 
-    def update(self, data: Dict[str, DataFrame], current_time: Timestamp, retrain_start_date: Timestamp, active_mask: torch.Tensor, warm_start: Optional[bool] = False, warm_training_epochs: Optional[int] = None):
+    def update(self, data: Dict[str, DataFrame], current_time: Timestamp, retrain_start_date: Timestamp, active_mask: torch.Tensor,  total_bars: int, warm_start: Optional[bool] = False, warm_training_epochs: Optional[int] = None,):
         """
         One-off training (train + valid).
         """
@@ -189,7 +192,7 @@ class UMIModel(nn.Module):
     
             # Reinitialize with new windows
             self._is_initialized = False
-            self.initialize(data)
+            self.initialize(data = data, total_bars = total_bars)
             return
 
         assert self._is_initialized
@@ -213,7 +216,7 @@ class UMIModel(nn.Module):
             raise ImportError("Could not find latest.pt warmed-up model in ", self.model_dir)
         
         # Train
-        _ = self._train(data, epochs, active_mask, start=retrain_start_date, end=current_time)
+        _ = self._train(data, epochs, active_mask, start=retrain_start_date, end=current_time, total_bars = total_bars)
         
         # Save backup if requested
         if self.save_backups:
@@ -271,7 +274,7 @@ class UMIModel(nn.Module):
         #start_date = current_time - freq2pdoffset(self.freq) * (lookback_periods - 1) 
         #days_range = self.market_calendar.schedule(start_date=start_date, end_date=current_time)
         #timestamps = market_calendars.date_range(days_range, frequency=self.freq).normalize()
-        data_tensor, data_mask = build_pred_tensor(data, indexes, feature_dim=self.F, device=self._device)
+        data_tensor, data_mask = build_tensor(data, indexes, feature_dim=self.F, device=self._device)
         
         # assertion on the universe size
         assert torch.equal(data_mask, active_mask), "Active mask mismatch during prediction"
@@ -287,7 +290,7 @@ class UMIModel(nn.Module):
         
         # Get last window
         prices_seq, feat_seq, _, dataset_mask = dataset[0]
-        assert torch.equal(data_mask, dataset_mask), "Dataset mask different from build_pred_tensor input mask during prediction"
+        assert torch.equal(data_mask, dataset_mask), "Dataset mask different from build_tensor input mask during prediction"
         
         
         # Add batch dimension and move to device
@@ -401,7 +404,7 @@ class UMIModel(nn.Module):
     # ----------------------------------------------------------------- #
     # ---------------- training utilities ----------------------------- #
     # ----------------------------------------------------------------- #
-    def _train(self, data: Dict[str, DataFrame], n_epochs: int, active_mask: torch.Tensor, start: Timestamp, end: Timestamp) -> float:
+    def _train(self, data: Dict[str, DataFrame], n_epochs: int, active_mask: torch.Tensor, start: Timestamp, end: Timestamp, total_bars: int) -> float:
         """
         Unified training function that handles all three training modes:
         - "joint": Train all components together
@@ -419,35 +422,28 @@ class UMIModel(nn.Module):
 
         if self.valid_end < self.train_end:
             raise ValueError(f"Validation end date: {self.valid_end} is earlier that end train end date {self.train_end}")
-
         
-        # quick and dirty fix
-        #if isinstance(self.train_offset, str):
-        #    self.train_offset = freq2pdoffset(self.train_offset)
+        full_tensor, data_mask = build_tensor(data, total_bars, self.F, self._device)
 
-        # Create common timestamp index. This solves the start= -1 bar problem
-        #start_date = self.train_end - self.train_offset + freq2pdoffset(self.freq)
-        days_range = self.market_calendar.schedule(start_date= start, end_date=end)
-        timestamps = market_calendars.date_range(days_range, frequency=self.freq)
-        
         assert len(data) > 0
-        (train_tensor, train_mask) , (valid_tensor, valid_mask) = build_input_tensor(data=data, timestamps=timestamps, feature_dim=self.F, split_valid_timestamp=self.train_end, device=self._device )
-
-        # empty tensor has size 1 with Null object
-        has_validation = torch.numel(valid_tensor) > 1
-        if has_validation:
-            assert torch.equal(valid_mask, active_mask) , "Active mask mismatch during training"
-        else:
-            assert torch.equal(train_mask, active_mask), "Active mask mismatch during training"
-        # Build training dataset
-        train_dataset = SlidingWindowDataset(train_tensor, self.L, self.pred_len, target_idx=self.target_idx)
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-        
-        # Build validation dataset (if available)
+        # Calculate split point by bar count
+        has_validation = self.valid_end < end
         valid_loader = None
         if has_validation:
+            train_bars = int(total_bars * (1 - self.valid_split)) 
+            train_tensor, train_mask = full_tensor[:train_bars], data_mask
+            valid_tensor, valid_mask = full_tensor[train_bars:], data_mask
+            assert torch.equal(valid_mask, active_mask), "Active mask mismatch"
+            # Build training dataset
             valid_dataset = SlidingWindowDataset(valid_tensor, self.L, self.pred_len, target_idx=self.target_idx)
             valid_loader = DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=False)
+        else:
+            train_tensor, train_mask = full_tensor, data_mask
+            valid_tensor = torch.tensor(0)
+            assert torch.equal(train_mask, active_mask), "Active mask mismatch" 
+            # Build training dataset
+            train_dataset = SlidingWindowDataset(train_tensor, self.L, self.pred_len, target_idx=self.target_idx)
+            train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
         
         # ═══════════════════════════════════════════════════════════════════════════════
         # 2. OPTIMIZERS SETUP
@@ -717,8 +713,8 @@ class UMIModel(nn.Module):
             if has_validation:
                 validation_loss = self._execute_validation_epoch(valid_loader)
                 best_validation_loss = min(best_validation_loss, validation_loss)
-            
-            if epoch == 0 or (epoch + 1) % max(1, n_epochs // 5) == 0:
+
+            if epoch == 0 or (epoch + 1) % max(1, n_epochs // 10) == 0:
                 if logger:
                     logger.info(f"Stage2 Epoch {global_epoch:>3} | train {train_loss:.5f} | "
                             f"val {validation_loss:.5f} | best {best_validation_loss:.5f}")

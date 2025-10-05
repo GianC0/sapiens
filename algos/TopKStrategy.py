@@ -143,7 +143,7 @@ class TopKStrategy(Strategy):
         self.model: Optional[MarketModel] = None
         self.model_name = self.model_params["model_name"]
         self.bar_spec = freq2barspec( self.strategy_params["freq"])
-        self.min_bars_required = self.model_params["window_len"] + 1
+        self.min_bars_required = self.model_params["window_len"]
         self.optimizer_lookback = freq2pdoffset( self.strategy_params["optimizer_lookback"])
         
         
@@ -294,14 +294,18 @@ class TopKStrategy(Strategy):
             logger.debug(f"Event time {event_time} not after last update {self._last_update_time}")
             return
 
-        now = pd.Timestamp(self.clock.utc_now(),)
+        now = pd.Timestamp(self.clock.utc_now()) #.tz_convert(self.calendar.tz)
+        freq = self.strategy_params["freq"]
+        #d_r = self.calendar.schedule(start_date=str(now - freq2pdoffset(freq)), end_date=str(now + freq2pdoffset(freq)))
         
         # check if "now" falls outside market trading hours
-        if not self.calendar.open_at_time(self.calendar.schedule(start_date=now.date(), end_date=now.date()), now):
+        schedule = self.calendar.schedule(start_date=str(now), end_date=str(now))
+        if schedule.empty:
+            logger.info(f"Non-trading day at {now}")
             return
 
         # Skip if no update needed
-        if self._last_update_time and now < (self._last_update_time + freq2pdoffset(self.strategy_params["freq"])):
+        if self._last_update_time and now < (self._last_update_time + freq2pdoffset(freq)):
             logger.warning("Update called too soon, skipping")
             return
         
@@ -316,7 +320,7 @@ class TopKStrategy(Strategy):
         
         assert self.model.is_initialized
 
-        data_dict = self._cache_to_dict(window=(self.min_bars_required)) # TODO: make it more generic for all models.
+        data_dict = self._cache_to_dict(window=(self.min_bars_required))
 
         if not data_dict:
             logger.warning("DATA DICTIONARY EMPTY WITHIN STRATEGY UPDATE() CALL")
@@ -353,11 +357,7 @@ class TopKStrategy(Strategy):
         # update last updated time
         self._last_update_time = now
         return 
-        # the logic should be the following:
-        # new prediction up until re-optimize portfolio
-        # update prediction for the next pred_len = now + holdout - holdout_start
-        # checks for stocks events (new or delisted) and retrain_offset and if nothing happens directly calls predict() method of the model (which should happen only if holdout period in bars is passed (otherwise do not do anything), and this variable is in the config.yaml); if retrain delta is passed without stocks event, it calls update() which runs a warm start fit() on the new training window and then the strategy calls predict(); if stock event happens then the strategy calls update() and then predict(). update() should manage the following: if delisting then just use the model active mask to cut off those stocks (so that future preds and training loss are not computed for these. the model is ready to predict after that) but if new stocks are added it checks for universe availability and enough history in the Cache for those new stocks and then calls an initialization. ensure that the most up to date mask is always set by update (or by initialize only at the start) so that the other functions use always the most up to date mask.
-        # Update training windows for walk-forward
+
     def on_retrain(self, event: TimeEvent):
         """Periodic model retraining."""
         if event.name != "retrain_timer":
@@ -380,7 +380,7 @@ class TopKStrategy(Strategy):
         # ADAPTIVE WINDOW: Ensure minimum training size
         # ═══════════════════════════════════════════════════════════════════
         # ensures case at t=0 where len(timestamps) for new bars < min_bars_required 
-        rolling_window_size = max(len(timestamps), self.min_bars_required)
+        rolling_window_size = max(len(timestamps), self.min_bars_required + self.pred_len)
         
         # Log when falling back to minimum (includes overlap with previous training)
         if rolling_window_size > self.min_bars_required:
@@ -390,9 +390,11 @@ class TopKStrategy(Strategy):
                 f"[on_retrain] Using rolling window of {rolling_window_size} bars (sufficient for training).")
         
         # Get updated data window
-        data_dict = self._cache_to_dict(window= (rolling_window_size))  # Get all latest
+        data_dict = self._cache_to_dict(window = (rolling_window_size))  # Get all latest
         if not data_dict:
             return
+        # all assets have same number of bars is ensured by get_data()
+        total_bars = len(next(iter(data_dict.values())))
         
         # Update active mask
         self.active_mask = self._compute_active_mask(data_dict)
@@ -403,6 +405,7 @@ class TopKStrategy(Strategy):
             current_time=now,
             retrain_start_date = self._last_retrain_time,
             active_mask=self.active_mask,
+            total_bars = total_bars,
             warm_start=self.strategy_params["warm_start"],
             warm_training_epochs=self.strategy_params["warm_training_epochs"],
         )
@@ -605,9 +608,7 @@ class TopKStrategy(Strategy):
             
             # Check 2: Active at walk-forward start
             # Check if we have data extending pred_len periods beyond valid_end
-            freq_offset = freq2pdoffset(self.strategy_params["freq"])
-            required_end = self.valid_end + (freq_offset * self.pred_len)
-            pred_window = df[(df.index > self.valid_end) & (df.index <= required_end)]
+            pred_window = df[(df.index > self.valid_end)]
             
             if pred_window.empty:
                 logger.info(f"Skipping {ticker}: not active at walk-forward start")
@@ -639,11 +640,15 @@ class TopKStrategy(Strategy):
         else:
             logger.error(f"Model {self.model_name} not found in {self.model_params["model_dir"]}.")
 
-            raise Exception("Model Not Initialized")
             
-            #model = ModelClass(**self.model_params)
-            #train_data = self._get_data(start = self.train_start , end = self.train_end)
-            #model.initialize(train_data)
+            
+            model = ModelClass(**self.model_params)
+            train_data = self.loader.get_data(calendar = self.model_params["calendar"] , frequency = self.model_params["freq"], start = self.train_start , end = self.train_end)
+            # all assets have same number of bars is ensured by get_data()
+            total_bars = len(next(iter(train_data.values())))
+            model.initialize(data = train_data, total_bars = total_bars)
+
+            raise Exception("Model Not Initialized")
             
 
         return model
@@ -972,27 +977,6 @@ class TopKStrategy(Strategy):
             return True
 
         return False
-    
-    def _get_data(self, start, end) -> Dict[str, pd.DataFrame]:
-        # Create data dictionary for selected stocks
-        calendar = market_calendars.get_calendar(self.model_params["calendar"])
-        days_range = calendar.schedule(start_date=start, end_date=end)
-        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"])
-
-        # init train+valid data
-        data = {}
-        for ticker in self.loader.universe:
-            if ticker in self.loader._frames:
-                df = self.loader._frames[ticker]
-                # Get data up to validation end for initial training
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize('UTC')
-                elif df.index.tz != timestamps.tz:
-                    df.index = df.index.tz_convert(timestamps.tz)
-
-                #logger.info(f"  {ticker}: {len(data[ticker])} bars")
-                data[ticker] = df.reindex(timestamps).dropna()
-        return data
     
     def _calculate_portfolio_nav(self) -> float:
         """Calculate total portfolio value: cash + market value of all positions."""

@@ -16,6 +16,7 @@ from typing import Dict, Iterator, List, Optional
 import logging
 import numpy as np
 import pandas as pd
+import pandas_market_calendars as market_calendars
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import Equity
@@ -175,32 +176,6 @@ class CsvBarLoader:
             self._benchmark_returns.sort_index(inplace=True)
 
 
-
-
-    def _create_equity_instrument(self, symbol: str) -> Equity:
-        """Create an Equity instrument for the given symbol."""
-        instrument_id = InstrumentId(
-            symbol=Symbol(symbol),
-            venue=self.venue
-        )
-        
-        assert self.cfg["currency"] in (USD,EUR)
-
-        # TODO: double check price precision.
-        return Equity(
-            instrument_id=instrument_id,
-            raw_symbol=Symbol(symbol),
-            currency=self.cfg["currency"],
-            price_precision=2,  # Standard for US equities
-            price_increment=Price.from_str("0.01"),
-            lot_size=Quantity.from_int(1),
-            # margin_init=Money(0, USD),  # No margin requirement for cash account
-            # margin_maint=Money(0, USD),
-            # maker_fee=Money(0, USD),    # Fees handled by commission model
-            # taker_fee=Money(0, USD),
-            ts_event=0,
-            ts_init=0,
-        )
     # ------------------------------------------------------------------ #
     # public ----------------------------------------------------------------
     # ------------------------------------------------------------------ #
@@ -313,9 +288,43 @@ class CsvBarLoader:
                     ts_event=ts_ns,
                     ts_init=ts_ns,
                 )
-        
+
+
+    def get_data(self, calendar, frequency, start, end) -> Dict[str, pd.DataFrame]:
+
+        # Create data dictionary for selected stocks
+        cal = market_calendars.get_calendar(calendar)
+        days_range = cal.schedule(start_date=start, end_date=end)
+        timestamps = market_calendars.date_range(days_range, frequency=frequency)
+
+        total_bars = 0
+
+        # init train+valid data
+        data = {}
+        for ticker in self._universe:
+            if ticker in self._frames:
+                df = self._frames[ticker]
+                # Ensure timezone compatibility
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize('UTC')
+                elif df.index.tz != timestamps.tz:
+                    df.index = df.index.tz_convert(timestamps.tz)
+                # re-indexing breaks different time-zones
+                #data[ticker] = df.reindex(timestamps).dropna()
+                df = df[(df.index >= start) & (df.index <= end)]
+                # assume all instruments have same bars as first instrumemnt loaded.
+                if total_bars == 0:
+                    total_bars = len(df.index)
+                # if asset does not have same number of bars for the same period, then skip it
+                elif len(df.index) < total_bars:
+                    continue
+
+                data[ticker] = df
+
+        return data
+
     # ------------------------------------------------------------------ #
-    # parsing helpers
+    #  helpers
     # ------------------------------------------------------------------ #
     def _parse_stock_csv(self, path: Path, adjust: bool, has_tz = True) -> pd.DataFrame:
         df = pd.read_csv(path) 
@@ -390,3 +399,27 @@ class CsvBarLoader:
         rf["DGS10"] = pd.to_numeric(rf["DGS10"], errors="coerce") / 100.0
         return rf["DGS10"].asfreq("B").ffill()
     
+    def _create_equity_instrument(self, symbol: str) -> Equity:
+        """Create an Equity instrument for the given symbol."""
+        instrument_id = InstrumentId(
+            symbol=Symbol(symbol),
+            venue=self.venue
+        )
+        
+        assert self.cfg["currency"] in (USD,EUR)
+
+        # TODO: double check price precision.
+        return Equity(
+            instrument_id=instrument_id,
+            raw_symbol=Symbol(symbol),
+            currency=self.cfg["currency"],
+            price_precision=2,  # Standard for US equities
+            price_increment=Price.from_str("0.01"),
+            lot_size=Quantity.from_int(1),
+            # margin_init=Money(0, USD),  # No margin requirement for cash account
+            # margin_maint=Money(0, USD),
+            # maker_fee=Money(0, USD),    # Fees handled by commission model
+            # taker_fee=Money(0, USD),
+            ts_event=0,
+            ts_init=0,
+        )

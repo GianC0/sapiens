@@ -240,7 +240,7 @@ class OptunaHparamsTuner:
                 
                 start = model_params_flat["train_start"]
                 end = model_params_flat["valid_end"]
-                data_dict = self._get_data(start=start, end=end)
+                data_dict = self.loader.get_data(calendar = self.model_params["calendar"] , frequency = self.model_params["freq"],start=start, end=end)
 
                 # Start MLflow run for this trial
                 with mlflow.start_run(
@@ -262,8 +262,12 @@ class OptunaHparamsTuner:
                     # Initialize and train model TODO: ensure train data has validation set as well
                     # leave this order to make train_offset be overwritten by flat params type
                     model = ModelClass(**(trial_hparams | model_params_flat) )
+                    
+                    # all assets have same number of bars is ensured by get_data()
+                    total_bars = len(next(iter(data_dict.values())))
+
                     # Validation is run automatically if valid_end is set
-                    score = model.initialize(data_dict)
+                    score = model.initialize(data = data_dict, total_bars = total_bars)
                     
                     # Log results
                     epochs_metrics = model._epoch_logs
@@ -652,7 +656,7 @@ class OptunaHparamsTuner:
         backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC").normalize()
         backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC").normalize()
         train_offset = freq2pdoffset(offset)
-        valid_split =  self.strategy_params["valid_split"]
+        valid_split =  self.model_params["valid_split"]
 
         
         calendar = market_calendars.get_calendar(self.model_params["calendar"])
@@ -702,27 +706,6 @@ class OptunaHparamsTuner:
 
         return cfg
     
-    def _get_data(self, start, end) -> Dict[str, pd.DataFrame]:
-
-        # Create data dictionary for selected stocks
-        calendar = market_calendars.get_calendar(self.model_params["calendar"])
-        days_range = calendar.schedule(start_date=start, end_date=end)
-        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"])
-
-        # init train+valid data
-        data = {}
-        for ticker in self.loader.universe:
-            if ticker in self.loader._frames:
-                df = self.loader._frames[ticker]
-                # Ensure timezone compatibility
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize('UTC')
-                elif df.index.tz != timestamps.tz:
-                    df.index = df.index.tz_convert(timestamps.tz)
-                # re-indexing breaks different time-zones
-                #data[ticker] = df.reindex(timestamps).dropna()
-                data[ticker] = df
-        return data
     
     def _produce_backtest_config(self, backtest_cfg, start, end) -> BacktestRunConfig:
 

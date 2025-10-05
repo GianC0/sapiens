@@ -36,7 +36,7 @@ def main():
     logs_dir = Path(cfg["STRATEGY"]["PARAMS"]["logs_dir"]).parent  # log_dir is parent directory of strategy
     #timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     timestamp = "20250922_066666"
-    run_dir = logs_dir / "backtests" / timestamp
+    #run_dir = logs_dir / "backtests" / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Logging
@@ -45,7 +45,7 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(f'{run_dir}/backtest.log', encoding='utf-8'),
-            logging.StreamHandler()  # This adds console output
+            #logging.StreamHandler()  # This adds console output
         ]
     )
     logger = logging.getLogger(__name__)
