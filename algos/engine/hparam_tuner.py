@@ -293,9 +293,9 @@ class OptunaHparamsTuner:
 
             # Handle case without optimization
             n_trials = self.model_params.get("n_trials",1)
-            if self.model_params["tune_hparams"] is False or n_trials < 1:
-                n_trials = 1
-            study.optimize(model_objective, n_trials=n_trials)
+            if self.model_params["tune_hparams"] is True and n_trials >= 1:
+                study.optimize(model_objective, n_trials=n_trials)
+            
             
             # Get best trial
             best_trial = study.best_trial

@@ -36,7 +36,7 @@ def main():
     logs_dir = Path(cfg["STRATEGY"]["PARAMS"]["logs_dir"]).parent  # log_dir is parent directory of strategy
     #timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     timestamp = "20250922_066666"
-    #run_dir = logs_dir / "backtests" / timestamp
+    run_dir = logs_dir / "backtests" / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Logging

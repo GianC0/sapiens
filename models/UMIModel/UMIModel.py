@@ -255,11 +255,11 @@ class UMIModel(nn.Module):
         if torch.numel(active_mask) != self.I:
             logger.error(f"Active mask size {torch.numel(active_mask)} != {self.I}")
             return {}
-        if indexes != self.L + 1:
-            logger.warning(f"Expected {self.L + 1} indexes, got {indexes}")
+        if indexes != self.L:
+            logger.warning(f"Expected {self.L} indexes, got {indexes}")
             # Don't return empty - try to proceed if we have enough data
-            if indexes < self.L + 1:
-                logger.error(f"Insufficient data: need {self.L + 1}, got {indexes}")
+            if indexes < self.L:
+                logger.error(f"Insufficient data: need {self.L}, got {indexes}")
                 return {}
         
         # Assert universe matches
@@ -269,7 +269,7 @@ class UMIModel(nn.Module):
 
 
         # Build panel from current data
-        #lookback_periods = self.L + 1  # Need L+1 bars for prediction
+        #lookback_periods = self.L   # Need L bars for prediction
         # Calculate the start date for the historical window
         #start_date = current_time - freq2pdoffset(self.freq) * (lookback_periods - 1) 
         #days_range = self.market_calendar.schedule(start_date=start_date, end_date=current_time)
@@ -427,24 +427,25 @@ class UMIModel(nn.Module):
 
         assert len(data) > 0
         # Calculate split point by bar count
-        has_validation = self.valid_end < end
+        has_validation = self.train_end < end
         valid_loader = None
         if has_validation:
             train_bars = int(total_bars * (1 - self.valid_split)) 
             train_tensor, train_mask = full_tensor[:train_bars], data_mask
             valid_tensor, valid_mask = full_tensor[train_bars:], data_mask
             assert torch.equal(valid_mask, active_mask), "Active mask mismatch"
-            # Build training dataset
+            # Build validation dataset
             valid_dataset = SlidingWindowDataset(valid_tensor, self.L, self.pred_len, target_idx=self.target_idx)
             valid_loader = DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=False)
         else:
             train_tensor, train_mask = full_tensor, data_mask
             valid_tensor = torch.tensor(0)
             assert torch.equal(train_mask, active_mask), "Active mask mismatch" 
-            # Build training dataset
-            train_dataset = SlidingWindowDataset(train_tensor, self.L, self.pred_len, target_idx=self.target_idx)
-            train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
         
+        # Build training dataset
+        train_dataset = SlidingWindowDataset(train_tensor, self.L, self.pred_len, target_idx=self.target_idx)
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+
         # ═══════════════════════════════════════════════════════════════════════════════
         # 2. OPTIMIZERS SETUP
         # ═══════════════════════════════════════════════════════════════════════════════

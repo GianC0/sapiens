@@ -341,6 +341,7 @@ class TopKStrategy(Strategy):
         preds = self.model.predict(data=data_dict, indexes = self.min_bars_required, active_mask=self.active_mask) #  preds: Dict[str, float]
 
         assert preds is not None, "Model predictions are empty"
+        assert len(preds) > 0
 
         # Compute new portfolio target weights for predicted instruments.
         weights = self._compute_target_weights(preds)
