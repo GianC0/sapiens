@@ -17,11 +17,149 @@ import torch
 from sklearn.decomposition import PCA
 from arch import arch_model
 import logging
+import talib
 
 logger = logging.getLogger(__name__)
 
+class DataAugmentor:
+    def __init__( self,
+        augmentation_config: Dict[str, Any],
+        market_data_type: str,  #OHLCV, orderbook, possibly more
+        augment_modality: str = "train", #train or stream
+    ):
+        self.config = augmentation_config
+        self.market_data_type = market_data_type
+        self.modality = augment_modality  # "train" or "stream"
+        #self.rng = np.random.default_rng(seed)
 
-class MarketDataAugmenter:
+        # Choose implementation based on market data type
+        if self.market_data_type == "OHCLV":
+            self.impl = _OHCLVAugmentor(self.config, self.modality)
+        elif self.market_data_type == "orderbook":
+            self.impl = _OrderbookAugmentor(self.config)
+        else:
+            raise ValueError(f"Unknown data type to augment: {market_data_type}")
+
+    def augment(self, data : Dict[str, pd.DataFrame]):
+
+        out = self.impl._augment(data)
+        return out
+
+class _OHCLVAugmentor:
+    def __init__(self,        
+        OHLCV_augmentation_config: Dict[str, Any],
+        augment_modality: str = "train", #train or stream
+        ):
+
+        self.config = OHLCV_augmentation_config
+        self.modality = augment_modality
+        
+        self.source = talib if self.modality == "train" else talib.stream
+        self.technical_indicators = []
+
+    def _check_OHLCV(self, df):
+        required_cols = {"Open", "High", "Low", "Close", "Volume"}
+        if not required_cols.issubset(df.columns):
+            raise ValueError(f"DataFrame must contain OHLCV columns: {required_cols}")
+
+    def _augment(self, data):
+
+        out = {}
+        
+        for symbol, df in data.items():
+                
+            self._check_OHLCV(df)
+
+            df = df.copy()  
+
+            if self.modality == "stream":
+                historical = retrieveFromCatalog(symbol).tail(100)
+                df = pd.concat([historical, df]).reset_index(drop=True)
+
+            # Add technical indicators
+            if self.config.get("technical_indicators", {}).get("enabled", True):
+                df = self._add_technical_indicators(df)
+        
+            #Add other engineered features
+
+        
+        #Perform PCA
+
+        
+        
+        return df
+
+    def _add_technical_indicators(self, df, timeperiod = 14):
+        self._check_OHLCV(df)
+
+        out = df.copy()
+
+        open, high, low, close, volume = out["Open"], out["High"], out["Low"], out["Close"], out["Volume"]
+
+        # Calls to indicators, from https://ta-lib.github.io/ta-lib-python/funcs.html
+        dict_indicators = {}
+        source = self.source
+
+        #Overlap Studies
+        dict_indicators['BBANDS_upper'], dict_indicators['BBANDS_middle'], dict_indicators['BBANDS_lower'] = source.BBANDS(close, timeperiod)
+        dict_indicators['DEMA'] = source.DEMA(close, timeperiod)
+        dict_indicators['EMA'] = source.EMA(close, timeperiod)
+        dict_indicators['HT_TRENDLINE'] = source.HT_TRENDLINE(close)
+        dict_indicators['KAMA'] = source.KAMA(close, timeperiod)
+        dict_indicators['MA'] = source.MA(close, timeperiod)
+        dict_indicators['MAMA'], dict_indicators['FAMA'] = source.MAMA(close)
+        dict_indicators['MIDPOINT'] = source.MIDPOINT(close, timeperiod)
+        dict_indicators['MIDPRICE'] = source.MIDPRICE(high, low, timeperiod)
+        dict_indicators['SAR'] = source.SAR(high, low)
+        dict_indicators['SAREXT'] = source.SAREXT(high, low)
+        dict_indicators['SMA'] = source.SMA(close, timeperiod)
+        dict_indicators['T3'] = source.T3(close, timeperiod)
+        dict_indicators['TEMA'] = source.TEMA(close, timeperiod)
+        dict_indicators['TRIMA'] = source.TRIMA(close, timeperiod)
+        dict_indicators['WMA'] = source.WMA(close, timeperiod)      
+
+        #Momentum Indicators
+        dict_indicators['AD'] = source.ADX(high, low, close, volume)
+
+
+        #Volume Indicators
+        dict_indicators['AD'] = source.AD(high, low, close, volume)
+        dict_indicators['ADOSC'] = source.ADOSC(high, low, close, volume)
+        dict_indicators['OBV'] = source.OBV(close, volume)
+        
+
+
+
+        dict_indicators['SMA_14'] = source.SMA(out, timeperiod)
+        dict_indicators['RSI_14'] = source.RSI(out, timeperiod)
+        #add more indicators
+
+        for indicator_name, feature in dict_indicators.items():
+            self.technical_indicators.append(indicator_name)
+
+            if self.modality == "train":
+                df[indicator_name] = feature
+            elif self.modality == "stream":
+                out.iloc[-1, out.columns.get_loc(indicator_name)] = feature
+
+        
+
+class _OrderbookAugmentor:
+    def __init__(self, rng):
+        self.rng = rng
+
+    def _augment(self, book):
+        book = book.copy()
+        return book
+      
+
+
+
+
+
+
+
+class MarketDataAugmenter2:
     """
     Augments market data with various techniques for improved model training.
     """
@@ -122,12 +260,13 @@ class MarketDataAugmenter:
     
     def _add_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add engineered features based on market data type."""
+        """
         for name, extractor in self.feature_extractors.items():
             try:
                 df[name] = extractor(df)
             except Exception as e:
                 logger.warning(f"Failed to extract feature {name}: {e}")
-                
+        """       
         # Add technical indicators
         df = self._add_technical_indicators(df)
         
@@ -385,4 +524,9 @@ class MarketDataAugmenter:
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
         rs = gain / loss
-        return 100 - (100 / (1 + rs))
+        # Calcolo RSI
+        rsi = 100 - (100 / (1 + rs))
+        
+        # Sostituisci NaN da 0/0 (serie piatta) con 0
+        rsi[(gain == 0) & (loss == 0)] = 0
+        return rsi
