@@ -191,6 +191,12 @@ STRATEGY:
       adv_lookback: 30     # Look-back window to compute Average Daily Volume (ADV)
       max_adv_pct:  0.05   # Max trade size = 5% of average daily traded volume for that instrument to use for weights 
 
+    # Risk Management
+    risk:
+      max_weight_abs:            1.0                # Max 3 % NAV per single position        (concentration limit)
+      drawdown_max:              0.15               # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
+      trailing_stop_max:         0.05               # % trailing stop from HWM/LWM 5% for single instrument
+      target_volatility:  0.05               # 15% tarket volatility for efficient risk optimizer             
         
       #max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
 
@@ -235,13 +241,6 @@ STRATEGY:
         optuna_type: categorical
         choices: ["30B", "60B"]
     
-    # Risk management overlays
-    risk_trailing_stop_pct:           # % trailing stop from HWM/LWM 5%
-      default: 0.05
-      optuna:
-        optuna_type: low-high
-        low: 0.02
-        high: 0.10
     
     #risk_target_volatility_annual:           # Volatility target (Hull, risk parity) 15 % only for "efficient_risk" optimizer 
     #  default: 0.15
@@ -250,19 +249,7 @@ STRATEGY:
     #    low: 0.05
     #    high: 0.20
     
-    risk_drawdown_pct:                # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
-      default: 0.15
-      optuna:
-        optuna_type: low-high
-        low: 0.10
-        high: 0.25
-    
-    risk_max_weight_abs:              # Max 3 % NAV per single position        (concentration limit)
-      default: 0.03
-      optuna:
-        optuna_type: low-high
-        low: 0.001
-        high: 0.99
+
     
     #risk_max_weight_rel:              # Max 20 % of gross exposure in one name
     #  default: 0.20

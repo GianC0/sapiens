@@ -19,7 +19,7 @@ def create_optimizer(name: str, **kwargs):
     
     if name not in optimizers:
         logger.warning(f"Unknown optimizer {name}, using equal_weight")
-        return EqualWeightOptimizer()
+        raise NotImplementedError(f"Unknown optimizer {name}")
     
     return optimizers[name](**kwargs)
 
@@ -150,7 +150,40 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
             
             # Clean and return weights
             cleaned_weights = ef.clean_weights()
-            self._last_valid_weights = self._to_array(cleaned_weights)
+            sharpe_array = self._to_array(cleaned_weights)
+
+            # If selector_k is requested, run a second pass that forces non-top-k weights to zero.
+            selector_k = kwargs.get("selector_k", None)
+            if selector_k is not None and selector_k < len(mu):
+                k = int(max(0, selector_k))
+                # pick top-k indices by absolute weight from the first pass
+                idx_sorted = np.argsort(-np.abs(sharpe_array))
+                top_idx = set(idx_sorted[:k])
+
+                # build a fresh EfficientFrontier to enforce zeros
+                ef2 = EfficientFrontier(
+                    expected_returns=pd.Series(mu),
+                    cov_matrix=pd.DataFrame(cov),
+                    weight_bounds=self.weight_bounds,
+                    solver=self.solver
+                )
+
+                # re-add ADV/liquidity constraints
+                self._add_adv_constraints(ef2, allowed_weight_ranges)
+
+                # Force w[i] == 0 for assets not in top-k
+                # Use equality by adding both <=0 and >=0 (robust)
+                for i in range(len(mu)):
+                    if i not in top_idx:
+                        ef2.add_constraint(lambda w, idx=i: w[idx] <= 0)
+                        ef2.add_constraint(lambda w, idx=i: w[idx] >= 0)
+
+                # Solve constrained max-sharpe on the top-k subset
+                ef2.max_sharpe(risk_free_rate=rf)
+                sharpe_weights2 = ef2.clean_weights()
+                sharpe_array = self._to_array(sharpe_weights2)
+                
+            self._last_valid_weights = sharpe_array
             return self._last_valid_weights
             
         except (OptimizationError, Exception) as e:
@@ -193,7 +226,40 @@ class MinVarianceOptimizer(PortfolioOptimizer):
             
             # Clean and return weights
             cleaned_weights = ef.clean_weights()
-            self._last_valid_weights = self._to_array(cleaned_weights)
+            sharpe_array = self._to_array(cleaned_weights)
+
+            # If selector_k is requested, run a second pass that forces non-top-k weights to zero.
+            selector_k = kwargs.get("selector_k", None)
+            if selector_k is not None and selector_k < len(mu):
+                k = int(max(0, selector_k))
+                # pick top-k indices by absolute weight from the first pass
+                idx_sorted = np.argsort(-np.abs(sharpe_array))
+                top_idx = set(idx_sorted[:k])
+
+                # build a fresh EfficientFrontier to enforce zeros
+                ef2 = EfficientFrontier(
+                    expected_returns=pd.Series(mu),
+                    cov_matrix=pd.DataFrame(cov),
+                    weight_bounds=self.weight_bounds,
+                    solver=self.solver
+                )
+
+                # re-add ADV/liquidity constraints
+                self._add_adv_constraints(ef2, allowed_weight_ranges)
+
+                # Force w[i] == 0 for assets not in top-k
+                # Use equality by adding both <=0 and >=0 (robust)
+                for i in range(len(mu)):
+                    if i not in top_idx:
+                        ef2.add_constraint(lambda w, idx=i: w[idx] <= 0)
+                        ef2.add_constraint(lambda w, idx=i: w[idx] >= 0)
+
+                # Solve constrained max-sharpe on the top-k subset
+                ef2.max_sharpe(risk_free_rate=rf)
+                sharpe_weights2 = ef2.clean_weights()
+                sharpe_array = self._to_array(sharpe_weights2)
+                
+            self._last_valid_weights = sharpe_array
             return self._last_valid_weights
             
         except (OptimizationError, Exception) as e:
@@ -253,6 +319,37 @@ class M2Optimizer(PortfolioOptimizer):
             sharpe_weights = ef.clean_weights()
             sharpe_array = self._to_array(sharpe_weights)
             
+            # If selector_k is requested, run a second pass that forces non-top-k weights to zero.
+            selector_k = kwargs.get("selector_k", None)
+            if selector_k is not None and selector_k < len(mu):
+                k = int(max(0, selector_k))
+                # pick top-k indices by absolute weight from the first pass
+                idx_sorted = np.argsort(-np.abs(sharpe_array))
+                top_idx = set(idx_sorted[:k])
+
+                # build a fresh EfficientFrontier to enforce zeros
+                ef2 = EfficientFrontier(
+                    expected_returns=pd.Series(mu),
+                    cov_matrix=pd.DataFrame(cov),
+                    weight_bounds=self.weight_bounds,
+                    solver=self.solver
+                )
+
+                # re-add ADV/liquidity constraints
+                self._add_adv_constraints(ef2, allowed_weight_ranges)
+
+                # Force w[i] == 0 for assets not in top-k
+                # Use equality by adding both <=0 and >=0 (robust)
+                for i in range(len(mu)):
+                    if i not in top_idx:
+                        ef2.add_constraint(lambda w, idx=i: w[idx] <= 0)
+                        ef2.add_constraint(lambda w, idx=i: w[idx] >= 0)
+
+                # Solve constrained max-sharpe on the top-k subset
+                ef2.max_sharpe(risk_free_rate=rf)
+                sharpe_weights2 = ef2.clean_weights()
+                sharpe_array = self._to_array(sharpe_weights2)
+
             # Calculate portfolio volatility
             port_vol = np.sqrt(np.dot(sharpe_array, np.dot(cov, sharpe_array)))
             
@@ -334,7 +431,40 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
             
             # Clean and return weights
             cleaned_weights = ef.clean_weights()
-            self._last_valid_weights = self._to_array(cleaned_weights)
+            sharpe_array = self._to_array(cleaned_weights)
+
+            # If selector_k is requested, run a second pass that forces non-top-k weights to zero.
+            selector_k = kwargs.get("selector_k", None)
+            if selector_k is not None and selector_k < len(mu):
+                k = int(max(0, selector_k))
+                # pick top-k indices by absolute weight from the first pass
+                idx_sorted = np.argsort(-np.abs(sharpe_array))
+                top_idx = set(idx_sorted[:k])
+
+                # build a fresh EfficientFrontier to enforce zeros
+                ef2 = EfficientFrontier(
+                    expected_returns=pd.Series(mu),
+                    cov_matrix=pd.DataFrame(cov),
+                    weight_bounds=self.weight_bounds,
+                    solver=self.solver
+                )
+
+                # re-add ADV/liquidity constraints
+                self._add_adv_constraints(ef2, allowed_weight_ranges)
+
+                # Force w[i] == 0 for assets not in top-k
+                # Use equality by adding both <=0 and >=0 (robust)
+                for i in range(len(mu)):
+                    if i not in top_idx:
+                        ef2.add_constraint(lambda w, idx=i: w[idx] <= 0)
+                        ef2.add_constraint(lambda w, idx=i: w[idx] >= 0)
+
+                # Solve constrained max-sharpe on the top-k subset
+                ef2.max_quadratic_utility(risk_aversion=self.risk_aversion)
+                sharpe_weights2 = ef2.clean_weights()
+                sharpe_array = self._to_array(sharpe_weights2)
+                
+            self._last_valid_weights = sharpe_array
             return self._last_valid_weights
             
             
@@ -366,7 +496,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
         """
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
     
-    def optimize(self, mu: np.ndarray, cov: np.ndarray, allowed_weight_ranges: np.ndarray, target_volatility: float, current_weights: np.ndarray, **kwargs) -> np.ndarray:
+    def optimize(self, mu: np.ndarray, cov: np.ndarray, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, target_volatility: float,  **kwargs) -> np.ndarray:
         """
         Find weights that maximize return for given risk level.
         """
@@ -386,7 +516,40 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
             
             # Clean and return weights
             cleaned_weights = ef.clean_weights()
-            self._last_valid_weights = self._to_array(cleaned_weights)
+            sharpe_array = self._to_array(cleaned_weights)
+
+            # If selector_k is requested, run a second pass that forces non-top-k weights to zero.
+            selector_k = kwargs.get("selector_k", None)
+            if selector_k is not None and selector_k < len(mu):
+                k = int(max(0, selector_k))
+                # pick top-k indices by absolute weight from the first pass
+                idx_sorted = np.argsort(-np.abs(sharpe_array))
+                top_idx = set(idx_sorted[:k])
+
+                # build a fresh EfficientFrontier to enforce zeros
+                ef2 = EfficientFrontier(
+                    expected_returns=pd.Series(mu),
+                    cov_matrix=pd.DataFrame(cov),
+                    weight_bounds=self.weight_bounds,
+                    solver=self.solver
+                )
+
+                # re-add ADV/liquidity constraints
+                self._add_adv_constraints(ef2, allowed_weight_ranges)
+
+                # Force w[i] == 0 for assets not in top-k
+                # Use equality by adding both <=0 and >=0 (robust)
+                for i in range(len(mu)):
+                    if i not in top_idx:
+                        ef2.add_constraint(lambda w, idx=i: w[idx] <= 0)
+                        ef2.add_constraint(lambda w, idx=i: w[idx] >= 0)
+
+                # Solve constrained max-sharpe on the top-k subset
+                ef2.efficient_risk(target_volatility=target_volatility)
+                sharpe_weights2 = ef2.clean_weights()
+                sharpe_array = self._to_array(sharpe_weights2)
+                
+            self._last_valid_weights = sharpe_array
             return self._last_valid_weights
             
         except (OptimizationError, Exception) as e:

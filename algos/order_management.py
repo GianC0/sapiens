@@ -231,7 +231,7 @@ class OrderManager:
         
         for symbol, instrument_id, order_qty, current_price in sells:
             logger.info(f"SELL {symbol}: qty={abs(order_qty):.2f}")
-            self._execute_order_with_validation(
+            self._execute_order(
                 instrument_id, 
                 int(order_qty), 
                 current_price,
@@ -246,7 +246,7 @@ class OrderManager:
             # Check if we have enough cash for this buy + commission
             required_cash = abs(order_qty) * current_price * (1 + self.commission_rate)
             
-            if required_cash > available_cash
+            if required_cash > available_cash:
                 # Reduce order size to fit available cash
                 max_qty = (available_cash) / (current_price * (1 + self.commission_rate))
                 if max_qty > 0.5:  # Only execute if meaningful size

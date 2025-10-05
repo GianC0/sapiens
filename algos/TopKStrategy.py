@@ -168,19 +168,22 @@ class TopKStrategy(Strategy):
         self.realised_returns = []
         self.trailing_stops = {}
 
-        # Extract risk parameters from config
-        self.selector_k = self.strategy_params.get("top_k", 30)
-        self.max_w_abs = self.strategy_params.get("risk_max_weight_abs", 0.03)
-        self.target_volatility = self.strategy_params.get("risk_target_volatility_annual", 0.05)
-        self.trailing_stop_pct = self.strategy_params.get("risk_trailing_stop_pct", 0.05)
-        self.drawdown_pct = self.strategy_params.get("risk_drawdown_pct", 0.15)
-        self.adv_lookback = self.strategy_params.get("liquidity", {}).get("adv_lookback", 30)
-        self.max_adv_pct = self.strategy_params.get("liquidity", {}).get("max_adv_pct", 0.05)
-        self.exec_algo = self.strategy_params.get("execution", {}).get("exec_algo", "twap")
-        self.twap_slices = self.strategy_params.get("execution", {}).get("twap", {}).get("slices", 4)
-        self.twap_interval_secs = self.strategy_params.get("execution", {}).get("twap", {}).get("interval_secs", 2.5)
+        # Extract risk params
+        self.max_w_abs = self.strategy_params["risk"]["max_weight_abs"]
+        self.drawdown_max = self.strategy_params["risk"]["drawdown_max"]
+        self.trailing_stop_max = self.strategy_params["risk"]["trailing_stop_max"]
+        self.target_volatility = self.strategy_params["risk"]["target_volatility"]
+        
+        # Extract execution parameters from config
+        self.selector_k = self.strategy_params["top_k"]
+
+        self.adv_lookback = self.strategy_params["liquidity"]["adv_lookback"]
+        self.max_adv_pct = self.strategy_params["liquidity"]["max_adv_pct"]
+        self.twap_slices = self.strategy_params["execution"]["twap"]["slices"]
+        self.twap_interval_secs = self.strategy_params["execution"]["twap"]["interval_secs"]
+
         self.commission_rate = self.strategy_params['costs']['fee_bps'] / 100
-        self.can_short = self.strategy_params.get("oms_type", "NETTING") == "HEDGING"
+        self.can_short = self.strategy_params["oms_type"] == "HEDGING"
 
         # Portfolio optimizer
         # TODO: add risk_aversion config parameter for MaxQuadraticUtilityOptimizer
@@ -369,7 +372,20 @@ class TopKStrategy(Strategy):
         # comput how much data to load
         days_range = self.calendar.schedule(start_date= self._last_retrain_time, end_date=now)
         timestamps = market_calendars.date_range(days_range, frequency=self.strategy_params["freq"]).normalize()
-        rolling_window_size = len(timestamps)
+        
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # ADAPTIVE WINDOW: Ensure minimum training size
+        # ═══════════════════════════════════════════════════════════════════
+        # ensures case at t=0 where len(timestamps) for new bars < min_bars_required 
+        rolling_window_size = max(len(timestamps), self.min_bars_required)
+        
+        # Log when falling back to minimum (includes overlap with previous training)
+        if rolling_window_size > self.min_bars_required:
+            logger.info(f"[on_retrain] Rolling window ({rolling_window_size} bars) < minimum required ({self.min_bars_required} bars). Overlap: {rolling_window_size - self.min_bars_required} bars from previous training.")
+        else:
+            logger.info(
+                f"[on_retrain] Using rolling window of {rolling_window_size} bars (sufficient for training).")
         
         # Get updated data window
         data_dict = self._cache_to_dict(window= (rolling_window_size))  # Get all latest
@@ -385,8 +401,8 @@ class TopKStrategy(Strategy):
             current_time=now,
             retrain_start_date = self._last_retrain_time,
             active_mask=self.active_mask,
-            warm_start=self.strategy_params.get("warm_start", False),
-            warm_training_epochs=self.strategy_params.get("warm_training_epochs", 1),
+            warm_start=self.strategy_params["warm_start"],
+            warm_training_epochs=self.strategy_params["warm_training_epochs"],
         )
         
         self._last_retrain_time = now
@@ -805,7 +821,7 @@ class TopKStrategy(Strategy):
             total_current_exposure += abs(current_w) 
 
             # returns per single period (same freq as preds' base period)
-            lookback_n = max(2, int(self.optimizer_lookback.n))
+            lookback_n = max(2, int(self.optimizer_lookback.n) )
             closes = [float(b.close) for b in bars[-lookback_n:]]
             returns = pd.Series(closes).pct_change().dropna()
             if len(returns) == 0:
@@ -819,8 +835,8 @@ class TopKStrategy(Strategy):
             # Risk-free rate is the only one who can take up to 100% of portfolio
             if symbol == risk_free_ticker:
                 # Risk-free allocation should account for commissions
-                max = 1 -  ( 2 * self.commission_rate )   # Reserve for round-trip
-                allowed_weight_ranges.append([0, max])
+                max_weight = 1 -  ( 2 * self.commission_rate )   # Reserve for round-trip
+                allowed_weight_ranges.append([0, max_weight])
                 continue
 
             # ADV constraints
@@ -870,6 +886,8 @@ class TopKStrategy(Strategy):
             benchmark_vol=self._get_benchmark_volatility(now),
             allowed_weight_ranges=np.array(allowed_weight_ranges),
             current_weights = np.array(current_weights),
+            selector_k = self.selector_k,
+            target_volatility = self.target_volatility,
         )
 
         if len(w_opt) != len(valid_symbols):
@@ -877,15 +895,10 @@ class TopKStrategy(Strategy):
             w_opt = np.ones(len(valid_symbols)) / len(valid_symbols)
 
         # Take top-K by absolute weight
-        # TODO: revisit
-        k = min(self.selector_k, len(valid_symbols))
-        idx_sorted = np.argsort(-np.abs(w_opt))
-        top_idx = idx_sorted[:k]
 
         final_arr = np.zeros_like(w_opt)
 
-        for i in top_idx:
-            val = w_opt[i]
+        for i, val in enumerate(w_opt):
             # clip to allowed range
             w_min, w_max = allowed_weight_ranges[i]
             final_arr[i] = float(np.clip(val, w_min, w_max))
@@ -922,14 +935,14 @@ class TopKStrategy(Strategy):
             high = self.trailing_stops.get(sym, price)
             if price > high:
                 self.trailing_stops[sym] = price
-            elif price <= high * (1 - self.trailing_stop_pct):
+            elif price <= high * (1 - self.trailing_stop_max):
                 self.order_manager.close_all_positions(instrument, reason="trailing_stop")
                 self.trailing_stops.pop(sym, None)
         else:                             # short
             low = self.trailing_stops.get(sym, price)
             if price < low:
                 self.trailing_stops[sym] = price
-            elif price >= low * (1 + self.trailing_stop_pct):
+            elif price >= low * (1 + self.trailing_stop_max):
                 self.order_manager.close_all_positions(instrument, reason="trailing_stop")
                 self.trailing_stops.pop(sym, None)
 
@@ -946,7 +959,7 @@ class TopKStrategy(Strategy):
         self.max_registered_portfolio_nav = max(self.max_registered_portfolio_nav, nav)
         #self.equity_analyzer.on_equity(ts, nav)
         
-        threshold = self.max_registered_portfolio_nav * (1 - self.drawdown_pct)
+        threshold = self.max_registered_portfolio_nav * (1 - self.drawdown_max)
         if nav < threshold:
             logger.warning(f"Drawdown stop triggered: NAV={nav:.2f} < Threshold={threshold:.2f} (Max={self.max_registered_portfolio_nav:.2f})")
             self.order_manager.liquidate_all(self.universe) 
