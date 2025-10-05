@@ -373,7 +373,7 @@ class TopKStrategy(Strategy):
 
         # comput how much data to load
         days_range = self.calendar.schedule(start_date= self._last_retrain_time, end_date=now)
-        timestamps = market_calendars.date_range(days_range, frequency=self.strategy_params["freq"]).normalize()
+        timestamps = market_calendars.date_range(days_range, frequency=self.strategy_params["freq"])
         
         
         # ═══════════════════════════════════════════════════════════════════
@@ -745,8 +745,8 @@ class TopKStrategy(Strategy):
         df = self.risk_free_df
         
         # Try exact date first
-        if timestamp.normalize() in df.index:
-            rf_now = df.loc[timestamp.normalize(), 'risk_free']
+        if timestamp in df.index:
+            rf_now = df.loc[timestamp, 'risk_free']
             if not pd.isna(rf_now):
                 return float(rf_now)
         

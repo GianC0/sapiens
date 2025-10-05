@@ -646,15 +646,11 @@ class OptunaHparamsTuner:
         return metrics
     
     def _add_dates(self, cfg, offset, to_strategy = False) -> Dict:
-        # TODO: to verify this is also working for strategy
-        # take some params from strategy
-
-        
         
         # trial HPARAMS -> model PARAMS 
         # Calculate proper date ranges
-        backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC")
-        backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC")
+        backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC").normalize()
+        backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC").normalize()
         train_offset = freq2pdoffset(offset)
         valid_split =  self.strategy_params["valid_split"]
 
@@ -723,7 +719,9 @@ class OptunaHparamsTuner:
                     df.index = df.index.tz_localize('UTC')
                 elif df.index.tz != timestamps.tz:
                     df.index = df.index.tz_convert(timestamps.tz)
-                data[ticker] = df.reindex(timestamps).dropna()
+                # re-indexing breaks different time-zones
+                #data[ticker] = df.reindex(timestamps).dropna()
+                data[ticker] = df
         return data
     
     def _produce_backtest_config(self, backtest_cfg, start, end) -> BacktestRunConfig:

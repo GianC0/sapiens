@@ -127,8 +127,8 @@ STRATEGY:
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
     freq: 1D                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
     #train_offset:               # Optimized during model hp tuning
-    backtest_start: 2024-01-01   # Start of walk-forward evaluation.
-    backtest_end: 2024-12-31     # End of walk-forward evaluation.
+    backtest_start: "2024-01-01" # Start of walk-forward evaluation.
+    backtest_end:   "2025-01-01" # End of walk-forward evaluation.
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     currency: USD

@@ -112,7 +112,7 @@ class CsvBarLoader:
         for path in self._stock_files:
             symbol = path.stem.upper()
             if symbol in self._universe: 
-                df = self._parse_stock_csv(path, adjust = adjust)
+                df = self._parse_stock_csv(path, adjust = adjust,  has_tz=True)
                 if columns_to_load == "candles":
                     available_cols = [col for col in ["Open","High","Low","Close","Volume"] if col in df.columns]
                     self._frames[symbol] = df[available_cols]
@@ -122,7 +122,7 @@ class CsvBarLoader:
                 self._instruments[symbol] = self._create_equity_instrument(symbol)
         
         # Include SGOV or risk_free ETF as tradable instrument
-        df_rf = self._parse_stock_csv(risk_free_path, adjust=adjust)
+        df_rf = self._parse_stock_csv(risk_free_path, adjust=adjust, has_tz=False)
         if risk_free_path.exists() and risk_free_ticker not in self._frames:
             if columns_to_load == "candles":
                 available_cols = [col for col in ["Open","High","Low","Close","Volume"] if col in df_rf.columns]
@@ -148,7 +148,8 @@ class CsvBarLoader:
         if benchmarks_file.exists():
             df = pd.read_csv(benchmarks_file, parse_dates=['dt'])
             df.rename(columns={"dt": "Date"}, inplace=True)
-            df.index = pd.to_datetime(df.index, utc=True)
+            df.index = pd.to_datetime(df.index) 
+            df.index = df.index.tz_localize('America/New_York').tz_convert('UTC')
 
             
             # Benchmark using S&P500
@@ -282,7 +283,7 @@ class CsvBarLoader:
             values_array = df_filtered.values.astype(np.float32)
             
             # Iterate through rows efficiently
-            for i, (ts, ts_ns) in enumerate(zip(df_filtered.index, timestamps_ns)):
+            for i, (_, ts_ns) in enumerate(zip(df_filtered.index, timestamps_ns)):
                 row_values = values_array[i]
                 
                 # 1) Yield FeatureBarData with all numeric features
@@ -316,11 +317,18 @@ class CsvBarLoader:
     # ------------------------------------------------------------------ #
     # parsing helpers
     # ------------------------------------------------------------------ #
-    def _parse_stock_csv(self, path: Path, adjust: bool) -> pd.DataFrame:
-        df = pd.read_csv(path)
-        df["Date"] = pd.to_datetime(df["Date"], utc=True)
-        df.set_index("Date", inplace=True)
-        df.sort_index(inplace=True)
+    def _parse_stock_csv(self, path: Path, adjust: bool, has_tz = True) -> pd.DataFrame:
+        df = pd.read_csv(path) 
+        if has_tz:
+            df["Date"] = pd.to_datetime(df["Date"], utc=True)
+            df.set_index("Date", inplace=True, ) 
+            df.sort_index(inplace=True)
+            df.index = df.index.tz_convert('UTC')
+        else:
+            df["Date"] = pd.to_datetime(df["Date"])
+            df.set_index("Date", inplace=True, ) 
+            df.sort_index(inplace=True)
+            df.index = df.index.tz_localize('America/New_York').tz_convert('UTC')
 
         # Adjust OHLC on stock splits and dividends
         if adjust:
