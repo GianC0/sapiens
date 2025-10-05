@@ -661,7 +661,7 @@ class OptunaHparamsTuner:
         
         calendar = market_calendars.get_calendar(self.model_params["calendar"])
         days_range = calendar.schedule(start_date= ( backtest_start - train_offset ), end_date=backtest_start)
-        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"]).normalize()
+        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"])
         
         # compute traing and validation dates
         valid_offset = (timestamps[-1] - timestamps[0]) / (1 - valid_split) * valid_split
@@ -685,12 +685,23 @@ class OptunaHparamsTuner:
         cfg["backtest_end"] = backtest_end
 
         if to_strategy:
-            # compute data load date for validation: t = valid_start - (window_len + 1)
-            days_range = calendar.schedule(start_date=train_start, end_date=valid_start)
-            timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"]).normalize()
-            # start date including the initial window data needed for prediting at time t=0 of walk-frwd
-            data_load_start = timestamps[-(self.best_model_params_flat["window_len"] + 1)]
+            # Compute data load start for initial window
+            # Need window_len + 1 bars before valid_start
+            window_size = self.best_model_params_flat["window_len"] + 1
+            
+            # Calculate using period count, not time offset
+            pre_valid_range = calendar.schedule(start_date=train_start, end_date=valid_start)
+            pre_valid_timestamps = market_calendars.date_range(pre_valid_range, frequency=self.model_params["freq"])
+            
+            if len(pre_valid_timestamps) >= window_size:
+                data_load_start = pre_valid_timestamps[-window_size]
+            else:
+                # If not enough history, use train_start
+                logger.warning(f"Insufficient history for window_len={window_size}, using train_start")
+                data_load_start = train_start
+            
             cfg["data_load_start"] = data_load_start
+
         
 
         return cfg
@@ -700,18 +711,19 @@ class OptunaHparamsTuner:
         # Create data dictionary for selected stocks
         calendar = market_calendars.get_calendar(self.model_params["calendar"])
         days_range = calendar.schedule(start_date=start, end_date=end)
-        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"]).normalize()
+        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"])
 
         # init train+valid data
         data = {}
         for ticker in self.loader.universe:
             if ticker in self.loader._frames:
                 df = self.loader._frames[ticker]
-                # Get data up to validation end for initial training
-                # TODO: this has to change in order to manage data from different timezones/market hours
-                df.index = df.index.normalize()
+                # Ensure timezone compatibility
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize('UTC')
+                elif df.index.tz != timestamps.tz:
+                    df.index = df.index.tz_convert(timestamps.tz)
                 data[ticker] = df.reindex(timestamps).dropna()
-                #logger.info(f"  {ticker}: {len(data[ticker])} bars")
         return data
     
     def _produce_backtest_config(self, backtest_cfg, start, end) -> BacktestRunConfig:

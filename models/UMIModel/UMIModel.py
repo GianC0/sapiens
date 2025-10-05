@@ -23,8 +23,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from pandas import DataFrame, Timestamp
 import pandas_market_calendars as market_calendars
+import logging
 from logging import Logger
-
+logger = logging.getLogger(__name__)
 
 from ..utils import SlidingWindowDataset, build_input_tensor, build_pred_tensor, freq2pdoffset
 from .learners import StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning
@@ -59,7 +60,6 @@ class UMIModel(nn.Module):
         target_idx: int = 3,  # usually "close" is at index 3
         save_backups: bool = False,         # Flag for saving backups during walk-forward
         model_dir: Path = Path("logs/UMIModel"),
-        logger: Logger = Logger("INFO"),
         calendar: str = 'NYSE',
 
         **hparams,
@@ -82,7 +82,6 @@ class UMIModel(nn.Module):
         self.valid_end      = pd.Timestamp(valid_end)                                               # end of validation date
         assert self.valid_end >= self.train_end, "Validation end date must be after training end date."
 
-        self.logger         = logger                                                                # actions logger
         self.save_backups   = save_backups                                                          # whether to save backups during walk-forward
         #self.bt_end         = pd.to_datetime(bt_end, utc=True)                                     # end of back-test date (optional)
         
@@ -131,8 +130,8 @@ class UMIModel(nn.Module):
         - Returns best validation loss
         """
         assert self._is_initialized is False
-        if self.logger:
-            self.logger.info(f"[{self.__class__.__name__}] Initializing model...")
+        if logger:
+            logger.info(f"[{self.__class__.__name__}] Initializing model...")
     
         # Register active mask
         self.I = len(data)
@@ -146,8 +145,8 @@ class UMIModel(nn.Module):
 
        
         # Train from scratch
-        if self.logger:
-            self.logger.info(f"[initialize] Training for {self.n_epochs} epochs...")
+        if logger:
+            logger.info(f"[initialize] Training for {self.n_epochs} epochs...")
         start = self.train_start #+ freq2pdoffset(self.freq)
         end = self.valid_end
         best_val = self._train(data, self.n_epochs, active_mask, start=start, end=end)
@@ -162,8 +161,8 @@ class UMIModel(nn.Module):
         # Dump metadata
         #self._dump_model_metadata()
         
-        if self.logger:
-            self.logger.info(f"[initialize] Complete. Best validation: {best_val:.6f}")
+        if logger:
+            logger.info(f"[initialize] Complete. Best validation: {best_val:.6f}")
 
         return best_val
 
@@ -185,8 +184,8 @@ class UMIModel(nn.Module):
         self.valid_end = current_time
 
         if not warm_start:
-            if self.logger:
-                self.logger.info(f"[update] Warm-start disabled. Initialization on most updated window up until: {current_time}")
+            if logger:
+                logger.info(f"[update] Warm-start disabled. Initialization on most updated window up until: {current_time}")
     
             # Reinitialize with new windows
             self._is_initialized = False
@@ -196,17 +195,17 @@ class UMIModel(nn.Module):
         assert self._is_initialized
 
         # Regular warm-start training
-        if self.logger:
-            self.logger.info(f"[update] Warm-start training...")
+        if logger:
+            logger.info(f"[update] Warm-start training...")
         latest_path = self.model_dir / "latest.pt"
         if latest_path.exists():
-            if self.logger:
-                self.logger.info(f"[update] Loading weights from {latest_path}")
+            if logger:
+                logger.info(f"[update] Loading weights from {latest_path}")
             try:
                 self.load_state_dict(torch.load(latest_path, map_location=self._device, weights_only=False))
             except Exception as e:
-                if self.logger:
-                    self.logger.info(f"[update] Failed to load weights: {e}, training from scratch")
+                if logger:
+                    logger.info(f"[update] Failed to load weights: {e}, training from scratch")
                 self._is_initialized = False
                 self.initialize(data)
                 return
@@ -220,14 +219,14 @@ class UMIModel(nn.Module):
         if self.save_backups:
             backup_name = f"checkpoint_{current_time.strftime('%Y%m%d_%H%M%S')}.pt"
             torch.save(self.state_dict(), self.model_dir / backup_name)
-            if self.logger:
-                self.logger.info(f"[update] Saved backup: {backup_name}")
+            if logger:
+                logger.info(f"[update] Saved backup: {backup_name}")
         
         # Save state
         torch.save(self.state_dict(), self.model_dir / "latest.pt")
 
-        if self.logger:
-            self.logger.info(f"[update] Complete. Model up-to-date at: {current_time}")
+        if logger:
+            logger.info(f"[update] Complete. Model up-to-date at: {current_time}")
         
         # Log update metrics
         # TODO: verify during strategy execution
@@ -246,12 +245,25 @@ class UMIModel(nn.Module):
         Returns:
             Dict[ticker, prediction] for active instruments only
         """
-        assert self._is_initialized, "Model must be initialized before prediction"
-        assert torch.numel(active_mask) == self.I, "Active mask size must match the number of stocks (I)"
-        assert indexes == self.L + 1
+
+        if not self._is_initialized:
+            logger.error("Model not initialized, cannot predict")
+            return {}
+        if torch.numel(active_mask) != self.I:
+            logger.error(f"Active mask size {torch.numel(active_mask)} != {self.I}")
+            return {}
+        if indexes != self.L + 1:
+            logger.warning(f"Expected {self.L + 1} indexes, got {indexes}")
+            # Don't return empty - try to proceed if we have enough data
+            if indexes < self.L + 1:
+                logger.error(f"Insufficient data: need {self.L + 1}, got {indexes}")
+                return {}
         
-        # Assert universe
-        assert self._universe == list(data.keys()), "Universe error!"
+        # Assert universe matches
+        if self._universe != list(data.keys()):
+            logger.error("Universe mismatch in predict()")
+            return {}
+
 
         # Build panel from current data
         #lookback_periods = self.L + 1  # Need L+1 bars for prediction
@@ -269,8 +281,8 @@ class UMIModel(nn.Module):
         
         # Get the last window for prediction
         if len(dataset) == 0:
-            if self.logger:
-                self.logger.warning("Insufficient data for prediction")
+            if logger:
+                logger.warning("Insufficient data for prediction")
             return {}
         
         # Get last window
@@ -398,8 +410,8 @@ class UMIModel(nn.Module):
         
         Returns the best validation loss achieved.
         """
-        if self.logger:
-            self.logger.info(f"[_train] Starting training with mode: {self.training_mode.capitalize()}")
+        if logger:
+            logger.info(f"[_train] Starting training with mode: {self.training_mode.capitalize()}")
         
         # ═══════════════════════════════════════════════════════════════════════════════
         # 1. DATA PREPARATION
@@ -416,7 +428,7 @@ class UMIModel(nn.Module):
         # Create common timestamp index. This solves the start= -1 bar problem
         #start_date = self.train_end - self.train_offset + freq2pdoffset(self.freq)
         days_range = self.market_calendar.schedule(start_date= start, end_date=end)
-        timestamps = market_calendars.date_range(days_range, frequency=self.freq).normalize()
+        timestamps = market_calendars.date_range(days_range, frequency=self.freq)
         
         assert len(data) > 0
         (train_tensor, train_mask) , (valid_tensor, valid_mask) = build_input_tensor(data=data, timestamps=timestamps, feature_dim=self.F, split_valid_timestamp=self.train_end, device=self._device )
@@ -491,8 +503,8 @@ class UMIModel(nn.Module):
                 n_epochs, best_validation_loss, global_epoch
             )
         
-        if self.logger:
-            self.logger.info(f"[_train] Training completed. Best validation loss: {best_validation_loss:.6f}")
+        if logger:
+            logger.info(f"[_train] Training completed. Best validation loss: {best_validation_loss:.6f}")
         return best_validation_loss
 
 
@@ -501,8 +513,8 @@ class UMIModel(nn.Module):
                         n_epochs, best_validation_loss, global_epoch):
         """Train all components jointly for n_epochs."""
         
-        if self.logger:
-            self.logger.info(f"[joint] Training all components jointly for {n_epochs} epochs")
+        if logger:
+            logger.info(f"[joint] Training all components jointly for {n_epochs} epochs")
         
         # Enable gradients for all components
         self.stock_factor.requires_grad_(True)
@@ -523,8 +535,8 @@ class UMIModel(nn.Module):
             
             # Logging
             if epoch == 0 or (epoch + 1) % max(1, n_epochs // 5) == 0:
-                if self.logger:
-                    self.logger.info(f"Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                if logger:
+                    logger.info(f"Epoch {global_epoch:>3} | train {train_loss:.5f} | "
                             f"val {validation_loss:.5f} | best {best_validation_loss:.5f}")
             
             self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
@@ -542,8 +554,8 @@ class UMIModel(nn.Module):
         # PHASE 1: Stage-1 Pretraining
         # ═══════════════════════════════════════════════════════════════════════════════
         
-        if self.logger:
-            self.logger.info(f"[hybrid] Phase 1: Stage-1 pretraining for {self.pretrain_epochs} epochs")
+        if logger:
+            logger.info(f"[hybrid] Phase 1: Stage-1 pretraining for {self.pretrain_epochs} epochs")
         
         # Disable forecaster gradients
         self.stock_factor.requires_grad_(True)
@@ -561,8 +573,8 @@ class UMIModel(nn.Module):
                 best_validation_loss = min(best_validation_loss, validation_loss)
             
             if epoch == 0 or (epoch + 1) % max(1, self.pretrain_epochs // 3) == 0:
-                if self.logger:
-                    self.logger.info(f"Pretrain Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                if logger:
+                    logger.info(f"Pretrain Epoch {global_epoch:>3} | train {train_loss:.5f} | "
                             f"val {validation_loss:.5f} | best {best_validation_loss:.5f}")
             
             self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
@@ -572,8 +584,8 @@ class UMIModel(nn.Module):
         # PHASE 2: Joint Fine-tuning
         # ═══════════════════════════════════════════════════════════════════════════════
         
-        if self.logger:
-            self.logger.info(f"[hybrid] Phase 2: Joint fine-tuning for {n_epochs} epochs")
+        if logger:
+            logger.info(f"[hybrid] Phase 2: Joint fine-tuning for {n_epochs} epochs")
         
         # Enable all gradients and reduce Stage-1 learning rates
         self.forecaster.requires_grad_(True)
@@ -595,8 +607,8 @@ class UMIModel(nn.Module):
                 best_validation_loss = min(best_validation_loss, validation_loss)
             
             if epoch == 0 or (epoch + 1) % max(1, n_epochs // 5) == 0:
-                if self.logger:
-                    self.logger.info(f"Finetune Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                if logger:
+                    logger.info(f"Finetune Epoch {global_epoch:>3} | train {train_loss:.5f} | "
                             f"val {validation_loss:.5f} | best {best_validation_loss:.5f}")
             
             self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
@@ -614,8 +626,8 @@ class UMIModel(nn.Module):
         # PHASE 1: Stage-1 Training with Early Stopping
         # ═══════════════════════════════════════════════════════════════════════════════
         
-        if self.logger:
-            self.logger.info(f"[sequential] Phase 1: Stage-1 training with early stopping")
+        if logger:
+            logger.info(f"[sequential] Phase 1: Stage-1 training with early stopping")
         
         # Disable forecaster gradients
         self.stock_factor.requires_grad_(True)
@@ -654,13 +666,13 @@ class UMIModel(nn.Module):
                 
                 # Check early stopping
                 if patience_counter >= self.patience:
-                    if self.logger:
-                        self.logger.info(f"[sequential] Early stopping after {patience_counter} epochs without improvement")
+                    if logger:
+                        logger.info(f"[sequential] Early stopping after {patience_counter} epochs without improvement")
                     break
             
             if epoch == 0 or (epoch + 1) % max(1, n_epochs // 10) == 0:
-                if self.logger:
-                    self.logger.info(f"Stage1 Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                if logger:
+                    logger.info(f"Stage1 Epoch {global_epoch:>3} | train {train_loss:.5f} | "
                             f"val {validation_loss:.5f} | best {best_validation_loss:.5f} | patience {patience_counter}")
             
             self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
@@ -668,8 +680,8 @@ class UMIModel(nn.Module):
         
         # Restore best Stage-1 weights
         if best_stage1_state_stock is not None and best_stage1_state_market is not None and has_validation:
-            if self.logger:
-                self.logger.info("[sequential] Restoring best Stage-1 weights")
+            if logger:
+                logger.info("[sequential] Restoring best Stage-1 weights")
             self.stock_factor.load_state_dict(best_stage1_state_stock)
             self.market_factor.load_state_dict(best_stage1_state_market)
         
@@ -677,8 +689,8 @@ class UMIModel(nn.Module):
         # PHASE 2: Stage-2 Only Training
         # ═══════════════════════════════════════════════════════════════════════════════
         
-        if self.logger:
-            self.logger.info(f"[sequential] Phase 2: Stage-2 training for {n_epochs} epochs")
+        if logger:
+            logger.info(f"[sequential] Phase 2: Stage-2 training for {n_epochs} epochs")
         
         # Freeze Stage-1 components, enable forecaster
         self.stock_factor.requires_grad_(False)
@@ -707,8 +719,8 @@ class UMIModel(nn.Module):
                 best_validation_loss = min(best_validation_loss, validation_loss)
             
             if epoch == 0 or (epoch + 1) % max(1, n_epochs // 5) == 0:
-                if self.logger:
-                    self.logger.info(f"Stage2 Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                if logger:
+                    logger.info(f"Stage2 Epoch {global_epoch:>3} | train {train_loss:.5f} | "
                             f"val {validation_loss:.5f} | best {best_validation_loss:.5f}")
             
             self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)

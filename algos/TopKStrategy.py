@@ -289,18 +289,20 @@ class TopKStrategy(Strategy):
         if event.name != "update_timer":
             return
 
-        assert pd.to_datetime(event.ts_event, unit="ns", utc=True) > self._last_update_time 
+        event_time = pd.to_datetime(event.ts_event, unit="ns", utc=True)
+        if event_time <= self._last_update_time:
+            logger.debug(f"Event time {event_time} not after last update {self._last_update_time}")
+            return
 
         now = pd.Timestamp(self.clock.utc_now(),)
         
         # check if "now" falls outside market trading hours
-        d_r = self.calendar.schedule(start_date=self._last_update_time, end_date= now + freq2pdoffset(self.strategy_params["freq"]) )
-        if now not in  market_calendars.date_range(d_r, frequency=self.strategy_params["freq"]).normalize():
+        if not self.calendar.open_at_time(self.calendar.schedule(start_date=now.date(), end_date=now.date()), now):
             return
 
         # Skip if no update needed
         if self._last_update_time and now < (self._last_update_time + freq2pdoffset(self.strategy_params["freq"])):
-            logger.warning("WIERD STRATEGY UPDATE() CALL")
+            logger.warning("Update called too soon, skipping")
             return
         
         logger.info(f"Update timer fired at {now}")
@@ -602,13 +604,15 @@ class TopKStrategy(Strategy):
                 continue
             
             # Check 2: Active at walk-forward start
-            pred_window = df[(df.index > self.valid_end) ]
-            if len(pred_window) < self.pred_len :
+            # Check if we have data extending pred_len periods beyond valid_end
+            freq_offset = freq2pdoffset(self.strategy_params["freq"])
+            required_end = self.valid_end + (freq_offset * self.pred_len)
+            pred_window = df[(df.index > self.valid_end) & (df.index <= required_end)]
+            
+            if pred_window.empty:
                 logger.info(f"Skipping {ticker}: not active at walk-forward start")
                 continue
-                
 
-                
             selected.append(ticker)
             
         logger.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates (including risk-free) ")
@@ -669,8 +673,10 @@ class TopKStrategy(Strategy):
             bars = self.cache.bars(bar_type)[:window]  # Get last 'window' bars (nautilus cache notation is opposite to pandas)
 
             # ensure there is at least one new bar after the last predition
-            assert pd.to_datetime(bars[0].ts_event, unit="ns", utc=True ) > self._last_update_time
-            
+            bar_time = pd.to_datetime(bars[0].ts_event, unit="ns", utc=True)
+            if bar_time <= self._last_update_time:
+                logger.warning(f"Bar time {bar_time} not after last update {self._last_update_time}")
+
             # Collect all bar data into lists
             bar_data = {
                 "Date": [],
@@ -971,7 +977,7 @@ class TopKStrategy(Strategy):
         # Create data dictionary for selected stocks
         calendar = market_calendars.get_calendar(self.model_params["calendar"])
         days_range = calendar.schedule(start_date=start, end_date=end)
-        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"]).normalize()
+        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"])
 
         # init train+valid data
         data = {}
@@ -979,10 +985,13 @@ class TopKStrategy(Strategy):
             if ticker in self.loader._frames:
                 df = self.loader._frames[ticker]
                 # Get data up to validation end for initial training
-                # TODO: this has to change in order to manage data from different timezones/market hours
-                df.index = df.index.normalize()
-                data[ticker] = df.reindex(timestamps).dropna()
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize('UTC')
+                elif df.index.tz != timestamps.tz:
+                    df.index = df.index.tz_convert(timestamps.tz)
+
                 #logger.info(f"  {ticker}: {len(data[ticker])} bars")
+                data[ticker] = df.reindex(timestamps).dropna()
         return data
     
     def _calculate_portfolio_nav(self) -> float:
