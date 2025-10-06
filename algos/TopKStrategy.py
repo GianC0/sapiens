@@ -847,8 +847,8 @@ class TopKStrategy(Strategy):
             # Risk-free rate is the only one who can take up to 100% of portfolio
             if symbol == risk_free_ticker:
                 # Risk-free allocation should account for commissions
-                max_weight = 1 -  ( 2 * self.commission_rate )   # Reserve for round-trip
-                allowed_weight_ranges.append([0, max_weight])
+                #max_weight = 1 -  ( 2 * self.commission_rate )   # Reserve for round-trip
+                allowed_weight_ranges.append([0, 1.0])
                 continue
 
             # ADV constraints
@@ -878,11 +878,10 @@ class TopKStrategy(Strategy):
         cov_horizon = cov_per_period * float(self.pred_len)  # scale to pred_len horizon
 
         # prepare expected returns
-        valid_mu = np.array([preds.get(s, 0.0) for s in valid_symbols])
+        valid_expected_returns = np.array([preds.get(s, 0.0) for s in valid_symbols])
 
         # If all expected returns <= rf_horizon then allocate to risk-free ticker (if available)
-        # TODO: this has to be ensured it's worth with commissions
-        if np.all(valid_mu <= current_rf):
+        if np.all(valid_expected_returns <= current_rf):
             w_series = pd.Series(0.0, index=self.universe)
             if risk_free_ticker in self.universe:
                 w_series[risk_free_ticker] = 1 - ( 2 * self.commission_rate) # Reserve for round-trip
@@ -892,41 +891,32 @@ class TopKStrategy(Strategy):
 
         # Call optimizer with horizon-scaled cov and risk-free rf
         w_opt = self.optimizer.optimize(
-            mu=valid_mu,
-            cov=cov_horizon,
+            er=pd.Series(valid_expected_returns, index=valid_symbols),
+            cov=pd.DataFrame(cov_horizon, index=valid_symbols, columns=valid_symbols),
             rf=current_rf,
             benchmark_vol=self._get_benchmark_volatility(now),
             allowed_weight_ranges=np.array(allowed_weight_ranges),
             current_weights = np.array(current_weights),
             selector_k = self.selector_k,
             target_volatility = self.target_volatility,
+            commission_rate = self.commission_rate,
         )
 
-        if len(w_opt) != len(valid_symbols):
-            logger.warning("Optimizer returned unexpected vector length. Falling back to equal weights.")
-            w_opt = np.ones(len(valid_symbols)) / len(valid_symbols)
-
-        # Take top-K by absolute weight
-
-        final_arr = np.zeros_like(w_opt)
-
-        for i, val in enumerate(w_opt):
-            # clip to allowed range
-            w_min, w_max = allowed_weight_ranges[i]
-            final_arr[i] = float(np.clip(val, w_min, w_max))
+        # Clipping (if optimizer constraints failed) and log if clipping occurred
+        final_arr = np.clip(w_opt, allowed_weight_ranges[:, 0], allowed_weight_ranges[:, 1])  # max bounds
 
         # Ensure total absolute exposure leaves room for commissions
         abs_final_sum = float(np.sum(np.abs(final_arr)))
-        if abs_final_sum > 1:
-            # Scale down to respect commission buffer
-            scale = 1 / abs_final_sum
+        max_deployment = 1.0 - (2 * self.commission_rate)
+        if abs_final_sum > max_deployment:
+            # Scale down to respect commission buffer (safe fallback)
+            scale = max_deployment / abs_final_sum
             final_arr = final_arr * scale
             logger.info(f"Scaled weights by {scale:.4f} to reserve cash for commissions")
 
-        # Map back to full universe
+        # Map to universe
         w_series = pd.Series(0.0, index=self.universe)
-        for i, symbol in enumerate(valid_symbols):
-            w_series[symbol] = final_arr[i]
+        w_series[valid_symbols] = final_arr  # Direct assignment using list indexing
 
         return w_series.to_dict()
 

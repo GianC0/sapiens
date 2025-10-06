@@ -186,8 +186,8 @@ class OrderManager:
             turnover = abs(target_weight - current_weight)
             total_target_turnover += turnover
         
-        # Reserve cash for commissions (both buy and sell side)
-        commission_reserve = nav * total_target_turnover * self.commission_rate
+        # Reserve cash for commissions (both buy and sell side, round-trip)
+        commission_reserve = nav * total_target_turnover * self.commission_rate * 2
         available_nav = nav - commission_reserve
         
         if available_nav <= 0:
