@@ -779,13 +779,13 @@ class TopKStrategy(Strategy):
             return None
         
         df = self.loader._benchmark_data
-        
-        # Calculate start date for lookback window
         lookback_start = timestamp - self.optimizer_lookback
-
-        # Get data in lookback window
-        volatility = df.loc[(df.index >= lookback_start) & (df.index <= timestamp), "Benchmark"].std()
-
+        
+        # Use iloc with index searching for robust timestamp matching
+        start_idx = df.index.searchsorted(lookback_start, side='left')
+        end_idx = df.index.searchsorted(timestamp, side='right')
+        
+        volatility = df.iloc[start_idx:end_idx]["Benchmark"].std()
         return volatility
 
     def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
@@ -899,11 +899,13 @@ class TopKStrategy(Strategy):
             current_weights = np.array(current_weights),
             selector_k = self.selector_k,
             target_volatility = self.target_volatility,
-            commission_rate = self.commission_rate,
+            commission_rate = 0.0,  # commission_rate is enforced afterwards. optimizer fails beacuse: DEFAULT  sum(w) = 1 AND constraint sum(w) ≤ 1 - commissions
         )
 
+
+
         # Clipping (if optimizer constraints failed) and log if clipping occurred
-        final_arr = np.clip(w_opt, allowed_weight_ranges[:, 0], allowed_weight_ranges[:, 1])  # max bounds
+        final_arr = np.clip(w_opt, np.array(allowed_weight_ranges)[:, 0], np.array(allowed_weight_ranges)[:, 1])  # max bounds
 
         # Ensure total absolute exposure leaves room for commissions
         abs_final_sum = float(np.sum(np.abs(final_arr)))
