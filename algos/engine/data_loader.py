@@ -17,6 +17,7 @@ import logging
 import numpy as np
 import pandas as pd
 import pandas_market_calendars as market_calendars
+from decimal import Decimal
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import Equity
@@ -408,6 +409,8 @@ class CsvBarLoader:
         
         assert self.cfg["currency"] in (USD,EUR)
 
+        fee_amount = Decimal(self.cfg["costs"]["fee_bps"] / 100)
+
         # TODO: double check price precision.
         return Equity(
             instrument_id=instrument_id,
@@ -418,8 +421,8 @@ class CsvBarLoader:
             lot_size=Quantity.from_int(1),
             # margin_init=Money(0, USD),  # No margin requirement for cash account
             # margin_maint=Money(0, USD),
-            # maker_fee=Money(0, USD),    # Fees handled by commission model
-            # taker_fee=Money(0, USD),
+            maker_fee=fee_amount, 
+            taker_fee=fee_amount,
             ts_event=0,
             ts_init=0,
         )

@@ -281,8 +281,29 @@ class TopKStrategy(Strategy):
         return
     
     # Used
+    #def on_dispose(self) -> None:
+    #    self.order_manager.liquidate_all(self.universe)
+    #    return
+
     def on_dispose(self) -> None:
-        self.order_manager.liquidate_all(self.universe)
+        """Ensure all positions are closed at end of backtest for accurate P&L."""
+        logger.info("Strategy disposal: liquidating all positions for final P&L calculation")
+        
+        # Force close all open positions at current market prices
+        for position in self.cache.positions_open(venue=self.venue):
+            instrument_id = position.instrument_id
+            symbol = instrument_id.symbol.value
+            
+            logger.info(f"Final liquidation: closing {symbol} position of {position.signed_qty}")
+            self.order_manager.close_position(position)
+        
+        # Cancel any pending orders
+        self.order_manager.cancel_all_orders()
+        
+        # Log final NAV for verification
+        final_nav = self._calculate_portfolio_nav()
+        logger.info(f"Final NAV at disposal: {final_nav:.2f}")
+        
         return
     
     def on_update(self, event: TimeEvent):

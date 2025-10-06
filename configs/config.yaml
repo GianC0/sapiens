@@ -171,8 +171,8 @@ STRATEGY:
 
     # Trading friction costs
     costs:
-      fee_bps:    5            # One-way commission in basis-points of notional: 0.05% commission
-      prob_slippage: 0.2       # Simulates the probability of experiencing price slippage when executing market orders. When triggered, moves fill price one tick against your order direction
+      fee_bps:    0.5          # One-way commission in basis-points of notional (:100): 0.005% / share
+      prob_slippage: 0.0       # Simulates the probability of experiencing price slippage when executing market orders. If triggered, the order fill price has prob_slippage chances to be filled at next tick (for all market levels data L1/L2/L3) 
       prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
 
     # Order execution algorithm

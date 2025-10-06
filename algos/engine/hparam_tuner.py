@@ -13,13 +13,13 @@ from fastapi import params
 from matplotlib.pyplot import bar
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, ImportableExecAlgorithmConfig, LoggingConfig
+from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, ImportableExecAlgorithmConfig, LoggingConfig, ImportableFeeModelConfig, ImportableFillModelConfig
 from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.backtest.models import FillModel
+from nautilus_trader.backtest.models import FillModel, MakerTakerFeeModel
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.backtest.node import BacktestEngineConfig
 #from nautilus_trader.common.component import RiskEngine   to fix
-from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig
+from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig, MakerTakerFeeModelConfig, FillModelConfig
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm, TWAPExecAlgorithmConfig
 from nautilus_trader.backtest.node import BacktestNode
@@ -719,7 +719,22 @@ class OptunaHparamsTuner:
                 base_currency=backtest_cfg["STRATEGY"]["currency"],
                 starting_balances=[str(backtest_cfg["STRATEGY"]["initial_cash"])+" "+str(backtest_cfg["STRATEGY"]["currency"])],
                 bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices,
-                
+                fill_model=ImportableFillModelConfig(
+                        fill_model_path = "nautilus_trader.backtest.models:FillModel",
+                        config_path = "nautilus_trader.backtest.config:FillModelConfig",
+                        config = {
+                            "prob_fill_on_limit" : backtest_cfg["STRATEGY"]["costs"]["prob_fill_on_limit"],
+                            "prob_slippage" : backtest_cfg["STRATEGY"]["costs"]["prob_slippage"],
+                            "random_seed" : self.seed,
+                            },
+
+                ),
+                fee_model=ImportableFeeModelConfig(
+                    fee_model_path = "nautilus_trader.backtest.models:MakerTakerFeeModel",
+                    config_path = "nautilus_trader.backtest.config:MakerTakerFeeModelConfig",
+                    config = {},
+                ),
+                # TODO: implement fee model
             ),
         ]
         bar_spec = freq2barspec(backtest_cfg["STRATEGY"]["freq"])
@@ -772,11 +787,7 @@ class OptunaHparamsTuner:
                         ),
                     logging=LoggingConfig(log_level="INFO"),
                     # TODO: fix fill model issue
-                    #fill_model=FillModel(
-                    #    prob_fill_on_limit=backtest_cfg["STRATEGY"].get("costs", {}).get("prob_fill_on_limit", 0.2),
-                    #    prob_slippage=backtest_cfg["STRATEGY"].get("costs", {}).get("prob_slippage", 0.2),
-                    #    random_seed=self.seed,
-                    #    ),
+
                     ),
                 data=data_configs,
                 venues=venue_configs,
