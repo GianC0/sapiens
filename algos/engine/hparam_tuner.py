@@ -9,6 +9,7 @@ Orchestrates two-phase hyperparameter optimization:
 Each phase gets its own Optuna study and MLflow experiment.
 """
 
+from heapq import merge
 from fastapi import params
 from matplotlib.pyplot import bar
 from nautilus_trader.model.enums import AccountType
@@ -25,6 +26,7 @@ from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm, TWAPExec
 from nautilus_trader.backtest.node import BacktestNode
 from pathlib import Path
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from copy import deepcopy
 
 import pandas_market_calendars as market_calendars
 from math import exp
@@ -46,7 +48,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 from algos.engine.data_loader import CsvBarLoader
-from models.utils import freq2pdoffset, yaml_safe, freq2barspec
+from models.utils import freq2pdoffset, yaml_safe, freq2barspec, merge_configs
+from algos.engine.data_augmentation import DataAugmentor
 
 
 
@@ -103,13 +106,12 @@ class OptunaHparamsTuner:
         
 
         # Split hparams into defaults and search spaces
-        self.model_defaults, self.model_search = self._split_hparam_cfg(self.model_hparams)
+        self.model_defaults, self.model_search = self._split_hparam_cfg(merge_configs([self.model_hparams, self.data_hparams]))
         self.strategy_defaults, self.strategy_search = self._split_hparam_cfg(self.strategy_hparams)
         self.seed = seed
 
-        # --- Data Loader and Data Augmentation setup -------------------------------------------
-        self.loader = CsvBarLoader(cfg=self.strategy_params,
-                                   cfg_augment = self.data_config, #TODOSB: merge into a single cfg
+        # --- Data Loader setup -------------------------------------------
+        self.loader = CsvBarLoader(cfg=self.strategy_params, 
                                     venue_name=self.strategy_params["venue_name"], 
                                     columns_to_load=self.data_params["features_to_load"], 
                                     adjust = self.data_params["adjust"])
@@ -233,7 +235,7 @@ class OptunaHparamsTuner:
             # Define objective function for model
             def model_objective(trial: optuna.Trial) -> float:
                 trial_hparams = self._suggest_params(trial, self.model_defaults, self.model_search)
-                
+                print(trial_hparams)
                 # setting train_offset and model_dir to model flatten config dictionary
                 # adding train_offset here to avoid type overwite later  (pandas.offset -> str)
                 train_offset = trial_hparams["train_offset"]
@@ -248,6 +250,23 @@ class OptunaHparamsTuner:
                 start = model_params_flat["train_start"]
                 end = model_params_flat["valid_end"]
                 data_dict = self._get_data(start=start, end=end)
+                
+                # --- Build trial-specific augmentor ---
+                # Extract data-related hyperparams from trial_hparams
+                augment_hparams = {k: v for k, v in trial_hparams.items() if k in self.data_hparams}
+
+                # Merge into the augmentor config
+                trial_data_config = merge_configs([self.data_params, augment_hparams])
+
+                # Instantiate augmentor with trial-specific parameters
+                print(trial_data_config)
+                
+                augmentor = DataAugmentor(augmentation_config=trial_data_config, augment_modality="train")
+
+                data_dict = self._get_data(start=start, end=end)
+                data_dict = augmentor.augment(data_dict)
+
+                print(data_dict)
 
                 # Start MLflow run for this trial
                 with mlflow.start_run(

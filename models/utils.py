@@ -342,3 +342,21 @@ def yaml_safe(obj):
     Useful for pandas.Timedelta attributes
     """
     return json.loads(json.dumps(obj, default=lambda o: getattr(o, "freqstr", str(o))))
+
+def merge_configs(list_configs):
+    """Merge a list of configuration dictionaries.
+
+    Args:
+        list_configs (List[dict]): List of configuration dictionaries to merge.
+    Returns:
+        dict: Merged configuration dictionary.
+    """
+    merged_config = {}
+    for config in list_configs:
+        for key, value in config.items():
+            if key in merged_config and isinstance(merged_config[key], dict) and isinstance(value, dict):
+                # Recursively merge nested dictionaries
+                merged_config[key] = merge_configs([merged_config[key], value])
+            else:
+                merged_config[key] = value
+    return merged_config

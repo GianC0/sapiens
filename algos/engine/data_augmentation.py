@@ -16,33 +16,73 @@ import pandas as pd
 import torch
 from sklearn.decomposition import PCA
 from arch import arch_model
-import logging
+import logging 
 import talib
+from joblib import dump, load
 
 logger = logging.getLogger(__name__)
 
 class DataAugmentor:
     def __init__( self,
         augmentation_config: Dict[str, Any],
-        market_data_type: str,  #OHLCV, orderbook, possibly more
         augment_modality: str = "train", #train or stream
     ):
-        self.config = augmentation_config
-        self.market_data_type = market_data_type
-        self.modality = augment_modality  # "train" or "stream"
-        #self.rng = np.random.default_rng(seed)
+        #self.config = augmentation_config
+        self.market_data_type = augmentation_config.get("features_to_load", "candles")  #OHLCV, orderbook, possibly more
+        self.modality = augment_modality 
+        self.pca = augmentation_config.get("pca", True)
+
+        self.pca_var_explained = augmentation_config.get("pca_var_explained", 0.95) #if using var explained to choose n_components
 
         # Choose implementation based on market data type
-        if self.market_data_type == "OHCLV":
-            self.impl = _OHCLVAugmentor(self.config, self.modality)
+        if self.market_data_type == "candles":
+            self.impl = _OHCLVAugmentor(augmentation_config, self.modality)
         elif self.market_data_type == "orderbook":
-            self.impl = _OrderbookAugmentor(self.config)
+            self.impl = _OrderbookAugmentor(augmentation_config)
         else:
-            raise ValueError(f"Unknown data type to augment: {market_data_type}")
+            raise ValueError(f"Unknown data type to augment: {self.market_data_type}")
+        
+        self.pca_model = None
+        self.pca_model_path = augmentation_config.get("pca_dir", "/logs/models/pca/")
 
-    def augment(self, data : Dict[str, pd.DataFrame]):
+    def augment(self, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        # Run base augmentations per symbol
+        out = {symbol: self.impl._augment(df) for symbol, df in data.items()}
 
-        out = self.impl._augment(data)
+        # Apply global PCA if enabled
+        if self.pca:
+            out = self.apply_PCA(out)
+        return out
+    
+    def apply_PCA(self, data: Dict[str, pd.DataFrame], n_components: int = 10) -> Dict[str, pd.DataFrame]:
+        # Add a temporary column to track symbols
+        labeled_data = [df.assign(_symbol=symbol) for symbol, df in data.items()]
+        combined = pd.concat(labeled_data, axis=0)
+
+        # Select numeric columns and handle missing values
+        numeric_cols = combined.select_dtypes(include=[np.number]).columns
+        X = combined[numeric_cols].fillna(0).values  # TODO: better missing value handling
+
+        # Fit PCA on train; reuse on prediction/stream
+        if self.modality == "train":
+            self.pca_model = PCA(n_components=min(n_components, X.shape[1]))
+            X_pca = self.pca_model.fit_transform(X)
+            dump(self.pca_model, self.pca_model_path + "_test" + "_pca.joblib") #TODO: use same run_dir as models
+        else:
+            if self.pca_model is None:
+                self.pca_model = load(self.pca_model_path)
+            X_pca = self.pca_model.transform(X)
+
+        # Combine PCA features with non-numeric columns
+        combined_pca = pd.concat(
+            [combined.drop(columns=numeric_cols, errors="ignore"), 
+            pd.DataFrame(X_pca, columns=[f"pca_{i+1}" for i in range(X_pca.shape[1])], index=combined.index)],
+            axis=1
+        )
+
+        # Split back by symbol
+        out = {str(symbol): group.drop(columns="_symbol") for symbol, group in combined_pca.groupby("_symbol")}
+
         return out
 
 class _OHCLVAugmentor:
@@ -51,43 +91,38 @@ class _OHCLVAugmentor:
         augment_modality: str = "train", #train or stream
         ):
 
-        self.config = OHLCV_augmentation_config
+        self.technical_indicators = OHLCV_augmentation_config.get("technical_indicators", True)
         self.modality = augment_modality
+
+        self.timeperiod = OHLCV_augmentation_config.get("techinds_timeperiod", 14)
         
         self.source = talib if self.modality == "train" else talib.stream
-        self.technical_indicators = []
 
-    def _check_OHLCV(self, df):
+
+    def _check_OHLCV(self, df: pd.DataFrame):
         required_cols = {"Open", "High", "Low", "Close", "Volume"}
         if not required_cols.issubset(df.columns):
             raise ValueError(f"DataFrame must contain OHLCV columns: {required_cols}")
-
-    def _augment(self, data):
-
-        out = {}
         
-        for symbol, df in data.items():
-                
-            self._check_OHLCV(df)
 
-            df = df.copy()  
+    def _augment(self, ohlcv_df: pd.DataFrame) -> pd.DataFrame:
 
-            if self.modality == "stream":
-                historical = retrieveFromCatalog(symbol).tail(100)
-                df = pd.concat([historical, df]).reset_index(drop=True)
+        self._check_OHLCV(ohlcv_df)
 
-            # Add technical indicators
-            if self.config.get("technical_indicators", {}).get("enabled", True):
-                df = self._add_technical_indicators(df)
-        
+        out = ohlcv_df.copy()  
+
+        if self.modality == "stream":
+            #historical = retrieveFromCatalog(symbol).tail(self.timeperiod)
+            #df = pd.concat([historical, df]).reset_index(drop=True)
+            out = out
+
+        # Add technical indicators
+        if self.technical_indicators:
+            out = self._add_technical_indicators(out)
+            print(out.head())
             #Add other engineered features
-
-        
-        #Perform PCA
-
-        
-        
-        return df
+      
+        return out
 
     def _add_technical_indicators(self, df, timeperiod = 14):
         self._check_OHLCV(df)
@@ -120,29 +155,62 @@ class _OHCLVAugmentor:
 
         #Momentum Indicators
         dict_indicators['AD'] = source.ADX(high, low, close, volume)
-
+        dict_indicators['ADXR'] = source.ADXR(high, low, close, timeperiod)
+        dict_indicators['APO'] = source.APO(close, fastperiod=12, slowperiod=26, matype=0)
+        dict_indicators['AROON_down'], dict_indicators['AROON_up'] = source.AROON(high, low, timeperiod)
+        dict_indicators['AROONOSC'] = source.AROONOSC(high, low, timeperiod)
+        dict_indicators['BOP'] = source.BOP(open, high, low, close)
+        dict_indicators['CCI'] = source.CCI(high, low, close, timeperiod)
+        dict_indicators['CMO'] = source.CMO(close, timeperiod)
+        dict_indicators['DX'] = source.DX(high, low, close, timeperiod)
+        dict_indicators['MACD'], dict_indicators['MACD_signal'], dict_indicators['MACD_hist'] = source.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+        dict_indicators['MACDEXT'], dict_indicators['MACDEXT_signal'], dict_indicators['MACDEXT_hist'] = source.MACDEXT(close, fastperiod=12, fastmatype=0, slowperiod=26, slowmatype=0, signalperiod=9, signalmatype=0)
+        dict_indicators['MACFIX'], dict_indicators['MACFIX_signal'], dict_indicators['MACFIX_hist'] = source.MACDFIX(close, signalperiod=9)
+        dict_indicators['MFI'] = source.MFI(high, low, close, volume, timeperiod)
+        dict_indicators['MINUS_DI'] = source.MINUS_DI(high, low, close, timeperiod)
+        dict_indicators['MINUS_DM'] = source.MINUS_DM(high, low, timeperiod)
+        dict_indicators['MOM'] = source.MOM(close, timeperiod)
+        dict_indicators['PLUS_DI'] = source.PLUS_DI(high, low, close, timeperiod)
+        dict_indicators['PLUS_DM'] = source.PLUS_DM(high, low, timeperiod)
+        dict_indicators['PPO'] = source.PPO(close, fastperiod=12, slowperiod=26, matype=0)
+        dict_indicators['ROC'] = source.ROC(close, timeperiod)
+        dict_indicators['ROCP'] = source.ROCP(close, timeperiod)
+        dict_indicators['ROCR'] = source.ROCR(close, timeperiod)
+        dict_indicators['ROCR100'] = source.ROCR100(close, timeperiod)
+        dict_indicators['RSI'] = source.RSI(close, timeperiod)
+        dict_indicators['STOCH_slowk'], dict_indicators['STOCH_slowd'] = source.STOCH(high, low, close, fastk_period=5, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0)
+        dict_indicators['STOCHF_fastk'], dict_indicators['STOCHF_fastd'] = source.STOCHF(high, low, close, fastk_period=5, fastd_period=3, fastd_matype=0)
+        dict_indicators['STOCHRSI_fastk'], dict_indicators['STOCHRSI_fastd'] = source.STOCHRSI(close, timeperiod, fastk_period=5, fastd_period=3, fastd_matype=0)
+        dict_indicators['TRIX'] = source.TRIX(close, timeperiod)    
+        dict_indicators['ULTOSC'] = source.ULTOSC(high, low, close, timeperiod1=7, timeperiod2=14, timeperiod3=28)
+        dict_indicators['WILLR'] = source.WILLR(high, low, close, timeperiod)
 
         #Volume Indicators
         dict_indicators['AD'] = source.AD(high, low, close, volume)
         dict_indicators['ADOSC'] = source.ADOSC(high, low, close, volume)
         dict_indicators['OBV'] = source.OBV(close, volume)
-        
 
+        #Volatility Indicators
+        dict_indicators['ATR']   = source.ATR(high, low, close, timeperiod)
+        dict_indicators['NATR']  = source.NATR(high, low, close, timeperiod)
+        dict_indicators['TRANGE'] = source.TRANGE(high, low, close)
 
-
-        dict_indicators['SMA_14'] = source.SMA(out, timeperiod)
-        dict_indicators['RSI_14'] = source.RSI(out, timeperiod)
+        #Price Transform Indicators
+        dict_indicators['AVGPRICE']  = source.AVGPRICE(open, high, low, close)
+        dict_indicators['MEDPRICE']  = source.MEDPRICE(high, low)
+        dict_indicators['TYPPRICE']  = source.TYPPRICE(high, low, close)
+        dict_indicators['WCLPRICE']  = source.WCLPRICE(high, low, close)
         #add more indicators
-
-        for indicator_name, feature in dict_indicators.items():
+        
+        for indicator_name, values in dict_indicators.items():
             self.technical_indicators.append(indicator_name)
 
             if self.modality == "train":
-                df[indicator_name] = feature
+                out[indicator_name] = values
             elif self.modality == "stream":
-                out.iloc[-1, out.columns.get_loc(indicator_name)] = feature
+                out.iloc[-1, out.columns.get_loc(indicator_name)] = values
 
-        
+        return out        
 
 class _OrderbookAugmentor:
     def __init__(self, rng):
@@ -153,11 +221,7 @@ class _OrderbookAugmentor:
         return book
       
 
-
-
-
-
-
+#TODO: keeping it for ideas, to remove once new class is completed
 
 class MarketDataAugmenter2:
     """
@@ -527,6 +591,5 @@ class MarketDataAugmenter2:
         # Calcolo RSI
         rsi = 100 - (100 / (1 + rs))
         
-        # Sostituisci NaN da 0/0 (serie piatta) con 0
         rsi[(gain == 0) & (loss == 0)] = 0
         return rsi

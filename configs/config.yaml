@@ -10,7 +10,7 @@ DATA:
     adjust: true                      # wheter to adjust OHLC based on stock splits and dividends
 
     # Data Augmentation settings
-    technical_indicators: false        # add technical indicators as features
+    technical_indicators: true        # add technical indicators as features
     pca: false                         # apply PCA to reduce feature dimensionality
 
   HPARAMS:  # optuna_type: "categorical", low-high (assumed float), int_low-high, log_low-high
@@ -22,12 +22,11 @@ DATA:
         low: 0.90
         high: 0.99
 
-    tis_timeperiod:
+    techinds_timeperiod:
       default: 14
       optuna:
-        optuna_type: int_low-high
-        low: 10
-        high: 30
+        optuna_type: categorical
+        choices: [14,38] 
         
 
 MODEL:
