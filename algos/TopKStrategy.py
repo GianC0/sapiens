@@ -106,6 +106,7 @@ class TopKStrategy(Strategy):
 
         self.strategy_params = cfg["STRATEGY"]
         self.model_params = cfg["MODEL"]
+        self.data_params = cfg["DATA"]
 
         # safe handling of variable
         if self.strategy_params["currency"]  == "USD":
@@ -150,7 +151,7 @@ class TopKStrategy(Strategy):
         # Loader for data access
         venue_name = self.strategy_params["venue_name"]
         self.venue = Venue(venue_name)
-        self.loader = CsvBarLoader(cfg=self.strategy_params, venue_name=self.venue.value, columns_to_load=self.model_params["features_to_load"], adjust=self.model_params["adjust"])
+        self.loader = CsvBarLoader(cfg=self.strategy_params, venue_name=self.venue.value, columns_to_load=self.data_params["features_to_load"], adjust=self.data_params["adjust"])
         #self.catalog = ParquetDataCatalog( path = self.strategy_params["catalog_path"], fs_protocol="file")
         self.universe: List[str] = []  # Ordered list of instruments
         self.active_mask: Optional[torch.Tensor] = None  # (I,)

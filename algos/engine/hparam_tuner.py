@@ -83,10 +83,13 @@ class OptunaHparamsTuner:
         
         
         # Parse configuration sections
+        self.data_config = self.config.get('DATA', {})
         self.model_config = self.config.get('MODEL', {})
         self.strategy_config = self.config.get('STRATEGY', {})
         
         # Extract params and hparams for each component
+        self.data_params = self.data_config.get('PARAMS', {})
+        self.data_hparams = self.data_config.get('HPARAMS', {})
         self.model_params = self.model_config.get('PARAMS', {})
         self.model_hparams = self.model_config.get('HPARAMS', {})
         self.strategy_params = self.strategy_config.get('PARAMS', {})
@@ -105,7 +108,11 @@ class OptunaHparamsTuner:
         self.seed = seed
 
         # --- Data Loader and Data Augmentation setup -------------------------------------------
-        self.loader = CsvBarLoader(cfg=self.strategy_params, venue_name=self.strategy_params["venue_name"], columns_to_load=self.model_params["features_to_load"], adjust = self.model_params["adjust"])
+        self.loader = CsvBarLoader(cfg=self.strategy_params,
+                                   cfg_augment = self.data_config, #TODOSB: merge into a single cfg
+                                    venue_name=self.strategy_params["venue_name"], 
+                                    columns_to_load=self.data_params["features_to_load"], 
+                                    adjust = self.data_params["adjust"])
         
         # Setup MLflow
         self._setup_mlflow()
