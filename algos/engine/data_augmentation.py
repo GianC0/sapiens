@@ -98,6 +98,8 @@ class _OHCLVAugmentor:
         
         self.source = talib if self.modality == "train" else talib.stream
 
+        self.technical_indicators_list = []
+
 
     def _check_OHLCV(self, df: pd.DataFrame):
         required_cols = {"Open", "High", "Low", "Close", "Volume"}
@@ -136,74 +138,78 @@ class _OHCLVAugmentor:
         source = self.source
 
         #Overlap Studies
-        dict_indicators['BBANDS_upper'], dict_indicators['BBANDS_middle'], dict_indicators['BBANDS_lower'] = source.BBANDS(close, timeperiod)
-        dict_indicators['DEMA'] = source.DEMA(close, timeperiod)
-        dict_indicators['EMA'] = source.EMA(close, timeperiod)
-        dict_indicators['HT_TRENDLINE'] = source.HT_TRENDLINE(close)
+        #TODOSB: if %B and BandWidth are highly correlated with volatility features consider reducing redundancy before PCA
+
+        upper, middle, lower = source.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2)
+        dict_indicators['%B'] = (close - lower) / (upper - lower) # %B: position of price within bands
+        dict_indicators['BandWidth']= (upper - lower) / middle # BandWidth: relative band width normalized by middle band
+        #dict_indicators['DEMA'] = source.DEMA(close, timeperiod) #redundant moving average
+        dict_indicators['EMA'] = source.EMA(close, timeperiod) #TODOSB: do not keep a single one
+        #dict_indicators['HT_TRENDLINE'] = source.HT_TRENDLINE(close) #redundant moving average
         dict_indicators['KAMA'] = source.KAMA(close, timeperiod)
-        dict_indicators['MA'] = source.MA(close, timeperiod)
-        dict_indicators['MAMA'], dict_indicators['FAMA'] = source.MAMA(close)
-        dict_indicators['MIDPOINT'] = source.MIDPOINT(close, timeperiod)
-        dict_indicators['MIDPRICE'] = source.MIDPRICE(high, low, timeperiod)
+        #dict_indicators['MA'] = source.MA(close, timeperiod) #generic moving average, SMA standard, redundant
+        #dict_indicators['MAMA'], dict_indicators['FAMA'] = source.MAMA(close) #redundant moving average
+        #dict_indicators['MIDPOINT'] = source.MIDPOINT(close, timeperiod) #Redundant with SMA or EMA
+        #dict_indicators['MIDPRICE'] = source.MIDPRICE(high, low, timeperiod) #Redundant with other volatility features
         dict_indicators['SAR'] = source.SAR(high, low)
-        dict_indicators['SAREXT'] = source.SAREXT(high, low)
-        dict_indicators['SMA'] = source.SMA(close, timeperiod)
-        dict_indicators['T3'] = source.T3(close, timeperiod)
+        #dict_indicators['SAREXT'] = source.SAREXT(high, low) #Overly complex; adds no clear gain over standard SAR
+        #dict_indicators['SMA'] = source.SMA(close, timeperiod) #redundant moving average
+        #dict_indicators['T3'] = source.T3(close, timeperiod) #redundant moving average
         dict_indicators['TEMA'] = source.TEMA(close, timeperiod)
-        dict_indicators['TRIMA'] = source.TRIMA(close, timeperiod)
-        dict_indicators['WMA'] = source.WMA(close, timeperiod)      
+        #dict_indicators['TRIMA'] = source.TRIMA(close, timeperiod) #redundant moving average
+        #dict_indicators['WMA'] = source.WMA(close, timeperiod) #redundant moving average 
 
         #Momentum Indicators
-        dict_indicators['AD'] = source.ADX(high, low, close, volume)
-        dict_indicators['ADXR'] = source.ADXR(high, low, close, timeperiod)
+        dict_indicators['ADX'] = source.ADX(high, low, close,timeperiod)
+        #dict_indicators['ADXR'] = source.ADXR(high, low, close, timeperiod) # redundant with ADX
         dict_indicators['APO'] = source.APO(close, fastperiod=12, slowperiod=26, matype=0)
-        dict_indicators['AROON_down'], dict_indicators['AROON_up'] = source.AROON(high, low, timeperiod)
-        dict_indicators['AROONOSC'] = source.AROONOSC(high, low, timeperiod)
+        #dict_indicators['AROON_down'], dict_indicators['AROON_up'] = source.AROON(high, low, timeperiod) # AROONOSC = Aroon Up − Aroon Down.
+        dict_indicators['AROONOSC'] = source.AROONOSC(high, low, timeperiod) #compact AROON
         dict_indicators['BOP'] = source.BOP(open, high, low, close)
         dict_indicators['CCI'] = source.CCI(high, low, close, timeperiod)
         dict_indicators['CMO'] = source.CMO(close, timeperiod)
-        dict_indicators['DX'] = source.DX(high, low, close, timeperiod)
+        #dict_indicators['DX'] = source.DX(high, low, close, timeperiod) #redundant with ADX
         dict_indicators['MACD'], dict_indicators['MACD_signal'], dict_indicators['MACD_hist'] = source.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-        dict_indicators['MACDEXT'], dict_indicators['MACDEXT_signal'], dict_indicators['MACDEXT_hist'] = source.MACDEXT(close, fastperiod=12, fastmatype=0, slowperiod=26, slowmatype=0, signalperiod=9, signalmatype=0)
-        dict_indicators['MACFIX'], dict_indicators['MACFIX_signal'], dict_indicators['MACFIX_hist'] = source.MACDFIX(close, signalperiod=9)
+        #dict_indicators['MACDEXT'], dict_indicators['MACDEXT_signal'], dict_indicators['MACDEXT_hist'] = source.MACDEXT(close, fastperiod=12, fastmatype=0, slowperiod=26, slowmatype=0, signalperiod=9, signalmatype=0) #redundant with MACD
+        #dict_indicators['MACFIX'], dict_indicators['MACFIX_signal'], dict_indicators['MACFIX_hist'] = source.MACDFIX(close, signalperiod=9) #redundant with MACD
         dict_indicators['MFI'] = source.MFI(high, low, close, volume, timeperiod)
-        dict_indicators['MINUS_DI'] = source.MINUS_DI(high, low, close, timeperiod)
-        dict_indicators['MINUS_DM'] = source.MINUS_DM(high, low, timeperiod)
+        #dict_indicators['MINUS_DI'] = source.MINUS_DI(high, low, close, timeperiod) #redundant with ADX
+        #dict_indicators['MINUS_DM'] = source.MINUS_DM(high, low, timeperiod) #redundant with ADX
         dict_indicators['MOM'] = source.MOM(close, timeperiod)
-        dict_indicators['PLUS_DI'] = source.PLUS_DI(high, low, close, timeperiod)
-        dict_indicators['PLUS_DM'] = source.PLUS_DM(high, low, timeperiod)
-        dict_indicators['PPO'] = source.PPO(close, fastperiod=12, slowperiod=26, matype=0)
+        #dict_indicators['PLUS_DI'] = source.PLUS_DI(high, low, close, timeperiod) #redundant with ADX
+        #dict_indicators['PLUS_DM'] = source.PLUS_DM(high, low, timeperiod) #redundant with ADX
+        #dict_indicators['PPO'] = source.PPO(close, fastperiod=12, slowperiod=26, matype=0) redundant with APO, MACD
         dict_indicators['ROC'] = source.ROC(close, timeperiod)
-        dict_indicators['ROCP'] = source.ROCP(close, timeperiod)
-        dict_indicators['ROCR'] = source.ROCR(close, timeperiod)
-        dict_indicators['ROCR100'] = source.ROCR100(close, timeperiod)
+        #dict_indicators['ROCP'] = source.ROCP(close, timeperiod) #redundant with ROC 
+        #dict_indicators['ROCR'] = source.ROCR(close, timeperiod) #redundant with ROC 
+        #dict_indicators['ROCR100'] = source.ROCR100(close, timeperiod) #redundant with ROC
         dict_indicators['RSI'] = source.RSI(close, timeperiod)
         dict_indicators['STOCH_slowk'], dict_indicators['STOCH_slowd'] = source.STOCH(high, low, close, fastk_period=5, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0)
-        dict_indicators['STOCHF_fastk'], dict_indicators['STOCHF_fastd'] = source.STOCHF(high, low, close, fastk_period=5, fastd_period=3, fastd_matype=0)
-        dict_indicators['STOCHRSI_fastk'], dict_indicators['STOCHRSI_fastd'] = source.STOCHRSI(close, timeperiod, fastk_period=5, fastd_period=3, fastd_matype=0)
+        #dict_indicators['STOCHF_fastk'], dict_indicators['STOCHF_fastd'] = source.STOCHF(high, low, close, fastk_period=5, fastd_period=3, fastd_matype=0) #redundant with STOCH
+        #dict_indicators['STOCHRSI_fastk'], dict_indicators['STOCHRSI_fastd'] = source.STOCHRSI(close, timeperiod, fastk_period=5, fastd_period=3, fastd_matype=0) #redundant with RSI and STOCH
         dict_indicators['TRIX'] = source.TRIX(close, timeperiod)    
-        dict_indicators['ULTOSC'] = source.ULTOSC(high, low, close, timeperiod1=7, timeperiod2=14, timeperiod3=28)
-        dict_indicators['WILLR'] = source.WILLR(high, low, close, timeperiod)
+        #dict_indicators['ULTOSC'] = source.ULTOSC(high, low, close, timeperiod1=7, timeperiod2=14, timeperiod3=28) #redundant with RSI and MFI
+        #dict_indicators['WILLR'] = source.WILLR(high, low, close, timeperiod) #redundant with RSI and STOCH
 
         #Volume Indicators
-        dict_indicators['AD'] = source.AD(high, low, close, volume)
-        dict_indicators['ADOSC'] = source.ADOSC(high, low, close, volume)
+        #dict_indicators['AD'] = source.AD(high, low, close, volume) #redundant with ADOSC
+        dict_indicators['ADOSC'] = source.ADOSC(high, low, close, volume) 
         dict_indicators['OBV'] = source.OBV(close, volume)
 
         #Volatility Indicators
         dict_indicators['ATR']   = source.ATR(high, low, close, timeperiod)
-        dict_indicators['NATR']  = source.NATR(high, low, close, timeperiod)
-        dict_indicators['TRANGE'] = source.TRANGE(high, low, close)
+        #dict_indicators['NATR']  = source.NATR(high, low, close, timeperiod) #redundant with ATR
+        #dict_indicators['TRANGE'] = source.TRANGE(high, low, close) #redundant with ATR
 
         #Price Transform Indicators
-        dict_indicators['AVGPRICE']  = source.AVGPRICE(open, high, low, close)
-        dict_indicators['MEDPRICE']  = source.MEDPRICE(high, low)
-        dict_indicators['TYPPRICE']  = source.TYPPRICE(high, low, close)
-        dict_indicators['WCLPRICE']  = source.WCLPRICE(high, low, close)
+        #dict_indicators['AVGPRICE']  = source.AVGPRICE(open, high, low, close) #very correlated with OHLCV
+        #dict_indicators['MEDPRICE']  = source.MEDPRICE(high, low) #very correlated with OHLCV
+        #dict_indicators['TYPPRICE']  = source.TYPPRICE(high, low, close) #very correlated with OHLCV
+        #dict_indicators['WCLPRICE']  = source.WCLPRICE(high, low, close) #very correlated with OHLCV
         #add more indicators
         
         for indicator_name, values in dict_indicators.items():
-            self.technical_indicators.append(indicator_name)
+            self.technical_indicators_list.append(indicator_name)
 
             if self.modality == "train":
                 out[indicator_name] = values
