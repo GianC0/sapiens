@@ -46,6 +46,7 @@ MODEL:
     # Training
     target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
     n_epochs:        2         # Epochs on train+valid after hp tuning and rolling initialization
+    valid_split:     0.3         # meaning 70/30 train/valid split of full training dataset.
     batch_size:      64          # Mini-batch size for AdamW                 
     training_mode: "sequential"  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) -> Stage-1 + Stage-2
     pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
@@ -53,8 +54,8 @@ MODEL:
     save_backups: false          # whether to save backups during walk-forward
 
     # Hyperparameter tuning settings
-    tune_hparams:    true        # Use Optuna Bayesian search.            
-    n_trials:        1           # Optuna trials for each run. Used only if tune_hparams is true
+    tune_hparams:    false        # Use Optuna Bayesian search.            
+    n_trials:        1          # Optuna trials for each run. Used only if tune_hparams is true
 
   # Default hyper-parameters defined by model are overwritten by this Optuna configuration
   HPARAMS:  # optuna_type: "categorical", low-high (assumed float), int_low-high, log_low-high
@@ -181,7 +182,6 @@ STRATEGY:
     # Objectives: sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown, total_return, annual_return, daily_vol
     tune_hparams: true
     n_trials: 1
-    valid_split : 0.3    # meaning 80/20 train/valid split of full training dataset. NOTE: used also for model split
     objectives:          # use only nautilus_trader portfolio_analyzer statistics
       sharpe_ratio: maximize
       #total_return: maximize
@@ -198,8 +198,8 @@ STRATEGY:
 
     # Trading friction costs
     costs:
-      fee_bps:    5            # One-way commission in basis-points of notional: 0.05% commission
-      prob_slippage: 0.2       # Simulates the probability of experiencing price slippage when executing market orders. When triggered, moves fill price one tick against your order direction
+      fee_bps:    0.5          # One-way commission in basis-points of notional (:100): 0.005% / share
+      prob_slippage: 0.0       # Simulates the probability of experiencing price slippage when executing market orders. If triggered, the order fill price has prob_slippage chances to be filled at next tick (for all market levels data L1/L2/L3) 
       prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
 
     # Order execution algorithm

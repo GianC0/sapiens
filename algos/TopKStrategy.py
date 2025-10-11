@@ -144,7 +144,7 @@ class TopKStrategy(Strategy):
         self.model: Optional[MarketModel] = None
         self.model_name = self.model_params["model_name"]
         self.bar_spec = freq2barspec( self.strategy_params["freq"])
-        self.min_bars_required = self.model_params["window_len"] + 1
+        self.min_bars_required = self.model_params["window_len"]
         self.optimizer_lookback = freq2pdoffset( self.strategy_params["optimizer_lookback"])
         
         
@@ -282,8 +282,29 @@ class TopKStrategy(Strategy):
         return
     
     # Used
+    #def on_dispose(self) -> None:
+    #    self.order_manager.liquidate_all(self.universe)
+    #    return
+
     def on_dispose(self) -> None:
-        self.order_manager.liquidate_all(self.universe)
+        """Ensure all positions are closed at end of backtest for accurate P&L."""
+        logger.info("Strategy disposal: liquidating all positions for final P&L calculation")
+        
+        # Force close all open positions at current market prices
+        for position in self.cache.positions_open(venue=self.venue):
+            instrument_id = position.instrument_id
+            symbol = instrument_id.symbol.value
+            
+            logger.info(f"Final liquidation: closing {symbol} position of {position.signed_qty}")
+            self.order_manager.close_position(position)
+        
+        # Cancel any pending orders
+        self.order_manager.cancel_all_orders()
+        
+        # Log final NAV for verification
+        final_nav = self._calculate_portfolio_nav()
+        logger.info(f"Final NAV at disposal: {final_nav:.2f}")
+        
         return
     
     def on_update(self, event: TimeEvent):
@@ -295,14 +316,18 @@ class TopKStrategy(Strategy):
             logger.debug(f"Event time {event_time} not after last update {self._last_update_time}")
             return
 
-        now = pd.Timestamp(self.clock.utc_now(),)
+        now = pd.Timestamp(self.clock.utc_now()) #.tz_convert(self.calendar.tz)
+        freq = self.strategy_params["freq"]
+        #d_r = self.calendar.schedule(start_date=str(now - freq2pdoffset(freq)), end_date=str(now + freq2pdoffset(freq)))
         
         # check if "now" falls outside market trading hours
-        if not self.calendar.open_at_time(self.calendar.schedule(start_date=now.date(), end_date=now.date()), now):
+        schedule = self.calendar.schedule(start_date=str(now), end_date=str(now))
+        if schedule.empty:
+            logger.info(f"Non-trading day at {now}")
             return
 
         # Skip if no update needed
-        if self._last_update_time and now < (self._last_update_time + freq2pdoffset(self.strategy_params["freq"])):
+        if self._last_update_time and now < (self._last_update_time + freq2pdoffset(freq)):
             logger.warning("Update called too soon, skipping")
             return
         
@@ -317,7 +342,7 @@ class TopKStrategy(Strategy):
         
         assert self.model.is_initialized
 
-        data_dict = self._cache_to_dict(window=(self.min_bars_required)) # TODO: make it more generic for all models.
+        data_dict = self._cache_to_dict(window=(self.min_bars_required))
 
         if not data_dict:
             logger.warning("DATA DICTIONARY EMPTY WITHIN STRATEGY UPDATE() CALL")
@@ -338,6 +363,7 @@ class TopKStrategy(Strategy):
         preds = self.model.predict(data=data_dict, indexes = self.min_bars_required, active_mask=self.active_mask) #  preds: Dict[str, float]
 
         assert preds is not None, "Model predictions are empty"
+        assert len(preds) > 0
 
         # Compute new portfolio target weights for predicted instruments.
         weights = self._compute_target_weights(preds)
@@ -354,11 +380,7 @@ class TopKStrategy(Strategy):
         # update last updated time
         self._last_update_time = now
         return 
-        # the logic should be the following:
-        # new prediction up until re-optimize portfolio
-        # update prediction for the next pred_len = now + holdout - holdout_start
-        # checks for stocks events (new or delisted) and retrain_offset and if nothing happens directly calls predict() method of the model (which should happen only if holdout period in bars is passed (otherwise do not do anything), and this variable is in the config.yaml); if retrain delta is passed without stocks event, it calls update() which runs a warm start fit() on the new training window and then the strategy calls predict(); if stock event happens then the strategy calls update() and then predict(). update() should manage the following: if delisting then just use the model active mask to cut off those stocks (so that future preds and training loss are not computed for these. the model is ready to predict after that) but if new stocks are added it checks for universe availability and enough history in the Cache for those new stocks and then calls an initialization. ensure that the most up to date mask is always set by update (or by initialize only at the start) so that the other functions use always the most up to date mask.
-        # Update training windows for walk-forward
+
     def on_retrain(self, event: TimeEvent):
         """Periodic model retraining."""
         if event.name != "retrain_timer":
@@ -381,7 +403,7 @@ class TopKStrategy(Strategy):
         # ADAPTIVE WINDOW: Ensure minimum training size
         # ═══════════════════════════════════════════════════════════════════
         # ensures case at t=0 where len(timestamps) for new bars < min_bars_required 
-        rolling_window_size = max(len(timestamps), self.min_bars_required)
+        rolling_window_size = max(len(timestamps), self.min_bars_required + self.pred_len)
         
         # Log when falling back to minimum (includes overlap with previous training)
         if rolling_window_size > self.min_bars_required:
@@ -391,9 +413,11 @@ class TopKStrategy(Strategy):
                 f"[on_retrain] Using rolling window of {rolling_window_size} bars (sufficient for training).")
         
         # Get updated data window
-        data_dict = self._cache_to_dict(window= (rolling_window_size))  # Get all latest
+        data_dict = self._cache_to_dict(window = (rolling_window_size))  # Get all latest
         if not data_dict:
             return
+        # all assets have same number of bars is ensured by get_data()
+        total_bars = len(next(iter(data_dict.values())))
         
         # Update active mask
         self.active_mask = self._compute_active_mask(data_dict)
@@ -404,6 +428,7 @@ class TopKStrategy(Strategy):
             current_time=now,
             retrain_start_date = self._last_retrain_time,
             active_mask=self.active_mask,
+            total_bars = total_bars,
             warm_start=self.strategy_params["warm_start"],
             warm_training_epochs=self.strategy_params["warm_training_epochs"],
         )
@@ -606,9 +631,7 @@ class TopKStrategy(Strategy):
             
             # Check 2: Active at walk-forward start
             # Check if we have data extending pred_len periods beyond valid_end
-            freq_offset = freq2pdoffset(self.strategy_params["freq"])
-            required_end = self.valid_end + (freq_offset * self.pred_len)
-            pred_window = df[(df.index > self.valid_end) & (df.index <= required_end)]
+            pred_window = df[(df.index > self.valid_end)]
             
             if pred_window.empty:
                 logger.info(f"Skipping {ticker}: not active at walk-forward start")
@@ -640,11 +663,15 @@ class TopKStrategy(Strategy):
         else:
             logger.error(f"Model {self.model_name} not found in {self.model_params["model_dir"]}.")
 
-            raise Exception("Model Not Initialized")
             
-            #model = ModelClass(**self.model_params)
-            #train_data = self._get_data(start = self.train_start , end = self.train_end)
-            #model.initialize(train_data)
+            
+            model = ModelClass(**self.model_params)
+            train_data = self.loader.get_data(calendar = self.model_params["calendar"] , frequency = self.model_params["freq"], start = self.train_start , end = self.train_end)
+            # all assets have same number of bars is ensured by get_data()
+            total_bars = len(next(iter(train_data.values())))
+            model.initialize(data = train_data, total_bars = total_bars)
+
+            raise Exception("Model Not Initialized")
             
 
         return model
@@ -774,13 +801,13 @@ class TopKStrategy(Strategy):
             return None
         
         df = self.loader._benchmark_data
-        
-        # Calculate start date for lookback window
         lookback_start = timestamp - self.optimizer_lookback
-
-        # Get data in lookback window
-        volatility = df.loc[(df.index >= lookback_start) & (df.index <= timestamp), "Benchmark"].std()
-
+        
+        # Use iloc with index searching for robust timestamp matching
+        start_idx = df.index.searchsorted(lookback_start, side='left')
+        end_idx = df.index.searchsorted(timestamp, side='right')
+        
+        volatility = df.iloc[start_idx:end_idx]["Benchmark"].std()
         return volatility
 
     def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
@@ -842,8 +869,8 @@ class TopKStrategy(Strategy):
             # Risk-free rate is the only one who can take up to 100% of portfolio
             if symbol == risk_free_ticker:
                 # Risk-free allocation should account for commissions
-                max_weight = 1 -  ( 2 * self.commission_rate )   # Reserve for round-trip
-                allowed_weight_ranges.append([0, max_weight])
+                #max_weight = 1 -  ( 2 * self.commission_rate )   # Reserve for round-trip
+                allowed_weight_ranges.append([0, 1.0])
                 continue
 
             # ADV constraints
@@ -873,11 +900,10 @@ class TopKStrategy(Strategy):
         cov_horizon = cov_per_period * float(self.pred_len)  # scale to pred_len horizon
 
         # prepare expected returns
-        valid_mu = np.array([preds.get(s, 0.0) for s in valid_symbols])
+        valid_expected_returns = np.array([preds.get(s, 0.0) for s in valid_symbols])
 
         # If all expected returns <= rf_horizon then allocate to risk-free ticker (if available)
-        # TODO: this has to be ensured it's worth with commissions
-        if np.all(valid_mu <= current_rf):
+        if np.all(valid_expected_returns <= current_rf):
             w_series = pd.Series(0.0, index=self.universe)
             if risk_free_ticker in self.universe:
                 w_series[risk_free_ticker] = 1 - ( 2 * self.commission_rate) # Reserve for round-trip
@@ -887,41 +913,34 @@ class TopKStrategy(Strategy):
 
         # Call optimizer with horizon-scaled cov and risk-free rf
         w_opt = self.optimizer.optimize(
-            mu=valid_mu,
-            cov=cov_horizon,
+            er=pd.Series(valid_expected_returns, index=valid_symbols),
+            cov=pd.DataFrame(cov_horizon, index=valid_symbols, columns=valid_symbols),
             rf=current_rf,
             benchmark_vol=self._get_benchmark_volatility(now),
             allowed_weight_ranges=np.array(allowed_weight_ranges),
             current_weights = np.array(current_weights),
             selector_k = self.selector_k,
             target_volatility = self.target_volatility,
+            commission_rate = 0.0,  # commission_rate is enforced afterwards. optimizer fails beacuse: DEFAULT  sum(w) = 1 AND constraint sum(w) ≤ 1 - commissions
         )
 
-        if len(w_opt) != len(valid_symbols):
-            logger.warning("Optimizer returned unexpected vector length. Falling back to equal weights.")
-            w_opt = np.ones(len(valid_symbols)) / len(valid_symbols)
 
-        # Take top-K by absolute weight
 
-        final_arr = np.zeros_like(w_opt)
-
-        for i, val in enumerate(w_opt):
-            # clip to allowed range
-            w_min, w_max = allowed_weight_ranges[i]
-            final_arr[i] = float(np.clip(val, w_min, w_max))
+        # Clipping (if optimizer constraints failed) and log if clipping occurred
+        final_arr = np.clip(w_opt, np.array(allowed_weight_ranges)[:, 0], np.array(allowed_weight_ranges)[:, 1])  # max bounds
 
         # Ensure total absolute exposure leaves room for commissions
         abs_final_sum = float(np.sum(np.abs(final_arr)))
-        if abs_final_sum > 1:
-            # Scale down to respect commission buffer
-            scale = 1 / abs_final_sum
+        max_deployment = 1.0 - (2 * self.commission_rate)
+        if abs_final_sum > max_deployment:
+            # Scale down to respect commission buffer (safe fallback)
+            scale = max_deployment / abs_final_sum
             final_arr = final_arr * scale
             logger.info(f"Scaled weights by {scale:.4f} to reserve cash for commissions")
 
-        # Map back to full universe
+        # Map to universe
         w_series = pd.Series(0.0, index=self.universe)
-        for i, symbol in enumerate(valid_symbols):
-            w_series[symbol] = final_arr[i]
+        w_series[valid_symbols] = final_arr  # Direct assignment using list indexing
 
         return w_series.to_dict()
 
@@ -973,27 +992,6 @@ class TopKStrategy(Strategy):
             return True
 
         return False
-    
-    def _get_data(self, start, end) -> Dict[str, pd.DataFrame]:
-        # Create data dictionary for selected stocks
-        calendar = market_calendars.get_calendar(self.model_params["calendar"])
-        days_range = calendar.schedule(start_date=start, end_date=end)
-        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"])
-
-        # init train+valid data
-        data = {}
-        for ticker in self.loader.universe:
-            if ticker in self.loader._frames:
-                df = self.loader._frames[ticker]
-                # Get data up to validation end for initial training
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize('UTC')
-                elif df.index.tz != timestamps.tz:
-                    df.index = df.index.tz_convert(timestamps.tz)
-
-                #logger.info(f"  {ticker}: {len(data[ticker])} bars")
-                data[ticker] = df.reindex(timestamps).dropna()
-        return data
     
     def _calculate_portfolio_nav(self) -> float:
         """Calculate total portfolio value: cash + market value of all positions."""

@@ -14,13 +14,13 @@ from fastapi import params
 from matplotlib.pyplot import bar
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, ImportableExecAlgorithmConfig, LoggingConfig
+from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, ImportableExecAlgorithmConfig, LoggingConfig, ImportableFeeModelConfig, ImportableFillModelConfig
 from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.backtest.models import FillModel
+from nautilus_trader.backtest.models import FillModel, MakerTakerFeeModel
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.backtest.node import BacktestEngineConfig
 #from nautilus_trader.common.component import RiskEngine   to fix
-from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig
+from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig, MakerTakerFeeModelConfig, FillModelConfig
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm, TWAPExecAlgorithmConfig
 from nautilus_trader.backtest.node import BacktestNode
@@ -249,7 +249,7 @@ class OptunaHparamsTuner:
                 
                 start = model_params_flat["train_start"]
                 end = model_params_flat["valid_end"]
-                data_dict = self._get_data(start=start, end=end)
+                data_dict = self.loader.get_data(calendar = self.model_params["calendar"] , frequency = self.model_params["freq"],start=start, end=end)
                 
                 # --- Build trial-specific augmentor ---
                 # Extract data-related hyperparams from trial_hparams
@@ -263,7 +263,6 @@ class OptunaHparamsTuner:
                 
                 augmentor = DataAugmentor(augmentation_config=trial_data_config, augment_modality="train")
 
-                data_dict = self._get_data(start=start, end=end)
                 data_dict = augmentor.augment(data_dict)
 
                 print(data_dict)
@@ -288,8 +287,12 @@ class OptunaHparamsTuner:
                     # Initialize and train model TODO: ensure train data has validation set as well
                     # leave this order to make train_offset be overwritten by flat params type
                     model = ModelClass(**(trial_hparams | model_params_flat) )
+                    
+                    # all assets have same number of bars is ensured by get_data()
+                    total_bars = len(next(iter(data_dict.values())))
+
                     # Validation is run automatically if valid_end is set
-                    score = model.initialize(data_dict)
+                    score = model.initialize(data = data_dict, total_bars = total_bars)
                     
                     # Log results
                     epochs_metrics = model._epoch_logs
@@ -315,9 +318,9 @@ class OptunaHparamsTuner:
 
             # Handle case without optimization
             n_trials = self.model_params.get("n_trials",1)
-            if self.model_params["tune_hparams"] is False or n_trials < 1:
-                n_trials = 1
-            study.optimize(model_objective, n_trials=n_trials)
+            if self.model_params["tune_hparams"] is True and n_trials >= 1:
+                study.optimize(model_objective, n_trials=n_trials)
+            
             
             # Get best trial
             best_trial = study.best_trial
@@ -678,7 +681,7 @@ class OptunaHparamsTuner:
         backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC").normalize()
         backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC").normalize()
         train_offset = freq2pdoffset(offset)
-        valid_split =  self.strategy_params["valid_split"]
+        valid_split =  self.model_params["valid_split"]
 
         
         calendar = market_calendars.get_calendar(self.model_params["calendar"])
@@ -728,27 +731,6 @@ class OptunaHparamsTuner:
 
         return cfg
     
-    def _get_data(self, start, end) -> Dict[str, pd.DataFrame]:
-
-        # Create data dictionary for selected stocks
-        calendar = market_calendars.get_calendar(self.model_params["calendar"])
-        days_range = calendar.schedule(start_date=start, end_date=end)
-        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"])
-
-        # init train+valid data
-        data = {}
-        for ticker in self.loader.universe:
-            if ticker in self.loader._frames:
-                df = self.loader._frames[ticker]
-                # Ensure timezone compatibility
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize('UTC')
-                elif df.index.tz != timestamps.tz:
-                    df.index = df.index.tz_convert(timestamps.tz)
-                # re-indexing breaks different time-zones
-                #data[ticker] = df.reindex(timestamps).dropna()
-                data[ticker] = df
-        return data
     
     def _produce_backtest_config(self, backtest_cfg, start, end) -> BacktestRunConfig:
 
@@ -762,7 +744,22 @@ class OptunaHparamsTuner:
                 base_currency=backtest_cfg["STRATEGY"]["currency"],
                 starting_balances=[str(backtest_cfg["STRATEGY"]["initial_cash"])+" "+str(backtest_cfg["STRATEGY"]["currency"])],
                 bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices,
-                
+                fill_model=ImportableFillModelConfig(
+                        fill_model_path = "nautilus_trader.backtest.models:FillModel",
+                        config_path = "nautilus_trader.backtest.config:FillModelConfig",
+                        config = {
+                            "prob_fill_on_limit" : backtest_cfg["STRATEGY"]["costs"]["prob_fill_on_limit"],
+                            "prob_slippage" : backtest_cfg["STRATEGY"]["costs"]["prob_slippage"],
+                            "random_seed" : self.seed,
+                            },
+
+                ),
+                fee_model=ImportableFeeModelConfig(
+                    fee_model_path = "nautilus_trader.backtest.models:MakerTakerFeeModel",
+                    config_path = "nautilus_trader.backtest.config:MakerTakerFeeModelConfig",
+                    config = {},
+                ),
+                # TODO: implement fee model
             ),
         ]
         bar_spec = freq2barspec(backtest_cfg["STRATEGY"]["freq"])
@@ -815,11 +812,7 @@ class OptunaHparamsTuner:
                         ),
                     logging=LoggingConfig(log_level="INFO"),
                     # TODO: fix fill model issue
-                    #fill_model=FillModel(
-                    #    prob_fill_on_limit=backtest_cfg["STRATEGY"].get("costs", {}).get("prob_fill_on_limit", 0.2),
-                    #    prob_slippage=backtest_cfg["STRATEGY"].get("costs", {}).get("prob_slippage", 0.2),
-                    #    random_seed=self.seed,
-                    #    ),
+
                     ),
                 data=data_configs,
                 venues=venue_configs,

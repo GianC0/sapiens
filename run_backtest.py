@@ -45,7 +45,7 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(f'{run_dir}/backtest.log', encoding='utf-8'),
-            logging.StreamHandler()  # This adds console output
+            #logging.StreamHandler()  # This adds console output
         ]
     )
     logger = logging.getLogger(__name__)

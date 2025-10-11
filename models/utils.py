@@ -168,7 +168,7 @@ class SlidingWindowDataset(Dataset):
         self.pred = pred_len
         self.target_idx = target_idx
         self.with_target = with_target
-        self.n_windows = max(0, self.panel.size(0) - self.L - (self.pred if with_target else 0))
+        self.n_windows = max(0, 1 + self.panel.size(0) - self.L - (self.pred if with_target else 0))
 
     def __len__(self):
         return self.n_windows
@@ -189,96 +189,18 @@ class SlidingWindowDataset(Dataset):
             ret = (tgt_close[-1] - tgt_close[0]) / (tgt_close[0] + 1e-8)  # (I,)
         return prices, seq, ret, active_mask
 
-
-def build_input_tensor( 
-    data: Dict[str, pd.DataFrame],
-    timestamps: pd.DatetimeIndex,
-    feature_dim: int,
-    split_valid_timestamp: pd.Timestamp,
-    device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.BoolTensor, pd.DatetimeIndex]:
-    """
-    Efficiently build aligned tensor from dict of DataFrames.
-    
-    Args:
-        data: Dict mapping ticker to DataFrame with features
-        timestamps: DatetimeIndex of all timestamps
-        universe: List of tickers to include (in order)
-        feature_dim: Number of features per instrument (e.g. 5 for OHLCV)
-        split_valid_timestamp: Timestamp to split training and validation data
-        
-    Returns 
-        tuple for training and validation:
-        - tensor: (T, I, F) tensor with NaN for missing data
-        - mask: (I,) boolean mask for last timestamp only (True = active)
-        
-        
-    Raises:
-        ValueError: If universe is empty or all timestamps are NaN
-    """
-    
-    universe = list(data.keys())
-
-    if not universe:
-        raise ValueError("Universe cannot be empty")
-    
-    # Pre-allocate array for efficiency
-    F = feature_dim
-    T = len(timestamps)
-    I = len(universe)
-    
-    # Use float32 to save memory (matches PyTorch default)
-    tensor_array = torch.full((T, I, F), float('nan'), dtype=torch.float32, device=device)
-    
-    # Fill in data for each instrument
-    for i, ticker in enumerate(universe):
-        assert data[ticker].shape == (T,F)  #not correct during last batch.
-        # Copy values into pre-allocated array
-        tensor_array[:, i, :] = torch.tensor(data[ticker].values, dtype=torch.float32, device=device)
-    
-    # Validate that we have at least some data
-    if torch.isnan(tensor_array).all():
-        raise ValueError("All data is NaN - no valid observations")
-    
-    # Check for completely empty timestamps
-    empty_timestamps = torch.isnan(tensor_array).all(dim=2).all(dim=1)  # (T,)
-    if torch.any(empty_timestamps):
-        n_empty = torch.sum(empty_timestamps)
-        raise ValueError(
-            f"Found {n_empty} completely empty timestamps. "
-        )
-    
-    
-    # move to torch tensor
-    train_idx = torch.as_tensor(timestamps <= split_valid_timestamp, dtype=torch.bool, device=device)
-
-    # Instrument is active if it has ALL non-NaN value at last timestamp
-    # train tensor and mask
-    train_tensor = tensor_array[train_idx]  # (T_train, I, F)
-    train_mask = ~torch.all(torch.isnan(train_tensor[-1, :, :]), dim=1)  # (I,)
-    
-    # valid tensor and mask
-    valid_tensor = torch.tensor(0)
-    valid_mask = torch.tensor(0)
-    # Create train/valid split. if train_end == valid_end -> this is an update() call, or no validation 
-    if split_valid_timestamp < timestamps[-1]:
-        valid_tensor = tensor_array[~train_idx]  # (T - T_train, I, F)
-        valid_mask = ~torch.all(torch.isnan(valid_tensor[-1, :, :]), dim=1)  # (I,)
-
-    return (train_tensor, train_mask), (valid_tensor, valid_mask)
-
-def build_pred_tensor(    
+def build_tensor(    
     data: Dict[str, pd.DataFrame],
     indexes: int,
     feature_dim: int,
     device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.BoolTensor, pd.DatetimeIndex]:
+    ) -> Tuple[torch.Tensor, torch.BoolTensor]:
     """
-    Efficiently build aligned tensor from dict of DataFrames.
+    Efficiently build aligned tensor from dict of DataFrames by bar count only.
     
     Args:
         data: Dict mapping ticker to DataFrame with features
-        indexes: n of rows for each instrument.
+        indexes: n of rows common to all instruments.
         universe: List of tickers to include (in order)
         feature_dim: Number of features per instrument (e.g. 5 for OHLCV)
         split_valid_timestamp: Timestamp to split training and validation data
@@ -299,19 +221,13 @@ def build_pred_tensor(
     if not universe:
         raise ValueError("Universe cannot be empty")
     
-    # Pre-allocate array for efficiency
-    F = feature_dim
-    T = indexes
-    I = len(universe)
-    
-    # Use float32 to save memory (matches PyTorch default)
-    tensor_array = torch.full((T, I, F), float('nan'), dtype=torch.float32, device=device)
+    # Pre-allocate array for efficiency : use float32 to save memory (matches PyTorch default)
+    F, T, I = feature_dim, indexes, len(universe)
+    tensor_array = torch.full((T, I, F), float('nan'), dtype=torch.float32, device=device)   # (T, I, F)
     
     # Fill in data for each instrument
     for i, ticker in enumerate(universe):
-        # Reindex to common timestamps (automatically fills NaN for missing)
         assert data[ticker].shape == (T,F), f"ticker dataframe size mismatch. Expected ({T},{F}), got {data[ticker].shape}"
-        # Copy values into pre-allocated array
         tensor_array[:, i, :] = torch.tensor(data[ticker].values, dtype=torch.float32, device=device)
     
     # Validate that we have at least some data
@@ -328,11 +244,9 @@ def build_pred_tensor(
     #    )
     
 
-    # train tensor and mask
-    pred_tensor = tensor_array  # (T, I, F)
     # Instrument is active if it has ALL non-NaN value at last timestamp
-    pred_mask = ~torch.all(torch.isnan(pred_tensor[-1, :, :]), dim=1)  # (I,)
-    return pred_tensor, pred_mask
+    active_mask = ~torch.all(torch.isnan(tensor_array[-1, :, :]), dim=1)  # (I,)
+    return tensor_array, active_mask
 
 def yaml_safe(obj):
     """Return a plain Python structure safe for yaml.dump by JSON round-tripping.
