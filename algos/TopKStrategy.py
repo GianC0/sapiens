@@ -182,7 +182,11 @@ class TopKStrategy(Strategy):
         self.twap_slices = self.strategy_params["execution"]["twap"]["slices"]
         self.twap_interval_secs = self.strategy_params["execution"]["twap"]["interval_secs"]
 
-        self.commission_rate = self.strategy_params['costs']['fee_bps'] / 100
+        #TODO: implement per-share fees (commission-based model)
+        # self.commission_rate = self.strategy_params['costs']['fee_bps'] / 10000
+        #self.fee_per_share = self.strategy_params['costs']['fee_per_share']
+        #self.min_commission = self.strategy_params['costs']['min_commission']
+        
         self.can_short = self.strategy_params["oms_type"] == "HEDGING"
 
         # Portfolio optimizer

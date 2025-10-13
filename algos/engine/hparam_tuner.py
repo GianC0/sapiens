@@ -18,16 +18,18 @@ from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.models import FillModel, MakerTakerFeeModel
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.backtest.node import BacktestEngineConfig
-#from nautilus_trader.common.component import RiskEngine   to fix
+#from nautilus_trader.common.component import RiskEngine   TODO: fix
 from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig, MakerTakerFeeModelConfig, FillModelConfig
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm, TWAPExecAlgorithmConfig
 from nautilus_trader.backtest.node import BacktestNode
-from pathlib import Path
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.model.objects import Price, Quantity, Money
 
 import pandas_market_calendars as market_calendars
 from math import exp
+from pathlib import Path
+from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Dict, Any, Optional, Tuple
 from unittest import loader
@@ -730,11 +732,14 @@ class OptunaHparamsTuner:
 
                 ),
                 fee_model=ImportableFeeModelConfig(
-                    fee_model_path = "nautilus_trader.backtest.models:MakerTakerFeeModel",
-                    config_path = "nautilus_trader.backtest.config:MakerTakerFeeModelConfig",
-                    config = {},
+                    fee_model_path = "algos.fees.QuantityBasedMinCommissionModel:QuantityBasedMinCommissionModel",
+                    config_path = "algos.fees.QuantityBasedMinCommissionModel:QuantityBasedMinCommissionModelConfig",
+                    config = {
+                                "commission_per_unit": Money(float(backtest_cfg["STRATEGY"]["costs"]["fee_per_share"]) , backtest_cfg["STRATEGY"]["currency"]),  
+                                "min_commission": Money( backtest_cfg["STRATEGY"]["costs"]["min_commission"] , backtest_cfg["STRATEGY"]["currency"]),
+                                "max_commission_pct": Decimal(backtest_cfg["STRATEGY"]["costs"]["max_commission_pct"])
+                    },
                 ),
-                # TODO: implement fee model
             ),
         ]
         bar_spec = freq2barspec(backtest_cfg["STRATEGY"]["freq"])

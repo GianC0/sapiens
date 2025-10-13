@@ -4,7 +4,9 @@ Nautilus Trader BacktestEngine and runs Strategies and Models hyper-parameter tu
 """
 from __future__ import annotations
 import argparse
+import code
 from pathlib import Path
+from sklearn.metrics import precision_recall_curve
 import yaml
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
@@ -16,6 +18,8 @@ import mlflow
 
 
 from nautilus_trader.model.currencies import USD,EUR
+from nautilus_trader.model.objects import Currency
+from nautilus_trader.core.nautilus_pyo3 import CurrencyType
 from models.utils import  yaml_safe
 from algos.engine.hparam_tuner import OptunaHparamsTuner
 
@@ -28,9 +32,9 @@ def main():
     # Setup some params type
     currency = cfg["STRATEGY"]["PARAMS"]["currency"]
     if currency == "USD":
-        cfg["STRATEGY"]["PARAMS"]["currency"] = USD
+        cfg["STRATEGY"]["PARAMS"]["currency"] = Currency(code='USD', precision=3, iso4217=840, name='United States dollar', currency_type = CurrencyType.FIAT ) #
     elif currency == "EUR":
-        cfg["STRATEGY"]["PARAMS"]["currency"] = EUR
+        cfg["STRATEGY"]["PARAMS"]["currency"] = Currency(code='EUR', precision=3, iso4217=978, name='Euro', currency_type=CurrencyType.FIAT)
 
     # Setup directories
     logs_dir = Path(cfg["STRATEGY"]["PARAMS"]["logs_dir"]).parent  # log_dir is parent directory of strategy
