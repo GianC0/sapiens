@@ -171,11 +171,15 @@ STRATEGY:
 
     # Trading friction costs
     costs:
-      fee_per_share: 0.005     # One-way commission 0.005% / share
-      min_commission: 1.0      # $1 minimum per order
-      max_commission_pct: 0.01 # max commission is 1% of trade value for that asset 
       prob_slippage: 0.0       # Simulates the probability of experiencing price slippage when executing market orders. If triggered, the order fill price has prob_slippage chances to be filled at next tick (for all market levels data L1/L2/L3) 
       prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
+
+    # Trading Commissions Model for fees
+    fee_model:                                       # Fee model defined in algos.fees
+      name: QuantityBasedMinMaxCommissionFeeModel    # Interactive Brokers
+      commission_per_unit: 0.005                           # One-way commission 0.005% / share
+      min_commission: 1.0                            # $1 minimum per order
+      max_commission_pct: 0.01                       # max commission is 1% of trade value for that asset 
 
     # Order execution algorithm
     execution:

@@ -1,17 +1,13 @@
 from decimal import Decimal
 from nautilus_trader.config import PositiveFloat
-from nautilus_trader.config import FeeModelConfig
+from nautilus_trader.backtest.config import FeeModelConfig
 from nautilus_trader.backtest.models import FeeModel
-from nautilus_trader.core.correctness import Condition
-from nautilus_trader.core.rust.model import LiquiditySide
-from nautilus_trader.model.book import OrderBook
-from nautilus_trader.model.functions import liquidity_side_to_str
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Price, Quantity, Money
 
-class QuantityBasedMinCommissionFeeModelConfig(FeeModelConfig):
+class QuantityBasedMinMaxCommissionFeeModelConfig(FeeModelConfig):
     """
-    Configuration for ``QuantityBasedMinCommissionFeeModel``.
+    Configuration for ``QuantityBasedMinMaxCommissionFeeModel``.
     
     Parameters
     ----------
@@ -27,7 +23,7 @@ class QuantityBasedMinCommissionFeeModelConfig(FeeModelConfig):
     min_commission: Money
     max_commission_pct: Decimal
 
-class QuantityBasedMinCommissionFeeModel(FeeModel):
+class QuantityBasedMinMaxCommissionFeeModel(FeeModel):
     """
     Provides a fee model which charges a commission per share/unit with a minimum commission.
     
@@ -42,7 +38,7 @@ class QuantityBasedMinCommissionFeeModel(FeeModel):
         The minimum commission amount per order.
     max_commission_pct : Decimal
         The maximum commission amount as % of trade value
-    config : QuantityBasedMinCommissionFeeModelConfig
+    config : QuantityBasedMinMaxCommissionFeeModelConfig
         The configuration for the model.
 
     Raises
@@ -55,11 +51,11 @@ class QuantityBasedMinCommissionFeeModel(FeeModel):
         If currencies of `commission_per_unit` and `min_commission` do not match.
     """
 
-    def __init__(self, commission_per_unit: Money, min_commission: Money, max_commission: Decimal) -> None:
+    def __init__(self, commission_per_unit: Money, min_commission: Money, max_commission_pct: Decimal) -> None:
         super().__init__()
         self._commission_per_unit = commission_per_unit
         self._min_commission = min_commission
-        self._max_commission = max_commission
+        self._max_commission = max_commission_pct
 
     def get_commission(
         self,

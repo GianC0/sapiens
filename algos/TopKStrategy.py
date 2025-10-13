@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+from csv import Error
 import importlib
 import math
 from typing import Any
@@ -32,6 +33,7 @@ from dataclasses import dataclass, field
 import logging
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.currencies import USD,EUR
+from nautilus_trader.model.objects import Price, Quantity, Money
 from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Logger
 from nautilus_trader.core.data import Data
 from nautilus_trader.trading.strategy import Strategy
@@ -44,6 +46,9 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.model.objects import Currency
+from nautilus_trader.backtest.models import FillModel, FeeModel
+from nautilus_trader.core.nautilus_pyo3 import CurrencyType
 from nautilus_trader.model.position import Position
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
@@ -83,12 +88,7 @@ class TopKStrategy(Strategy):
     def __init__(self, config: TopKStrategyConfig):  
         super().__init__()  
 
-        # quick & dirty: allow passing in either a plain dict or a StrategyConfig
-            #if isinstance(nautilus_cfg, dict):
-                # wrap dict into the expected StrategyConfig dataclass
-            #    nautilus_cfg = TopKStrategyConfig(config=nautilus_cfg)
-
-            # use the inner dict consistently
+        # use the inner dict consistently
         if hasattr(config, 'config') and config.config is not None:
             # It's a TopKStrategyConfig with a config attribute
             cfg = config.config
@@ -104,20 +104,23 @@ class TopKStrategy(Strategy):
             # Field descriptor or other unexpected type
             cfg = {}
 
+        # safe handling of variable
+        currency = cfg["STRATEGY"]["currency"]
+        if currency == "USD":
+            cfg["STRATEGY"]["currency"] = Currency(code='USD', precision=3, iso4217=840, name='United States dollar', currency_type = CurrencyType.FIAT ) #
+        elif currency == "EUR":
+            cfg["STRATEGY"]["currency"] = Currency(code='EUR', precision=3, iso4217=978, name='Euro', currency_type=CurrencyType.FIAT)
+        else: # currency is already in nautilus format
+            raise Error("Currency not implemented correctly") 
+
+        # create params dictionaries
         self.strategy_params = cfg["STRATEGY"]
         self.model_params = cfg["MODEL"]
-
-        # safe handling of variable
-        if self.strategy_params["currency"]  == "USD":
-            self.strategy_params["currency"]  = USD 
-        elif self.strategy_params["currency"]  == "EUR":
-            self.strategy_params["currency"]  = EUR
-        else: # currency is already in nautilus format
-            pass 
+        
         self.model_params["model_dir"] = Path(self.model_params["model_dir"])
 
         self.calendar = market_calendars.get_calendar(cfg["STRATEGY"]["calendar"])
-        
+
         # Core timing parameters
         self.train_start = pd.Timestamp(self.strategy_params["train_start"])
         self.train_end = pd.Timestamp(self.strategy_params["train_end"])
@@ -146,7 +149,9 @@ class TopKStrategy(Strategy):
         self.min_bars_required = self.model_params["window_len"]
         self.optimizer_lookback = freq2pdoffset( self.strategy_params["optimizer_lookback"])
         
-        
+        # Commissions Fee Model
+        self.fee_model = self._import_fee_model()
+
         # Loader for data access
         venue_name = self.strategy_params["venue_name"]
         self.venue = Venue(venue_name)
@@ -181,11 +186,6 @@ class TopKStrategy(Strategy):
         self.max_adv_pct = self.strategy_params["liquidity"]["max_adv_pct"]
         self.twap_slices = self.strategy_params["execution"]["twap"]["slices"]
         self.twap_interval_secs = self.strategy_params["execution"]["twap"]["interval_secs"]
-
-        #TODO: implement per-share fees (commission-based model)
-        # self.commission_rate = self.strategy_params['costs']['fee_bps'] / 10000
-        #self.fee_per_share = self.strategy_params['costs']['fee_per_share']
-        #self.min_commission = self.strategy_params['costs']['min_commission']
         
         self.can_short = self.strategy_params["oms_type"] == "HEDGING"
 
@@ -871,8 +871,7 @@ class TopKStrategy(Strategy):
             # compute allowed weight ranges
             # Risk-free rate is the only one who can take up to 100% of portfolio
             if symbol == risk_free_ticker:
-                # Risk-free allocation should account for commissions
-                #max_weight = 1 -  ( 2 * self.commission_rate )   # Reserve for round-trip
+                # Risk-free max allocation is 100%
                 allowed_weight_ranges.append([0, 1.0])
                 continue
 
@@ -880,9 +879,7 @@ class TopKStrategy(Strategy):
             volumes = [float(b.volume) for b in bars[-self.adv_lookback:]] if len(bars) >= self.adv_lookback else [float(b.volume) for b in bars]
             adv = float(np.mean(volumes)) if volumes else 0.0
             
-            # Adjust max weight for commission reserve
-            commission_adjusted_nav = self.nav * (1 - self.commission_rate * 2)  # Reserve for round-trip
-            max_w_relative = min((adv * self.max_adv_pct * current_price) / commission_adjusted_nav, self.max_w_abs) if commission_adjusted_nav > 0 else self.max_w_abs
+            max_w_relative = min((adv * self.max_adv_pct * current_price) / self.nav, self.max_w_abs)
 
             # compute min or min/max weight for instrument
             if self.can_short:
@@ -905,13 +902,10 @@ class TopKStrategy(Strategy):
         # prepare expected returns
         valid_expected_returns = np.array([preds.get(s, 0.0) for s in valid_symbols])
 
-        # If all expected returns <= rf_horizon then allocate to risk-free ticker (if available)
+        # If all expected returns <= rf_horizon then allocate to risk-free ticker (safe fall-back)
         if np.all(valid_expected_returns <= current_rf):
             w_series = pd.Series(0.0, index=self.universe)
-            if risk_free_ticker in self.universe:
-                w_series[risk_free_ticker] = 1 - ( 2 * self.commission_rate) # Reserve for round-trip
-                
-            logger.info(f"All assets underperform risk-free rate {current_rf:.4f}, allocating 100% to {risk_free_ticker}")
+            w_series[risk_free_ticker] = 1.0
             return w_series.to_dict()
 
         # Call optimizer with horizon-scaled cov and risk-free rf
@@ -924,26 +918,19 @@ class TopKStrategy(Strategy):
             current_weights = np.array(current_weights),
             selector_k = self.selector_k,
             target_volatility = self.target_volatility,
-            commission_rate = 0.0,  # commission_rate is enforced afterwards. optimizer fails beacuse: DEFAULT  sum(w) = 1 AND constraint sum(w) ≤ 1 - commissions
+            commission_rate = 0.0,  # commission_rate is enforced by order_manager.rebalance_portfolio(). optimizer would fails beacuse by DEFAULT  sum(w) = 1 AND constraint sum(w) ≤ 1 - commissions
         )
 
-
-
         # Clipping (if optimizer constraints failed) and log if clipping occurred
-        final_arr = np.clip(w_opt, np.array(allowed_weight_ranges)[:, 0], np.array(allowed_weight_ranges)[:, 1])  # max bounds
+        w_clipped = np.clip(w_opt, np.array(allowed_weight_ranges)[:, 0], np.array(allowed_weight_ranges)[:, 1])  # max bounds
 
-        # Ensure total absolute exposure leaves room for commissions
-        abs_final_sum = float(np.sum(np.abs(final_arr)))
-        max_deployment = 1.0 - (2 * self.commission_rate)
-        if abs_final_sum > max_deployment:
-            # Scale down to respect commission buffer (safe fallback)
-            scale = max_deployment / abs_final_sum
-            final_arr = final_arr * scale
-            logger.info(f"Scaled weights by {scale:.4f} to reserve cash for commissions")
+        # Account for commissions:
+        w_final = self._adjust_weights_for_commissions(symbols = valid_symbols, expected_returns_array = valid_expected_returns, weights_array = w_clipped, nav = self.nav)
 
         # Map to universe
         w_series = pd.Series(0.0, index=self.universe)
-        w_series[valid_symbols] = final_arr  # Direct assignment using list indexing
+        # TODO: double check if correct
+        w_series[valid_symbols] = w_final  # Direct assignment using list indexing
 
         return w_series.to_dict()
 
@@ -1040,3 +1027,118 @@ class TopKStrategy(Strategy):
         logger.info(f"NAV Calculation: Cash={cash_balance:.2f}, Positions={total_positions_value:.2f}, Total={nav:.2f}")
 
         return nav
+
+    def _import_fee_model(self) -> FeeModel:
+        try:
+            # Try to import from algos module
+            fee_module = importlib.import_module(f"algos.fees.{self.strategy_params["fee_model"]["name"]}")
+            FeeModelClass = getattr(fee_module, self.strategy_params["fee_model"]["name"], None)
+            
+            if FeeModelClass is None:
+                FeeModelClass = getattr(fee_module, "Strategy", None)
+            
+            if FeeModelClass is None:
+                raise ImportError(f"Could not find FeeModel class in algos.{self.strategy_params["fee_model"]["name"]}")
+            
+        except ImportError as e:
+            logger.error(f"Failed to import fee model {self.strategy_params["fee_model"]["name"]}: {e}")
+            raise
+
+        fee_model = FeeModelClass(**{k: v for k, v in self.strategy_params["fee_model"].items() if k != "name"})
+
+        return fee_model
+    
+    def _adjust_weights_for_commissions(
+        self, 
+        symbols: np.ndarray,
+        expected_returns_array: np.ndarray,
+        weights_array: np.ndarray,
+        nav: float
+    ) -> np.ndarray:
+        """
+        Adjust portfolio weights to ensure sufficient cash for commissions.
+        Scales down lowest-ranked positions to reserve commission costs.
+        
+        Args:
+            weights: Target weights from optimizer
+            universe: List of symbols
+            nav: Current portfolio NAV
+            
+        Returns:
+            Adjusted weights that account for commissions
+        """
+        if nav <= 0:
+            logger.error("Invalid NAV for commission adjustment")
+            return weights_array
+        
+        adjusted_weights = weights_array.copy()
+        
+        # Calculate total commissions needed for rebalancing
+        # TODO: ensure multi-currency support
+        total_commission_needed = Money(0.0, self.strategy_params["currency"])
+        trade_details = []
+        
+        for idx, symbol in enumerate(symbols):
+            target_weight = adjusted_weights[idx]
+            instrument_id = InstrumentId(Symbol(symbol), self.strategy.venue)
+            instrument = self.strategy.cache.instrument(instrument_id)
+            
+            # Get current and target quantities
+            current_qty = self._get_net_position_qty(instrument_id)
+            current_price = self._get_current_price(instrument_id)
+            
+            if current_price is None or current_price <= 0:
+                continue
+            
+            target_qty = (target_weight * nav) / current_price
+            trade_qty = target_qty - current_qty
+            
+            # safe upper bound for commissions
+            price = max(instrument.make_price(current_price), expected_returns_array[idx] )
+            commissions = self.strategy.fee_model.get_commission( Quantity_fill_qty = instrument.make_qty(trade_qty), Price_fill_px = price)
+            total_commission_needed += commissions
+            
+            trade_details.append({
+                'symbol': symbol,
+                'weight': target_weight,
+                'trade_qty': trade_qty,
+                'price': current_price,
+                'commission': commissions
+            })
+        
+        if total_commission_needed == 0:
+            return adjusted_weights
+        
+        # Calculate commission as percentage of NAV
+        commission_pct = float(total_commission_needed) / float(nav)
+
+        if commission_pct <= 0.0:
+            return adjusted_weights
+
+        # get indices sorted by absolute weight, ascending (smallest first)
+        order = np.argsort(np.abs(adjusted_weights))
+
+        remaining = commission_pct
+        for idx in order:
+            if remaining <= 0.0:
+                break
+
+            w = adjusted_weights[idx]
+            reduc = min(abs(w), remaining)
+
+            # preserve sign when reducing
+            if w > 0:
+                adjusted_weights[idx] = max(0.0, w - reduc)
+            else:
+                adjusted_weights[idx] = min(0.0, w + reduc)
+
+            remaining -= reduc
+            logger.info(
+                f"Scaled {symbols[idx]} weight: {w:.6f} -> {adjusted_weights[idx]:.6f} (freed {reduc:.6f})"
+            )
+
+        if remaining > 0.0:
+            logger.warning(f"Could not fully reserve commissions: {remaining*nav:.2f} shortfall")
+            return np.zeros(len(weights_array))
+
+        return adjusted_weights

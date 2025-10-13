@@ -8,6 +8,7 @@ from collections import defaultdict
 import numpy as np
 from datetime import datetime, timedelta
 from nautilus_trader.model import ExecAlgorithmId
+from nautilus_trader.model.objects import Price, Quantity, Money
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
@@ -138,11 +139,6 @@ class OrderManager:
         self.rejected_orders: Dict[str, List[Any]] = defaultdict(list)
         self.order_retries: Dict[str, int] = defaultdict(int)
 
-        # Commission parameters
-        self.fee_bps = config['costs']['fee_bps']  # basis points
-        self.commission_rate = self.strategy.commission_rate
-
-
         # Position tracking for order management
         self.target_positions: Dict[str, int] = {}
         self.current_positions: Dict[str, int] = {}
@@ -196,6 +192,7 @@ class OrderManager:
         if available_nav <= 0:
             logger.error(f"Insufficient NAV after commission reserve: {available_nav:.2f}")
             return
+        
         
         # Separate symbols into sells and buys
         sells = []

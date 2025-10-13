@@ -15,11 +15,11 @@ from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, ImportableExecAlgorithmConfig, LoggingConfig, ImportableFeeModelConfig, ImportableFillModelConfig
 from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.backtest.models import FillModel, MakerTakerFeeModel
+from nautilus_trader.backtest.models import FillModel, FeeModel
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.backtest.node import BacktestEngineConfig
 #from nautilus_trader.common.component import RiskEngine   TODO: fix
-from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig, MakerTakerFeeModelConfig, FillModelConfig
+from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm, TWAPExecAlgorithmConfig
 from nautilus_trader.backtest.node import BacktestNode
@@ -338,23 +338,22 @@ class OptunaHparamsTuner:
         if self.best_model_params_flat is None or self.best_model_path is None:
             raise ValueError("Must run optimize_model() before optimize_strategy()")
         
-        strategy_name = self.strategy_params.get('strategy_name', 'TopKStrategy')
-
-        try:
-            # Try to import from algos module
-            strategy_module = importlib.import_module(f"algos.{strategy_name}")
-            StrategyClass = getattr(strategy_module, strategy_name, None)
-            
-            if StrategyClass is None:
-                # Try without redundant naming (e.g., algos.TopKStrategy.Strategy)
-                StrategyClass = getattr(strategy_module, "Strategy", None)
-            
-            if StrategyClass is None:
-                raise ImportError(f"Could not find strategy class in algos.{strategy_name}")
-                
-        except ImportError as e:
-            logger.error(f"Failed to import strategy {strategy_name}: {e}")
-            raise
+        #strategy_name = self.strategy_params.get('strategy_name', 'TopKStrategy')
+        #try:
+        #    # Try to import from algos module
+        #    strategy_module = importlib.import_module(f"algos.{strategy_name}")
+        #    StrategyClass = getattr(strategy_module, strategy_name, None)
+        #    
+        #    if StrategyClass is None:
+        #        # Try without redundant naming (e.g., algos.TopKStrategy.Strategy)
+        #        StrategyClass = getattr(strategy_module, "Strategy", None)
+        #    
+        #    if StrategyClass is None:
+        #        raise ImportError(f"Could not find strategy class in algos.{strategy_name}")
+        #        
+        #except ImportError as e:
+        #    logger.error(f"Failed to import strategy {strategy_name}: {e}")
+        #    raise
 
         # Create MLflow experiment for strategy optimization
         with mlflow.start_run(
@@ -711,6 +710,7 @@ class OptunaHparamsTuner:
     
     def _produce_backtest_config(self, backtest_cfg, start, end) -> BacktestRunConfig:
 
+        fee_model = backtest_cfg["STRATEGY"]["fee_model"]["name"]
         # Initialize Venue configs
         venue_configs = [
             BacktestVenueConfig(
@@ -732,12 +732,12 @@ class OptunaHparamsTuner:
 
                 ),
                 fee_model=ImportableFeeModelConfig(
-                    fee_model_path = "algos.fees.QuantityBasedMinCommissionModel:QuantityBasedMinCommissionModel",
-                    config_path = "algos.fees.QuantityBasedMinCommissionModel:QuantityBasedMinCommissionModelConfig",
+                    fee_model_path = f"algos.fees.{fee_model}:{fee_model}",
+                    config_path = f"algos.fees.{fee_model}:{fee_model}Config",
                     config = {
-                                "commission_per_unit": Money(float(backtest_cfg["STRATEGY"]["costs"]["fee_per_share"]) , backtest_cfg["STRATEGY"]["currency"]),  
-                                "min_commission": Money( backtest_cfg["STRATEGY"]["costs"]["min_commission"] , backtest_cfg["STRATEGY"]["currency"]),
-                                "max_commission_pct": Decimal(backtest_cfg["STRATEGY"]["costs"]["max_commission_pct"])
+                                "commission_per_unit": Money(float(backtest_cfg["STRATEGY"]["fee_model"]["commission_per_unit"]) , backtest_cfg["STRATEGY"]["currency"]),  
+                                "min_commission": Money( backtest_cfg["STRATEGY"]["fee_model"]["min_commission"] , backtest_cfg["STRATEGY"]["currency"]),
+                                "max_commission_pct": Decimal(backtest_cfg["STRATEGY"]["fee_model"]["max_commission_pct"])
                     },
                 ),
             ),
@@ -758,20 +758,7 @@ class OptunaHparamsTuner:
         # Initialize Strategy
         strategy_name = self.strategy_params['strategy_name']
         model_name = self.model_params["model_name"]
-        try:
-            # Try to import from algos module
-            strategy_module = importlib.import_module(f"algos.{strategy_name}")
-            StrategyClass = getattr(strategy_module, strategy_name, None)
-            if StrategyClass is None:
-                # Try without redundant naming (e.g., algos.TopKStrategy.Strategy)
-                StrategyClass = getattr(strategy_module, "Strategy", None)
-            if StrategyClass is None:
-                raise ImportError(f"Could not find strategy class in algos.{strategy_name}")
-        except ImportError as e:
-            logger.error(f"Failed to import strategy {strategy_name}: {e}")
-            raise
-        #strategy = StrategyClass(config=backtest_cfg)
-        # TODO: add the fees from transactions and costs from config, add risk engine
+        # TODO:  add risk engine
         config=BacktestRunConfig(
                 engine=BacktestEngineConfig(
                     trader_id=f"Backtest-{model_name}-{strategy_name}",
