@@ -543,7 +543,7 @@ class OptunaHparamsTuner:
         # Run backtest
         node.run()
 
-        engine = node.get_engines()
+        engine = node.get_engines()[0]
         venue = Venue(self.strategy_params["venue_name"])
 
         # Calculate metrics using Nautilus built-in analyzer
@@ -557,88 +557,103 @@ class OptunaHparamsTuner:
         # Calculate metrics using Nautilus built-in analyzer
         metrics = {}
 
-        # Get portfolio analyzer for comprehensive metrics
-        portfolio_analyzer = engine.analyzer
-        
+        # Try to get the portfolio analyzer from the engine (preferred)
+        portfolio = getattr(engine, "portfolio", None)
+        portfolio_analyzer = getattr(portfolio, "analyzer", None) if portfolio is not None else getattr(engine, "analyzer", None)
+
         # Get account for final balance
         account = engine.cache.account_for_venue(venue)
-        
-        try:
-            # Get portfolio statistics from analyzer
-            stats = portfolio_analyzer.get_portfolio_stats()
-            
-            # TODO: decide what to store/analyze
-            # check: https://github.com/nautechsystems/nautilus_trader/tree/develop/nautilus_trader/analysis/statistics
-            # check: https://nautilustrader.io/docs/latest/concepts/reports
 
-            # Extract key metrics
-            metrics['sharpe_ratio'] = stats.get('sharpe_ratio', 0.0) if stats else 0.0
-            metrics['sortino_ratio'] = stats.get('sortino_ratio', 0.0) if stats else 0.0
-            metrics['calmar_ratio'] = stats.get('calmar_ratio', 0.0) if stats else 0.0
-            metrics['max_drawdown'] = stats.get('max_drawdown', 0.0) if stats else 0.0
-            
-            # Get returns statistics
-            returns_stats = portfolio_analyzer.get_returns_stats() if hasattr(portfolio_analyzer, 'get_returns_stats') else {}
-            metrics['total_return'] = returns_stats.get('total_return', 0.0) if returns_stats else 0.0
-            metrics['annual_return'] = returns_stats.get('annual_return', 0.0) if returns_stats else 0.0
-            metrics['daily_vol'] = returns_stats.get('daily_vol', 0.0) if returns_stats else 0.0
-            
-            # Get trade statistics
-            trade_stats = portfolio_analyzer.get_trade_stats() if hasattr(portfolio_analyzer, 'get_trade_stats') else {}
-            metrics['num_trades'] = trade_stats.get('total_trades', 0) if trade_stats else 0
-            metrics['win_rate'] = trade_stats.get('win_rate', 0.0) if trade_stats else 0.0
-            metrics['avg_win'] = trade_stats.get('avg_win', 0.0) if trade_stats else 0.0
-            metrics['avg_loss'] = trade_stats.get('avg_loss', 0.0) if trade_stats else 0.0
-            metrics['profit_factor'] = trade_stats.get('profit_factor', 0.0) if trade_stats else 0.0
+        try:
+            # Prefer the "performance" API; fall back to older names if present
+            stats_general = {}
+            if portfolio_analyzer is not None:
+                if hasattr(portfolio_analyzer, "get_performance_stats_general"):
+                    stats_general = portfolio_analyzer.get_performance_stats_general()
+                elif hasattr(portfolio_analyzer, "get_portfolio_stats"):
+                    stats_general = portfolio_analyzer.get_portfolio_stats()
+
+            returns_stats = {}
+            if portfolio_analyzer is not None:
+                if hasattr(portfolio_analyzer, "get_performance_stats_returns"):
+                    returns_stats = portfolio_analyzer.get_performance_stats_returns()
+                elif hasattr(portfolio_analyzer, "get_returns_stats"):
+                    returns_stats = portfolio_analyzer.get_returns_stats()
+
+            pnl_stats = {}
+            if portfolio_analyzer is not None:
+                if hasattr(portfolio_analyzer, "get_performance_stats_pnls"):
+                    pnl_stats = portfolio_analyzer.get_performance_stats_pnls()
+                # no common older name guaranteed for this; keep empty fallback
+
+            trade_stats = {}
+            if portfolio_analyzer is not None:
+                if hasattr(portfolio_analyzer, "get_trade_stats"):
+                    trade_stats = portfolio_analyzer.get_trade_stats()
+                else:
+                    # some analyzer methods return trade info inside pnl/returns dicts
+                    trade_stats = pnl_stats.get("trade_stats", {}) if isinstance(pnl_stats, dict) else {}
+
+            # Extract key metrics (use .get safely)
+            metrics['sharpe_ratio'] = stats_general.get('sharpe_ratio', 0.0) if isinstance(stats_general, dict) else 0.0
+            metrics['sortino_ratio'] = stats_general.get('sortino_ratio', 0.0) if isinstance(stats_general, dict) else 0.0
+            metrics['calmar_ratio'] = stats_general.get('calmar_ratio', 0.0) if isinstance(stats_general, dict) else 0.0
+            metrics['max_drawdown'] = stats_general.get('max_drawdown', 0.0) if isinstance(stats_general, dict) else 0.0
+
+            metrics['total_return'] = returns_stats.get('total_return', 0.0) if isinstance(returns_stats, dict) else 0.0
+            metrics['annual_return'] = returns_stats.get('annual_return', 0.0) if isinstance(returns_stats, dict) else 0.0
+            metrics['daily_vol'] = returns_stats.get('daily_vol', 0.0) if isinstance(returns_stats, dict) else 0.0
+
+            metrics['num_trades'] = trade_stats.get('total_trades', 0) if isinstance(trade_stats, dict) else 0
+            metrics['win_rate'] = trade_stats.get('win_rate', 0.0) if isinstance(trade_stats, dict) else 0.0
+            metrics['avg_win'] = trade_stats.get('avg_win', 0.0) if isinstance(trade_stats, dict) else 0.0
+            metrics['avg_loss'] = trade_stats.get('avg_loss', 0.0) if isinstance(trade_stats, dict) else 0.0
+            metrics['profit_factor'] = trade_stats.get('profit_factor', 0.0) if isinstance(trade_stats, dict) else 0.0
 
             logger.info(f"Metrics loaded successfully")
-            
+
         except Exception as e:
             logger.warning(f"Could not get analyzer metrics: {e}, calculating manually")
-            
-            # Fallback to manual calculation if analyzer methods not available
+
+            # (unchanged) fallback manual calculations
             positions = list(engine.cache.positions_closed())
             num_trades = len(positions)
-            
+
             if num_trades > 0:
                 winning_trades = sum(1 for p in positions if p.realized_pnl.as_double() > 0)
                 win_rate = winning_trades / num_trades
-                
-                # Calculate PnLs
+
                 pnls = [p.realized_pnl.as_double() for p in positions]
                 avg_pnl = sum(pnls) / len(pnls) if pnls else 0
-                
-                # Calculate returns from equity curve
+
                 initial_balance = float(strategy_params_flat['initial_cash'])
                 final_balance = float(account.balance_total(strategy_params_flat["currency"]).as_double())
                 total_return = (final_balance / initial_balance) - 1 if initial_balance > 0 else 0
-                
-                # Simple Sharpe calculation
+
                 if len(pnls) > 1:
                     returns = [(pnls[i] / initial_balance) for i in range(len(pnls))]
                     if len(returns) > 0 and all(r == returns[0] for r in returns):
-                        sharpe_ratio = 0.0  # All returns are the same
+                        sharpe_ratio = 0.0
                     else:
                         import numpy as np
                         returns_array = np.array(returns)
                         sharpe_ratio = (np.mean(returns_array) / np.std(returns_array)) * np.sqrt(252) if np.std(returns_array) > 0 else 0
                 else:
                     sharpe_ratio = 0.0
-                    
+
                 metrics = {
                     'sharpe_ratio': sharpe_ratio,
                     'total_return': total_return,
-                    'max_drawdown': 0.0,  # Would need equity curve to calculate
+                    'max_drawdown': 0.0,
                     'win_rate': win_rate,
                     'num_trades': num_trades,
                     'avg_pnl': avg_pnl,
                     'final_balance': final_balance,
                 }
             else:
-                # No trades executed
                 initial_balance = float(strategy_params_flat['initial_cash'])
                 final_balance = float(account.balance_total(strategy_params_flat["currency"]).as_double())
-                
+
                 metrics = {
                     'sharpe_ratio': 0.0,
                     'total_return': (final_balance / initial_balance) - 1 if initial_balance > 0 else 0,
@@ -649,6 +664,7 @@ class OptunaHparamsTuner:
                 }
 
         return metrics
+
     
     def _add_dates(self, cfg, offset, to_strategy = False) -> Dict:
         
@@ -734,10 +750,11 @@ class OptunaHparamsTuner:
                 fee_model=ImportableFeeModelConfig(
                     fee_model_path = f"algos.fees.{fee_model}:{fee_model}",
                     config_path = f"algos.fees.{fee_model}:{fee_model}Config",
-                    config = {
-                                "commission_per_unit": Money(float(backtest_cfg["STRATEGY"]["fee_model"]["commission_per_unit"]) , backtest_cfg["STRATEGY"]["currency"]),  
-                                "min_commission": Money( backtest_cfg["STRATEGY"]["fee_model"]["min_commission"] , backtest_cfg["STRATEGY"]["currency"]),
-                                "max_commission_pct": Decimal(backtest_cfg["STRATEGY"]["fee_model"]["max_commission_pct"])
+                    config = { "config" : {
+                                    "commission_per_unit": Money(float(backtest_cfg["STRATEGY"]["fee_model"]["commission_per_unit"]) , backtest_cfg["STRATEGY"]["currency"]),  
+                                    "min_commission": Money( backtest_cfg["STRATEGY"]["fee_model"]["min_commission"] , backtest_cfg["STRATEGY"]["currency"]),
+                                    "max_commission_pct": Decimal(backtest_cfg["STRATEGY"]["fee_model"]["max_commission_pct"])
+                                }
                     },
                 ),
             ),

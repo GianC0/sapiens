@@ -281,10 +281,10 @@ class CsvBarLoader:
                 
                 yield Bar(
                     bar_type=bar_type,
-                    open=Price.from_str(f"{open_val:.2f}"),
-                    high=Price.from_str(f"{high_val:.2f}"),
-                    low=Price.from_str(f"{low_val:.2f}"),
-                    close=Price.from_str(f"{close_val:.2f}"),
+                    open=Price.from_str(f"{open_val:.3f}"),
+                    high=Price.from_str(f"{high_val:.3f}"),
+                    low=Price.from_str(f"{low_val:.3f}"),
+                    close=Price.from_str(f"{close_val:.3f}"),
                     volume=Quantity.from_int(int(volume_val)),
                     ts_event=ts_ns,
                     ts_init=ts_ns,
@@ -420,8 +420,8 @@ class CsvBarLoader:
             lot_size=Quantity.from_int(1),
             # margin_init=Money(0, USD),  # No margin requirement for cash account
             # margin_maint=Money(0, USD),
-            #maker_fee=fee_amount, 
-            #taker_fee=fee_amount,
+            maker_fee=0, 
+            taker_fee=0,
             ts_event=0,
             ts_init=0,
         )

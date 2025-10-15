@@ -182,11 +182,6 @@ class OrderManager:
             turnover = abs(target_weight - current_weight)
             total_target_turnover += turnover
         
-        # Reserve cash for commissions (both buy and sell side, round-trip)
-        #commission_reserve = nav * total_target_turnover * self.commission_rate * 2
-        #available_nav = nav - commission_reserve
-
-        # commissions are taken care by weight optimization process
         available_nav = nav
         
         if available_nav <= 0:
@@ -239,16 +234,16 @@ class OrderManager:
             )
             # Update available cash estimate (add proceeds minus commission)
             proceeds = abs(order_qty) * current_price
-            available_cash += proceeds * (1 - self.commission_rate * 2)
+            available_cash += proceeds
         
         # Then execute buys with available cash
         for symbol, instrument_id, order_qty, current_price in buys:
             # Check if we have enough cash for this buy + commission
-            required_cash = abs(order_qty) * current_price * (1 + self.commission_rate * 2)
+            required_cash = abs(order_qty) * current_price 
             
             if required_cash > available_cash:
                 # Reduce order size to fit available cash
-                max_qty = (available_cash) / (current_price * (1 + self.commission_rate * 2))
+                max_qty = (available_cash) / (current_price)
                 if max_qty > 0.5:  # Only execute if meaningful size
                     adjusted_qty = int(max_qty)
                     logger.warning(f"BUY {symbol}: Reduced qty from {order_qty:.2f} to {adjusted_qty} due to cash constraint")
@@ -265,7 +260,7 @@ class OrderManager:
                 available_cash
             )
             # Update available cash estimate
-            available_cash -= abs(order_qty) * current_price * (1 + self.commission_rate * 2)
+            available_cash -= abs(order_qty) * current_price 
         
         # Log holds for completeness
         if holds:
@@ -558,7 +553,7 @@ class OrderManager:
         
         # For buy orders, validate sufficient cash
         if quantity > 0:
-            required_cash = abs(quantity) * current_price * (1 + self.commission_rate * 2)
+            required_cash = abs(quantity) * current_price
             if required_cash > available_cash:
                 logger.error(f"Insufficient cash for order: required={required_cash:.2f}, available={available_cash:.2f}")
                 return False
@@ -658,7 +653,7 @@ class OrderManager:
         if not bars:
             logger.warning(f"No bars available for {instrument_id}")
             return None
-        return float(bars[-1].close)
+        return float(bars[0].close)
     
     def _get_available_cash(self) -> float:
         """Get available cash in the account."""

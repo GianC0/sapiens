@@ -132,6 +132,7 @@ STRATEGY:
     backtest_end:   "2025-01-01" # End of walk-forward evaluation.
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
+    cash_buffer: 50              # cash buffer to always keep in portfolio to cover rounding errors
     currency: USD
     warm_start:      true        # Enable warm-start                   
     rebalance_only: false        # false = all universe instruments are considered for top_k. true = portoflio instruments stay the same, with dynamic reallocation 
@@ -175,9 +176,9 @@ STRATEGY:
       prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
 
     # Trading Commissions Model for fees
-    fee_model:                                       # Fee model defined in algos.fees
+    fee_model:                                       # Fee model defined in algos.fees. Modify only name and add respective params for other fee models
       name: QuantityBasedMinMaxCommissionFeeModel    # Interactive Brokers
-      commission_per_unit: 0.005                           # One-way commission 0.005% / share
+      commission_per_unit: 0.005                     # One-way commission 0.005% / share
       min_commission: 1.0                            # $1 minimum per order
       max_commission_pct: 0.01                       # max commission is 1% of trade value for that asset 
 
@@ -199,7 +200,7 @@ STRATEGY:
 
     # Risk Management
     risk:
-      max_weight_abs:            1.0                # Max 3 % NAV per single position        (concentration limit)
+      max_weight_abs:            0.5                # Max x% NAV per single position        (concentration limit)
       drawdown_max:              0.15               # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
       trailing_stop_max:         0.05               # % trailing stop from HWM/LWM 5% for single instrument
       target_volatility:  0.05               # 15% tarket volatility for efficient risk optimizer             

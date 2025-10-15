@@ -21,10 +21,10 @@ from pathlib import Path
 from pyexpat import model
 from tracemalloc import start
 from typing import Dict, List, Optional
+from flask import config
 from pandas.tseries.frequencies import to_offset
 import numpy as np
 import pandas as pd
-from sklearn import frozen
 from sympy import total_degree
 import yaml
 import pandas_market_calendars as market_calendars
@@ -50,6 +50,7 @@ from nautilus_trader.model.objects import Currency
 from nautilus_trader.backtest.models import FillModel, FeeModel
 from nautilus_trader.core.nautilus_pyo3 import CurrencyType
 from nautilus_trader.model.position import Position
+from nautilus_trader.config import ImportableFeeModelConfig
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
     OrderDenied, OrderEmulated, OrderEvent, OrderExpired,
@@ -57,6 +58,7 @@ from nautilus_trader.model.events import (
     OrderPendingCancel, OrderPendingUpdate, OrderRejected,
     OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated
 )
+
 
 logger = logging.getLogger(__name__)
 # ----- project imports -----------------------------------------------------
@@ -88,21 +90,9 @@ class TopKStrategy(Strategy):
     def __init__(self, config: TopKStrategyConfig):  
         super().__init__()  
 
-        # use the inner dict consistently
-        if hasattr(config, 'config') and config.config is not None:
-            # It's a TopKStrategyConfig with a config attribute
-            cfg = config.config
-        elif isinstance(config, dict):
-            # It's already a dictionary
-            cfg = config
-        elif hasattr(config, '__dataclass_fields__'):
-            # It's a dataclass but config field is not initialized
-            # This happens when Nautilus creates the config incorrectly
-            # Fall back to empty dict - will be populated by Nautilus
-            cfg = {}
-        else:
-            # Field descriptor or other unexpected type
-            cfg = {}
+        # TODO: quick dirty fix. implement proper typing
+        cfg = config.config
+
 
         # safe handling of variable
         currency = cfg["STRATEGY"]["currency"]
@@ -152,6 +142,9 @@ class TopKStrategy(Strategy):
         # Commissions Fee Model
         self.fee_model = self._import_fee_model()
 
+        # Cash buffer to always keep for rounding errors
+        self.cash_buffer = self.strategy_params["cash_buffer"]
+
         # Loader for data access
         venue_name = self.strategy_params["venue_name"]
         self.venue = Venue(venue_name)
@@ -169,7 +162,6 @@ class TopKStrategy(Strategy):
 
         # Initialize tracking variables
         self.max_registered_portfolio_nav = 0.0
-        self.nav = 0.0
         self.realised_returns = []
         self.trailing_stops = {}
 
@@ -208,6 +200,10 @@ class TopKStrategy(Strategy):
         # Order Manager for any strategy
         self.order_manager = OrderManager(self, self.strategy_params)
         logger.info("OrderManager initialized")
+
+        # Final liquidation flag
+        self.final_liquidation_happend = False
+        
 
 
     # ================================================================= #
@@ -268,6 +264,20 @@ class TopKStrategy(Strategy):
             callback=self.on_retrain,
         )    
 
+        # Final liquidation timer one bar before the end of backtest
+        schedule = self.calendar.schedule(start_date=str(self.valid_start), end_date=str(self.valid_end))
+        if not schedule.empty:
+            last_trading_time = schedule.index[-1]
+            liquidation_time = pd.Timestamp(last_trading_time) - freq2pdoffset(self.strategy_params["freq"])
+            
+            self.clock.set_time_alert(
+                name="final_liquidation",
+                alert_time=liquidation_time,
+                callback=self.on_final_liquidation
+            )
+            logger.info(f"Final liquidation scheduled for {liquidation_time}")
+
+
 
 
     # Not used ATM
@@ -284,13 +294,10 @@ class TopKStrategy(Strategy):
     def on_load(self, state: dict[str, bytes]) -> None:
         return
     
-    # Used
-    #def on_dispose(self) -> None:
-    #    self.order_manager.liquidate_all(self.universe)
-    #    return
-
+    """
+    Ensure all positions are closed at end of backtest for accurate P&L.
     def on_dispose(self) -> None:
-        """Ensure all positions are closed at end of backtest for accurate P&L."""
+        """"""
         logger.info("Strategy disposal: liquidating all positions for final P&L calculation")
         
         # Force close all open positions at current market prices
@@ -309,9 +316,27 @@ class TopKStrategy(Strategy):
         logger.info(f"Final NAV at disposal: {final_nav:.2f}")
         
         return
-    
+    """
+
+    def on_final_liquidation(self, event: TimeEvent):
+        """Liquidate all positions before backtest ends."""
+        logger.info("Final liquidation: closing all positions")
+        
+        for position in self.cache.positions_open(venue=self.venue):
+            self.order_manager.close_position(position)
+        
+        self.order_manager.cancel_all_orders()
+        self.final_liquidation_happend = True
+
+    def on_dispose(self) -> None:
+        """Log final state."""
+        final_nav = self._calculate_portfolio_nav()
+        logger.info(f"Final NAV at disposal: {final_nav:.2f}")
+
     def on_update(self, event: TimeEvent):
         if event.name != "update_timer":
+            return
+        if self.final_liquidation_happend:
             return
 
         event_time = pd.to_datetime(event.ts_event, unit="ns", utc=True)
@@ -372,7 +397,7 @@ class TopKStrategy(Strategy):
         weights = self._compute_target_weights(preds)
 
         # Check if we have valid weights
-        if not weights or all(abs(w) < 1e-6 for w in weights.values()):
+        if not weights or all(abs(w) < 1e-6 for w in weights.values()) or len(weights) == 0:
             logger.warning("No valid weights computed, skipping rebalance")
             self._last_update_time = now
             return
@@ -834,7 +859,7 @@ class TopKStrategy(Strategy):
         total_current_exposure = 0.0
 
         # Current portfolio net asset value
-        self.nav = self._calculate_portfolio_nav()
+        nav = self._calculate_portfolio_nav()
 
         for i, symbol in enumerate(self.universe):
             
@@ -845,7 +870,7 @@ class TopKStrategy(Strategy):
                 continue
 
             # Get current price
-            current_price = float(bars[-1].close)
+            current_price = float(bars[0].close)
             prices[symbol] = current_price
 
             # Calculate current position weight
@@ -853,7 +878,7 @@ class TopKStrategy(Strategy):
             for position in self.cache.positions_open():
                 if position.instrument_id == instrument_id:
                     net_position += float(position.signed_qty)
-            current_w = (net_position * current_price / self.nav) if (net_position and self.nav > 0) else 0.0
+            current_w = (net_position * current_price / nav) if (net_position and nav > 0) else 0.0
             current_weights.append(current_w)
             total_current_exposure += abs(current_w) 
 
@@ -866,7 +891,7 @@ class TopKStrategy(Strategy):
 
             returns_data.append(returns.values)
             valid_symbols.append(symbol)
-            prices[symbol] = float(bars[-1].close)
+            prices[symbol] = float(bars[0].close)
 
             # compute allowed weight ranges
             # Risk-free rate is the only one who can take up to 100% of portfolio
@@ -879,7 +904,7 @@ class TopKStrategy(Strategy):
             volumes = [float(b.volume) for b in bars[-self.adv_lookback:]] if len(bars) >= self.adv_lookback else [float(b.volume) for b in bars]
             adv = float(np.mean(volumes)) if volumes else 0.0
             
-            max_w_relative = min((adv * self.max_adv_pct * current_price) / self.nav, self.max_w_abs)
+            max_w_relative = min((adv * self.max_adv_pct * current_price) / nav, self.max_w_abs)
 
             # compute min or min/max weight for instrument
             if self.can_short:
@@ -917,19 +942,21 @@ class TopKStrategy(Strategy):
             allowed_weight_ranges=np.array(allowed_weight_ranges),
             current_weights = np.array(current_weights),
             selector_k = self.selector_k,
-            target_volatility = self.target_volatility,
-            commission_rate = 0.0,  # commission_rate is enforced by order_manager.rebalance_portfolio(). optimizer would fails beacuse by DEFAULT  sum(w) = 1 AND constraint sum(w) ≤ 1 - commissions
+            target_volatility = self.target_volatility
         )
 
         # Clipping (if optimizer constraints failed) and log if clipping occurred
         w_clipped = np.clip(w_opt, np.array(allowed_weight_ranges)[:, 0], np.array(allowed_weight_ranges)[:, 1])  # max bounds
 
         # Account for commissions:
-        w_final = self._adjust_weights_for_commissions(symbols = valid_symbols, expected_returns_array = valid_expected_returns, weights_array = w_clipped, nav = self.nav)
+        w_final = self._adjust_weights_for_commissions(symbols = valid_symbols, expected_returns_array = valid_expected_returns, weights_array = w_clipped, nav = nav)
+
+        # Controls Conditions:
+        # sells + active balance < buys + commission + (buffer)
+        # start with sells then buys
 
         # Map to universe
         w_series = pd.Series(0.0, index=self.universe)
-        # TODO: double check if correct
         w_series[valid_symbols] = w_final  # Direct assignment using list indexing
 
         return w_series.to_dict()
@@ -999,7 +1026,6 @@ class TopKStrategy(Strategy):
         for position in self.cache.positions_open(venue = self.venue):
             instrument_id = position.instrument_id
             bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
-            market_value = self.cache.bars(bar_type)[-1].close
             
             
             # Aggregate positions for each instrument (for HEDGING accounts)
@@ -1013,26 +1039,30 @@ class TopKStrategy(Strategy):
             bars = self.cache.bars(bar_type)
             
             if bars:
-                current_price = float(bars[-1].close)
+                current_price = float(bars[0].close)
                 position_value = net_quantity * current_price
                 total_positions_value += position_value
         
-        nav = cash_balance + total_positions_value
+        nav = cash_balance + total_positions_value - self.cash_buffer
         
         # Sanity check
         if nav <= 0 and cash_balance > 0:
             logger.warning(f"NAV calculation may be incorrect: cash={cash_balance:.2f}, positions={total_positions_value:.2f}")
-            nav = cash_balance  # Use cash as fallback
+            nav = cash_balance - self.cash_buffer  # Use cash as fallback
         
         logger.info(f"NAV Calculation: Cash={cash_balance:.2f}, Positions={total_positions_value:.2f}, Total={nav:.2f}")
 
         return nav
 
     def _import_fee_model(self) -> FeeModel:
+
+        name =  self.strategy_params["fee_model"]["name"]
+
         try:
             # Try to import from algos module
             fee_module = importlib.import_module(f"algos.fees.{self.strategy_params["fee_model"]["name"]}")
-            FeeModelClass = getattr(fee_module, self.strategy_params["fee_model"]["name"], None)
+            FeeModelClass = getattr(fee_module, name, None)
+            FeeModelConfig = getattr(fee_module, f"{name}Config", None)
             
             if FeeModelClass is None:
                 FeeModelClass = getattr(fee_module, "Strategy", None)
@@ -1044,7 +1074,8 @@ class TopKStrategy(Strategy):
             logger.error(f"Failed to import fee model {self.strategy_params["fee_model"]["name"]}: {e}")
             raise
 
-        fee_model = FeeModelClass(**{k: v for k, v in self.strategy_params["fee_model"].items() if k != "name"})
+        FeeModelConfig.config = {k: v for k, v in self.strategy_params["fee_model"].items() if k != "name"}
+        fee_model = FeeModelClass(FeeModelConfig)
 
         return fee_model
     
@@ -1057,88 +1088,220 @@ class TopKStrategy(Strategy):
     ) -> np.ndarray:
         """
         Adjust portfolio weights to ensure sufficient cash for commissions.
-        Scales down lowest-ranked positions to reserve commission costs.
+        
+        Decision logic:
+        1. Calculate total expected profit from rebalancing entire portfolio
+        2. Calculate total commissions for all trades
+        3. If total_profit <= total_commissions: reject rebalance (return zeros)
+        4. Otherwise: reserve commission cash by reducing least profitable positions
+        5. Handles both long and short positions correctly
         
         Args:
-            weights: Target weights from optimizer
-            universe: List of symbols
+            symbols: Array of stock symbols
+            expected_returns_array: Expected returns for each stock (can be negative)
+            weights_array: Target weights from optimizer (can be negative for shorts)
             nav: Current portfolio NAV
             
         Returns:
-            Adjusted weights that account for commissions
+            Adjusted weights accounting for commissions, or zeros if unprofitable
         """
         if nav <= 0:
             logger.error("Invalid NAV for commission adjustment")
-            return weights_array
+            return np.zeros(len(weights_array))
         
         adjusted_weights = weights_array.copy()
         
-        # Calculate total commissions needed for rebalancing
-        # TODO: ensure multi-currency support
-        total_commission_needed = Money(0.0, self.strategy_params["currency"])
-        trade_details = []
+        total_commission_needed = 0.0
+        total_expected_profit = 0.0
+        net_trades_value = 0.0
+        trade_info = []
         
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 1: Calculate all trades, commissions, and expected profits
+        # ═══════════════════════════════════════════════════════════════
         for idx, symbol in enumerate(symbols):
             target_weight = adjusted_weights[idx]
-            instrument_id = InstrumentId(Symbol(symbol), self.strategy.venue)
-            instrument = self.strategy.cache.instrument(instrument_id)
             
-            # Get current and target quantities
-            current_qty = self._get_net_position_qty(instrument_id)
-            current_price = self._get_current_price(instrument_id)
+            instrument_id = InstrumentId(Symbol(symbol), self.venue)
+            instrument = self.cache.instrument(instrument_id)
+            
+            # Get current position and price
+            current_qty = self.order_manager._get_net_position_qty(instrument_id)
+            current_price = self.order_manager._get_current_price(instrument_id)
             
             if current_price is None or current_price <= 0:
+                adjusted_weights[idx] = 0.0
                 continue
             
-            target_qty = (target_weight * nav) / current_price
+            # Calculate target quantity as float
+            target_value = target_weight * nav
+            target_qty_float = target_value / current_price
+            
+            # ─────────────────────────────────────────────────────────
+            # REQUIREMENT 2: Enforce integer quantities
+            # Skip if rounds to zero when non-zero weight intended
+            # rounds to smallest positive int or to biggest negative int as a safe bound
+            # ─────────────────────────────────────────────────────────
+            target_qty = int(target_qty_float)
+            
+            if target_qty == 0 and abs(target_weight) > 1e-8:
+                logger.debug(
+                    f"Skipping {symbol}: target_qty={target_qty_float:.3f} rounds to zero "
+                    f"(price={current_price:.2f}, target_weight={target_weight:.6f})"
+                )
+                adjusted_weights[idx] = 0.0
+                continue
+            
+            # Recalculate weight based on actual integer quantity
+            adjusted_weight = (target_qty * current_price) / nav if target_qty != 0 else 0.0
+            adjusted_weights[idx] = adjusted_weight
+            
+            # Calculate trade quantity needed
             trade_qty = target_qty - current_qty
             
-            # safe upper bound for commissions
-            price = max(instrument.make_price(current_price), expected_returns_array[idx] )
-            commissions = self.strategy.fee_model.get_commission( Quantity_fill_qty = instrument.make_qty(trade_qty), Price_fill_px = price)
-            total_commission_needed += commissions
+            # Calculate expected profit from holding target position
+            # Works for both long and short:
+            # - Long (target_qty > 0, expected_return > 0): profit > 0
+            # - Short (target_qty < 0, expected_return < 0): profit > 0
+            # - Unprofitable positions: profit < 0 (will be reduced first)
+            position_expected_profit = target_qty * current_price * expected_returns_array[idx]
             
-            trade_details.append({
+            if abs(trade_qty) < 1:  # No meaningful trade needed
+                # Still track for overall profit calculation
+                trade_info.append({
+                    'idx': idx,
+                    'symbol': symbol,
+                    'weight': adjusted_weight,
+                    'target_qty': target_qty,
+                    'current_qty': current_qty,
+                    'trade_qty': 0,
+                    'current_price': current_price,
+                    'expected_return': expected_returns_array[idx],
+                    'position_profit': position_expected_profit,
+                    'commission': 0.0,
+                    'needs_trade': False
+                })
+                continue
+            
+            # Calculate commission for this trade
+            expected_price = current_price * (1 + expected_returns_array[idx])
+            # Use max of current and expected price for conservative commission estimate
+            price_for_commission = instrument.make_price(max(abs(current_price), abs(expected_price)))
+            qty_for_commission = instrument.make_qty(abs(trade_qty))
+            
+            commission = self.fee_model.get_commission(
+                Order_order=None,
+                Quantity_fill_qty=qty_for_commission,
+                Price_fill_px=price_for_commission,
+                Instrument_instrument=instrument
+            )
+            commission_value = float(commission)
+            total_commission_needed += commission_value
+            
+            # Calculate expected profit from this specific trade
+            # Formula: trade_qty * current_price * expected_return
+            # Works for both long and short positions
+            trade_expected_profit = trade_qty * current_price * expected_returns_array[idx]
+            total_expected_profit += trade_expected_profit
+            net_trades_value += trade_qty * current_price
+            
+            trade_info.append({
+                'idx': idx,
                 'symbol': symbol,
-                'weight': target_weight,
+                'weight': adjusted_weight,
+                'target_qty': target_qty,
+                'current_qty': current_qty,
                 'trade_qty': trade_qty,
-                'price': current_price,
-                'commission': commissions
+                'current_price': current_price,
+                'expected_return': expected_returns_array[idx],
+                'trade_profit': trade_expected_profit,
+                'position_profit': position_expected_profit,
+                'commission': commission_value,
+                'needs_trade': True
             })
         
-        if total_commission_needed == 0:
+        # ═══════════════════════════════════════════════════════════════
+        # REQUIREMENT 1: Decide if portfolio-wide rebalancing is profitable
+        # ═══════════════════════════════════════════════════════════════
+        if total_expected_profit <= total_commission_needed:
+            logger.warning(
+                f"Rebalancing NOT profitable: expected profit ({total_expected_profit:.2f}) "
+                f"<= commissions ({total_commission_needed:.2f}). "
+                f"Keeping current allocation (returning zero weights)."
+            )
+            return np.zeros(len(weights_array))
+        
+        net_expected_profit = total_expected_profit - total_commission_needed
+        logger.info(
+            f"Rebalancing IS profitable: expected profit ({total_expected_profit:.2f}) "
+            f"> commissions ({total_commission_needed:.2f}). "
+            f"Net profit: {net_expected_profit:.2f}"
+        )
+        
+        if total_commission_needed <= 1e-8:
             return adjusted_weights
         
-        # Calculate commission as percentage of NAV
-        commission_pct = float(total_commission_needed) / float(nav)
-
-        if commission_pct <= 0.0:
+        if net_trades_value + total_commission_needed < nav:
             return adjusted_weights
+        # ═══════════════════════════════════════════════════════════════
+        # REQUIREMENT 3: Reserve cash for commissions
+        # Reduce positions with lowest expected profit first
+        # ═══════════════════════════════════════════════════════════════
+        commission_pct = total_commission_needed / nav
+        
+        # Sort by position_profit ASCENDING (lowest/most negative first)
+        # This correctly handles:
+        # - Unprofitable shorts (negative qty × positive return = negative profit) → reduce first
+        # - Unprofitable longs (positive qty × negative return = negative profit) → reduce first  
+        # - Low-profit positions → reduce next
+        # - High-profit positions → keep
+        trade_info.sort(key=lambda x: x['position_profit'])
+        
+        remaining_commission_pct = commission_pct
 
-        # get indices sorted by absolute weight, ascending (smallest first)
-        order = np.argsort(np.abs(adjusted_weights))
-
-        remaining = commission_pct
-        for idx in order:
-            if remaining <= 0.0:
+        for trade in trade_info:
+            if remaining_commission_pct <= 1e-8:
                 break
-
-            w = adjusted_weights[idx]
-            reduc = min(abs(w), remaining)
-
-            # preserve sign when reducing
-            if w > 0:
-                adjusted_weights[idx] = max(0.0, w - reduc)
+            
+            idx = trade['idx']
+            current_weight = adjusted_weights[idx]
+            
+            if abs(current_weight) < 1e-8:
+                continue
+            
+            # Calculate maximum possible reduction (full position)
+            max_reduction = abs(current_weight)
+            reduction = min(max_reduction, remaining_commission_pct)
+            
+            # Apply reduction (preserving sign direction)
+            # For long (weight > 0): reduce means subtract → less buying
+            # For short (weight < 0): reduce means add → less shorting
+            if current_weight > 0:
+                adjusted_weights[idx] = max(0.0, current_weight - reduction)
             else:
-                adjusted_weights[idx] = min(0.0, w + reduc)
-
-            remaining -= reduc
+                adjusted_weights[idx] = min(0.0, current_weight + reduction)
+            
+            remaining_commission_pct -= reduction
+            
             logger.info(
-                f"Scaled {symbols[idx]} weight: {w:.6f} -> {adjusted_weights[idx]:.6f} (freed {reduc:.6f})"
+                f"Reduced {trade['symbol']} (position_profit={trade['position_profit']:.2f}, "
+                f"return={trade['expected_return']:.4f}): "
+                f"weight {current_weight:.6f} → {adjusted_weights[idx]:.6f} "
+                f"(freed {reduction:.6f} of NAV)"
             )
-
-        if remaining > 0.0:
-            logger.warning(f"Could not fully reserve commissions: {remaining*nav:.2f} shortfall")
+        
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 4: Verify sufficient commission reserve
+        # ═══════════════════════════════════════════════════════════════
+        if remaining_commission_pct > 1e-6:
+            shortfall = remaining_commission_pct * nav
+            logger.error(
+                f"FAILED to reserve full commission amount. Shortfall: ${shortfall:.2f}. "
+                f"This should not happen. Rejecting rebalance."
+            )
             return np.zeros(len(weights_array))
-
+        
+        logger.info(f"Successfully reserved ${total_commission_needed:.2f} for commissions")
+        
         return adjusted_weights
+    
