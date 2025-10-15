@@ -419,14 +419,15 @@ class OptunaHparamsTuner:
                         mlflow.log_metric(metric_name, metric_value)
                     
                     # Use Portfolio return as objective
-                    scores = tuple(metrics[obj] for obj in objectives )
-                    
+                    scores = tuple(metrics[obj] for obj in objectives)
+                    scores_dict = {obj: metrics[obj] for obj in metrics if obj in objectives}
+
                     # Store trial attributes
                     trial.set_user_attr("metrics", metrics)
                     trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
-                    trial.set_system_attr("strategy_params_path", strategy_params_path)
+                    trial.set_user_attr("strategy_params_path", str(strategy_params_path))
                     
-                    logger.info(f"  Trial {trial.number}: Scores = {scores:.4f}")
+                    logger.info(f"  Trial {trial.number}: Scores = {scores_dict}")
                     
                     return scores
             
@@ -448,7 +449,7 @@ class OptunaHparamsTuner:
             mlflow.log_params({
                 f"best_strategy_{k}": v for k, v in best_trial.params.items()
             })
-            mlflow.log_metric("best_strategy_sharpe", best_trial.value) # type: ignore
+            mlflow.log_metrics("best_strategy_metric", best_trial.value) # type: ignore
             
             logger.info(f"\nBest strategy trial: {best_trial.number}")
             logger.info(f"Best strategy Sharpe: {best_trial.value:.4f}")
@@ -554,101 +555,154 @@ class OptunaHparamsTuner:
         return metrics
 
     def _compute_metrics(self, engine: BacktestEngine, venue: Venue, strategy_params_flat: Dict) -> Dict:
-        # Calculate metrics using Nautilus built-in analyzer
+        """
+        Compute comprehensive metrics and generate all Nautilus reports.
+        Logs all reports to MLflow as both tables and CSV artifacts.
+        
+        Returns:
+            Dictionary of key performance metrics
+        """
         metrics = {}
 
-        # Try to get the portfolio analyzer from the engine (preferred)
+        # Get portfolio, trader, and account
         portfolio = getattr(engine, "portfolio", None)
-        portfolio_analyzer = getattr(portfolio, "analyzer", None) if portfolio is not None else getattr(engine, "analyzer", None)
-
-        # Get account for final balance
+        portfolio_analyzer = getattr(portfolio, "analyzer", None) if portfolio is not None else None
+        trader = getattr(engine, "trader", None)
         account = engine.cache.account_for_venue(venue)
 
         try:
-            # Prefer the "performance" API; fall back to older names if present
+            # ===== GENERATE ALL REPORTS =====
+            if trader is not None:
+                # 1. Orders Report
+                try:
+                    orders_report = trader.generate_orders_report()
+                    if not orders_report.empty:
+                        mlflow.log_table(orders_report, "orders_report.json")
+                        #orders_report.to_csv("orders_report.csv")
+                        #mlflow.log_artifact("orders_report.csv")
+                        logger.info(f"Logged orders report: {len(orders_report)} orders")
+                except Exception as e:
+                    logger.warning(f"Could not generate orders report: {e}")
+
+                # 2. Order Fills Report (summary of filled orders)
+                try:
+                    order_fills_report = trader.generate_order_fills_report()
+                    if not order_fills_report.empty:
+                        mlflow.log_table(order_fills_report, "order_fills_report.json")
+                        #order_fills_report.to_csv("order_fills_report.csv")
+                        #mlflow.log_artifact("order_fills_report.csv")
+                        logger.info(f"Logged order fills report: {len(order_fills_report)} filled orders")
+                except Exception as e:
+                    logger.warning(f"Could not generate order fills report: {e}")
+
+                # 3. Fills Report (individual fill events)
+                try:
+                    fills_report = trader.generate_fills_report()
+                    if not fills_report.empty:
+                        mlflow.log_table(fills_report, "fills_report.json")
+                        #fills_report.to_csv("fills_report.csv")
+                        #mlflow.log_artifact("fills_report.csv")
+                        logger.info(f"Logged fills report: {len(fills_report)} fills")
+                except Exception as e:
+                    logger.warning(f"Could not generate fills report: {e}")
+
+                # 4. Positions Report (includes snapshots for NETTING OMS)
+                try:
+                    positions_report = trader.generate_positions_report()
+                    if not positions_report.empty:
+                        mlflow.log_table(positions_report, "positions_report.json")
+                        #positions_report.to_csv("positions_report.csv")
+                        #mlflow.log_artifact("positions_report.csv")
+                        logger.info(f"Logged positions report: {len(positions_report)} positions")
+                except Exception as e:
+                    logger.warning(f"Could not generate positions report: {e}")
+
+                # 5. Account Report (balance changes over time)
+                try:
+                    account_report = trader.generate_account_report(venue)
+                    if not account_report.empty:
+                        mlflow.log_table(account_report, "account_report.json")
+                        #account_report.to_csv("account_report.csv")
+                        #mlflow.log_artifact("account_report.csv")
+                        logger.info(f"Logged account report: {len(account_report)} snapshots")
+                except Exception as e:
+                    logger.warning(f"Could not generate account report: {e}")
+
+            # ===== EXTRACT PORTFOLIO STATISTICS =====
             stats_general = {}
+            returns_stats = {}
+            pnl_stats = {}
+            
             if portfolio_analyzer is not None:
+                # Get general performance statistics
                 if hasattr(portfolio_analyzer, "get_performance_stats_general"):
                     stats_general = portfolio_analyzer.get_performance_stats_general()
                 elif hasattr(portfolio_analyzer, "get_portfolio_stats"):
                     stats_general = portfolio_analyzer.get_portfolio_stats()
 
-            returns_stats = {}
-            if portfolio_analyzer is not None:
+                # Get returns statistics
                 if hasattr(portfolio_analyzer, "get_performance_stats_returns"):
                     returns_stats = portfolio_analyzer.get_performance_stats_returns()
                 elif hasattr(portfolio_analyzer, "get_returns_stats"):
                     returns_stats = portfolio_analyzer.get_returns_stats()
 
-            pnl_stats = {}
-            if portfolio_analyzer is not None:
+                # Get PnL statistics
                 if hasattr(portfolio_analyzer, "get_performance_stats_pnls"):
                     pnl_stats = portfolio_analyzer.get_performance_stats_pnls()
-                # no common older name guaranteed for this; keep empty fallback
 
-            trade_stats = {}
-            if portfolio_analyzer is not None:
-                if hasattr(portfolio_analyzer, "get_trade_stats"):
-                    trade_stats = portfolio_analyzer.get_trade_stats()
-                else:
-                    # some analyzer methods return trade info inside pnl/returns dicts
-                    trade_stats = pnl_stats.get("trade_stats", {}) if isinstance(pnl_stats, dict) else {}
+            # Combine all stats and log numeric values
+            all_stats = {**stats_general, **returns_stats, **pnl_stats}
+            all_stats = {k: float(v) for k, v in all_stats.items() if isinstance(v, (int, float))}
 
-            # Extract key metrics (use .get safely)
-            metrics['sharpe_ratio'] = stats_general.get('sharpe_ratio', 0.0) if isinstance(stats_general, dict) else 0.0
-            metrics['sortino_ratio'] = stats_general.get('sortino_ratio', 0.0) if isinstance(stats_general, dict) else 0.0
-            metrics['calmar_ratio'] = stats_general.get('calmar_ratio', 0.0) if isinstance(stats_general, dict) else 0.0
-            metrics['max_drawdown'] = stats_general.get('max_drawdown', 0.0) if isinstance(stats_general, dict) else 0.0
+            # Extract Returns metrics
+            metrics['returns_volatility'] = all_stats.get('Returns Volatility (252 days)', 0.0)
+            metrics['avg_return'] = all_stats.get('Average (Return)', 0.0)
+            metrics['avg_loss_pct'] = all_stats.get('Average Loss (Return)', 0.0)
+            metrics['avg_win_pct'] = all_stats.get('Average Win (Return)', 0.0)
+            metrics['sharpe_ratio'] = all_stats.get('Sharpe Ratio (252 days)', 0.0)
+            metrics['sortino_ratio'] = all_stats.get('Sortino Ratio (252 days)' , 0.0)
+            metrics['profit_factor'] = all_stats.get('Profit Factor', 0.0)
+            metrics['risk_return_ratio'] = all_stats.get('Risk Return Ratio', 0.0)
 
-            metrics['total_return'] = returns_stats.get('total_return', 0.0) if isinstance(returns_stats, dict) else 0.0
-            metrics['annual_return'] = returns_stats.get('annual_return', 0.0) if isinstance(returns_stats, dict) else 0.0
-            metrics['daily_vol'] = returns_stats.get('daily_vol', 0.0) if isinstance(returns_stats, dict) else 0.0
+            # Extract PnL metrics
+            metrics['total_pnl'] = all_stats.get('PnL (total)', 0.0)
+            metrics['total_pnl_pct'] = all_stats.get('PnL% (total)', 0.0)
+            metrics['max_drawdown'] = all_stats.get('Max Drawdown', 0.0)
+            metrics['max_winner'] = all_stats.get('Max Winner', 0.0)
+            metrics['avg_winner'] = all_stats.get('Avg Winner', 0.0)
+            metrics['min_winner'] = all_stats.get('Min Winner', 0.0)
+            metrics['min_loser'] = all_stats.get('Min Loser', 0.0)
+            metrics['avg_loser'] = all_stats.get('Avg Loser', 0.0)
+            metrics['max_loser'] = all_stats.get('Max Loser', 0.0)
+            metrics["expectancy"] = all_stats.get('Expectancy', 0.0)
+            metrics["win_rate"] = all_stats.get('Win Rate', 0.0)
+            
+            # Get trade count from cache
+            positions_closed = list(engine.cache.positions_closed())
+            metrics['num_trades'] = len(positions_closed)
 
-            metrics['num_trades'] = trade_stats.get('total_trades', 0) if isinstance(trade_stats, dict) else 0
-            metrics['win_rate'] = trade_stats.get('win_rate', 0.0) if isinstance(trade_stats, dict) else 0.0
-            metrics['avg_win'] = trade_stats.get('avg_win', 0.0) if isinstance(trade_stats, dict) else 0.0
-            metrics['avg_loss'] = trade_stats.get('avg_loss', 0.0) if isinstance(trade_stats, dict) else 0.0
-            metrics['profit_factor'] = trade_stats.get('profit_factor', 0.0) if isinstance(trade_stats, dict) else 0.0
-
-            logger.info(f"Metrics loaded successfully")
+            logger.info(f"Extracted {len(metrics)} metrics successfully")
 
         except Exception as e:
-            logger.warning(f"Could not get analyzer metrics: {e}, calculating manually")
+            logger.warning(f"Error in comprehensive metrics collection: {e}, using fallback")
 
-            # (unchanged) fallback manual calculations
+            # Fallback manual calculations
             positions = list(engine.cache.positions_closed())
             num_trades = len(positions)
 
             if num_trades > 0:
                 winning_trades = sum(1 for p in positions if p.realized_pnl.as_double() > 0)
                 win_rate = winning_trades / num_trades
-
-                pnls = [p.realized_pnl.as_double() for p in positions]
-                avg_pnl = sum(pnls) / len(pnls) if pnls else 0
-
+                
                 initial_balance = float(strategy_params_flat['initial_cash'])
                 final_balance = float(account.balance_total(strategy_params_flat["currency"]).as_double())
                 total_return = (final_balance / initial_balance) - 1 if initial_balance > 0 else 0
 
-                if len(pnls) > 1:
-                    returns = [(pnls[i] / initial_balance) for i in range(len(pnls))]
-                    if len(returns) > 0 and all(r == returns[0] for r in returns):
-                        sharpe_ratio = 0.0
-                    else:
-                        import numpy as np
-                        returns_array = np.array(returns)
-                        sharpe_ratio = (np.mean(returns_array) / np.std(returns_array)) * np.sqrt(252) if np.std(returns_array) > 0 else 0
-                else:
-                    sharpe_ratio = 0.0
-
                 metrics = {
-                    'sharpe_ratio': sharpe_ratio,
-                    'total_return': total_return,
-                    'max_drawdown': 0.0,
+                    'sharpe_ratio': 0.0,
+                    'total_pnl_pct': total_return,
                     'win_rate': win_rate,
                     'num_trades': num_trades,
-                    'avg_pnl': avg_pnl,
-                    'final_balance': final_balance,
                 }
             else:
                 initial_balance = float(strategy_params_flat['initial_cash'])
@@ -656,11 +710,8 @@ class OptunaHparamsTuner:
 
                 metrics = {
                     'sharpe_ratio': 0.0,
-                    'total_return': (final_balance / initial_balance) - 1 if initial_balance > 0 else 0,
-                    'max_drawdown': 0.0,
-                    'win_rate': 0.0,
+                    'total_pnl_pct': (final_balance / initial_balance) - 1 if initial_balance > 0 else 0,
                     'num_trades': 0,
-                    'final_balance': final_balance,
                 }
 
         return metrics

@@ -155,11 +155,41 @@ STRATEGY:
     # Hyperparameter tuning Settings and Objectives
     # Objectives: sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown, total_return, annual_return, daily_vol
     tune_hparams: true
-    n_trials: 1
-    objectives:          # use only nautilus_trader portfolio_analyzer statistics
-      sharpe_ratio: maximize
-      #total_return: maximize
-      #profit_factor: maximize 
+    n_trials: 1      
+    objectives: # use only nautilus_trader portfolio_analyzer statistics
+      ## Performance / Returns ##
+      #returns_volatility: minimize      
+      #avg_return: maximize
+      #avg_loss_pct: minimize              
+      #avg_win_pct: maximize
+
+      ## Risk-Adjusted Ratios ##
+      #sharpe_ratio: maximize
+      #sortino_ratio: maximize
+      #profit_factor: maximize
+      #risk_return_ratio: maximize
+
+      ## PnL & Drawdown ##
+      #total_pnl: maximize
+      total_pnl_pct: maximize
+      #max_drawdown: minimize              # reduce max drawdown
+
+      ## Trade-Level Stats ##
+      #max_winner: maximize                # larger best trade is usually good
+      #avg_winner: maximize
+      #min_winner: maximize                # increase the worst winning trade
+      num_trades: minimize
+
+      ## loser/loss metrics — negative sign convention                      ##
+      ## (maximize direction of negatives => tries to bring losses to zero) ##
+      #min_loser: maximize                 # see note above re: sign convention
+      #avg_loser: maximize                 # see note above
+      #max_loser: minimize                 # typically want to reduce the worst loss magnitude
+
+      ## Expectancy & Win Rate ##
+      #expectancy: maximize
+      #win_rate: maximize
+
 
 
 
