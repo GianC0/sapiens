@@ -254,18 +254,22 @@ class OptunaHparamsTuner:
                 # --- Build trial-specific augmentor ---
                 # Extract data-related hyperparams from trial_hparams
                 augment_hparams = {k: v for k, v in trial_hparams.items() if k in self.data_hparams}
-
-                # Merge into the augmentor config
-                trial_data_config = merge_configs([self.data_params, augment_hparams])
-
-                # Instantiate augmentor with trial-specific parameters
-                print(trial_data_config)
-                
-                augmentor = DataAugmentor(augmentation_config=trial_data_config, augment_modality="train")
+                augment_config = self.data_params | augment_hparams | {"pca_dir":model_dir}
+                augmentor = DataAugmentor(augmentation_config=augment_config | augment_hparams, augment_modality="train")
 
                 data_dict = augmentor.augment(data_dict)
 
-                print(data_dict)
+                # Inspect and check shapes
+                shapes = {symbol: df.shape for symbol, df in data_dict.items()}
+                print("Data shapes per symbol:", shapes)
+                # Validate that all dataframes have the same number of features (columns)
+                n_features = {df.shape[1] for df in data_dict.values()}
+                if len(n_features) != 1:
+                    raise ValueError(f"Inconsistent feature dimensions across symbols: {shapes}")
+
+                # Set dynamic feature_dim
+                print(n_features)
+                model_params_flat["feature_dim"] = next(iter(n_features))
 
                 # Start MLflow run for this trial
                 with mlflow.start_run(
@@ -286,6 +290,7 @@ class OptunaHparamsTuner:
                     
                     # Initialize and train model TODO: ensure train data has validation set as well
                     # leave this order to make train_offset be overwritten by flat params type
+                    print((trial_hparams | model_params_flat)["feature_dim"])
                     model = ModelClass(**(trial_hparams | model_params_flat) )
                     
                     # all assets have same number of bars is ensured by get_data()

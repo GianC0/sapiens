@@ -8,14 +8,16 @@ Provides various augmentation techniques for financial time series:
 - Mixup on returns
 - Latent space augmentation
 """
-
 from __future__ import annotations
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from arch import arch_model
+import abc
+from pathlib import Path
 import logging 
 import talib
 from joblib import dump, load
@@ -31,7 +33,6 @@ class DataAugmentor:
         self.market_data_type = augmentation_config.get("features_to_load", "candles")  #OHLCV, orderbook, possibly more
         self.modality = augment_modality 
         self.pca = augmentation_config.get("pca", True)
-
         self.pca_var_explained = augmentation_config.get("pca_var_explained", 0.95) #if using var explained to choose n_components
 
         # Choose implementation based on market data type
@@ -43,7 +44,7 @@ class DataAugmentor:
             raise ValueError(f"Unknown data type to augment: {self.market_data_type}")
         
         self.pca_model = None
-        self.pca_model_path = augmentation_config.get("pca_dir", "/logs/models/pca/")
+        self.pca_model_path= augmentation_config.get("pca_dir", Path("/logs/backtests/pca/"))#where to save/load pca model
 
     def augment(self, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         # Run base augmentations per symbol
@@ -54,80 +55,126 @@ class DataAugmentor:
             out = self.apply_PCA(out)
         return out
     
-    def apply_PCA(self, data: Dict[str, pd.DataFrame], n_components: int = 10) -> Dict[str, pd.DataFrame]:
-        # Add a temporary column to track symbols
-        labeled_data = [df.assign(_symbol=symbol) for symbol, df in data.items()]
-        combined = pd.concat(labeled_data, axis=0)
-
-        # Select numeric columns and handle missing values
-        numeric_cols = combined.select_dtypes(include=[np.number]).columns
-        X = combined[numeric_cols].fillna(0).values  # TODO: better missing value handling
-
-        # Fit PCA on train; reuse on prediction/stream
+    def apply_PCA(self, data: Dict[str, pd.DataFrame], variance_explained: float = 0.95) -> Dict[str, pd.DataFrame]:
+        """
+        Apply PCA with per-symbol normalization.
+        Normalize each symbol independently, then fit a single PCA on all normalized data.
+        """
+        
+        # Select numeric columns
+        numeric_cols = list(data.values())[0].select_dtypes(include=[np.number]).columns
+        
+        # Normalize per symbol and combine
+        normalized_data = []
+        for symbol, df in data.items():
+            # Fill missing values per symbol (forward-fill then mean)
+            df_filled = df[numeric_cols].fillna(method='ffill').fillna(df[numeric_cols].mean()) #TODO: consider more advanced imputation
+            
+            # Normalize per symbol
+            scaler = StandardScaler()
+            df_normalized = pd.DataFrame(
+                scaler.fit_transform(df_filled),
+                columns=numeric_cols,
+                index=df.index
+            )
+            df_normalized['_symbol'] = symbol
+            
+            # Add back non-numeric columns
+            non_numeric = df.drop(columns=numeric_cols, errors='ignore')
+            df_normalized = pd.concat([non_numeric, df_normalized], axis=1)
+            normalized_data.append(df_normalized)
+        
+        combined = pd.concat(normalized_data, axis=0)
+        X = combined[numeric_cols].values
+        
+        # Train or apply PCA
         if self.modality == "train":
-            self.pca_model = PCA(n_components=min(n_components, X.shape[1]))
+            self.pca_model = PCA(n_components=variance_explained)
             X_pca = self.pca_model.fit_transform(X)
-            dump(self.pca_model, self.pca_model_path + "_test" + "_pca.joblib") #TODO: use same run_dir as models
-        else:
+            dump(self.pca_model, self.pca_model_path / "pca.joblib")
+            
+            explained = self.pca_model.explained_variance_ratio_.sum()
+            print(f"PCA retained {explained:.2%} of variance using {self.pca_model.n_components_} components.")
+        
+        elif self.modality == "stream":
             if self.pca_model is None:
-                self.pca_model = load(self.pca_model_path)
+                self.pca_model = load(self.pca_model_path / "pca.joblib")
             X_pca = self.pca_model.transform(X)
-
+        
         # Combine PCA features with non-numeric columns
         combined_pca = pd.concat(
-            [combined.drop(columns=numeric_cols, errors="ignore"), 
-            pd.DataFrame(X_pca, columns=[f"pca_{i+1}" for i in range(X_pca.shape[1])], index=combined.index)],
-            axis=1
+            [
+                combined.drop(columns=numeric_cols, errors="ignore"),
+                pd.DataFrame(
+                    X_pca,
+                    columns=[f"pca_{i+1}" for i in range(X_pca.shape[1])],
+                    index=combined.index,
+                ),
+            ],
+            axis=1,
         )
-
+        
         # Split back by symbol
-        out = {str(symbol): group.drop(columns="_symbol") for symbol, group in combined_pca.groupby("_symbol")}
-
+        out = {
+            str(symbol): group.drop(columns="_symbol")
+            for symbol, group in combined_pca.groupby("_symbol")
+        }
+        
         return out
 
-class _OHCLVAugmentor:
-    def __init__(self,        
-        OHLCV_augmentation_config: Dict[str, Any],
-        augment_modality: str = "train", #train or stream
-        ):
+class _BaseAugmentor(abc.ABC):
+    """Abstract base class for all market data augmentors."""
 
-        self.technical_indicators = OHLCV_augmentation_config.get("technical_indicators", True)
+    def __init__(self, augment_modality: str = "train"):
+        if augment_modality not in {"train", "stream"}:
+            raise ValueError("augment_modality must be 'train' or 'stream'")
         self.modality = augment_modality
 
-        self.timeperiod = OHLCV_augmentation_config.get("techinds_timeperiod", 14)
-        
-        self.source = talib if self.modality == "train" else talib.stream
+    @abc.abstractmethod
+    def _check_input(self, df: pd.DataFrame) -> None:
+        """Validate the DataFrame structure."""
+        pass
 
+    @abc.abstractmethod
+    def _augment(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply augmentation logic and return augmented DataFrame."""
+        pass
+
+    def augment(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Standard entry point: validate then augment."""
+        self._check_input(df)
+        logger.debug(f"Running {self.__class__.__name__} augmentation, mode={self.modality}")
+        return self._augment(df)
+
+class _OHCLVAugmentor(_BaseAugmentor):
+    def __init__(self, cfg: dict, augment_modality: str = "train"):
+        super().__init__(augment_modality)
+        self.technical_indicators = cfg.get("technical_indicators", True)
+        self.timeperiod = cfg.get("techinds_timeperiod", 14)
+        self.source = talib if self.modality == "train" else talib.stream
         self.technical_indicators_list = []
 
+    def _check_input(self, df: pd.DataFrame) -> None:
+        required = {"Open", "High", "Low", "Close", "Volume"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"Missing OHLCV columns: {missing}")
 
-    def _check_OHLCV(self, df: pd.DataFrame):
-        required_cols = {"Open", "High", "Low", "Close", "Volume"}
-        if not required_cols.issubset(df.columns):
-            raise ValueError(f"DataFrame must contain OHLCV columns: {required_cols}")
-        
-
-    def _augment(self, ohlcv_df: pd.DataFrame) -> pd.DataFrame:
-
-        self._check_OHLCV(ohlcv_df)
-
-        out = ohlcv_df.copy()  
+    def _augment(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy(deep=False)
 
         if self.modality == "stream":
             #historical = retrieveFromCatalog(symbol).tail(self.timeperiod)
             #df = pd.concat([historical, df]).reset_index(drop=True)
             out = out
 
-        # Add technical indicators
         if self.technical_indicators:
             out = self._add_technical_indicators(out)
-            print(out.head())
-            #Add other engineered features
-      
-        return out
 
+        #Add other engineered features
+        return out
+        
     def _add_technical_indicators(self, df, timeperiod = 14):
-        self._check_OHLCV(df)
 
         out = df.copy()
 
