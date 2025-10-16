@@ -159,6 +159,7 @@ STRATEGY:
     backtest_end:   "2025-01-01" # End of walk-forward evaluation.
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
+    cash_buffer: 50              # cash buffer to always keep in portfolio to cover rounding errors
     currency: USD
     warm_start:      true        # Enable warm-start                   
     rebalance_only: false        # false = all universe instruments are considered for top_k. true = portoflio instruments stay the same, with dynamic reallocation 
@@ -181,11 +182,41 @@ STRATEGY:
     # Hyperparameter tuning Settings and Objectives
     # Objectives: sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown, total_return, annual_return, daily_vol
     tune_hparams: true
-    n_trials: 1
-    objectives:          # use only nautilus_trader portfolio_analyzer statistics
-      sharpe_ratio: maximize
-      #total_return: maximize
-      #profit_factor: maximize 
+    n_trials: 1      
+    objectives: # use only nautilus_trader portfolio_analyzer statistics
+      ## Performance / Returns ##
+      #returns_volatility: minimize      
+      #avg_return: maximize
+      #avg_loss_pct: minimize              
+      #avg_win_pct: maximize
+
+      ## Risk-Adjusted Ratios ##
+      #sharpe_ratio: maximize
+      #sortino_ratio: maximize
+      #profit_factor: maximize
+      #risk_return_ratio: maximize
+
+      ## PnL & Drawdown ##
+      #total_pnl: maximize
+      total_pnl_pct: maximize
+      #max_drawdown: minimize              # reduce max drawdown
+
+      ## Trade-Level Stats ##
+      #max_winner: maximize                # larger best trade is usually good
+      #avg_winner: maximize
+      #min_winner: maximize                # increase the worst winning trade
+      num_trades: minimize
+
+      ## loser/loss metrics — negative sign convention                      ##
+      ## (maximize direction of negatives => tries to bring losses to zero) ##
+      #min_loser: maximize                 # see note above re: sign convention
+      #avg_loser: maximize                 # see note above
+      #max_loser: minimize                 # typically want to reduce the worst loss magnitude
+
+      ## Expectancy & Win Rate ##
+      #expectancy: maximize
+      #win_rate: maximize
+
 
 
 
@@ -198,9 +229,15 @@ STRATEGY:
 
     # Trading friction costs
     costs:
-      fee_bps:    0.5          # One-way commission in basis-points of notional (:100): 0.005% / share
       prob_slippage: 0.0       # Simulates the probability of experiencing price slippage when executing market orders. If triggered, the order fill price has prob_slippage chances to be filled at next tick (for all market levels data L1/L2/L3) 
       prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
+
+    # Trading Commissions Model for fees
+    fee_model:                                       # Fee model defined in algos.fees. Modify only name and add respective params for other fee models
+      name: QuantityBasedMinMaxCommissionFeeModel    # Interactive Brokers
+      commission_per_unit: 0.005                     # One-way commission 0.005% / share
+      min_commission: 1.0                            # $1 minimum per order
+      max_commission_pct: 0.01                       # max commission is 1% of trade value for that asset 
 
     # Order execution algorithm
     execution:
@@ -220,7 +257,7 @@ STRATEGY:
 
     # Risk Management
     risk:
-      max_weight_abs:            1.0                # Max 3 % NAV per single position        (concentration limit)
+      max_weight_abs:            0.5                # Max x% NAV per single position        (concentration limit)
       drawdown_max:              0.15               # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
       trailing_stop_max:         0.05               # % trailing stop from HWM/LWM 5% for single instrument
       target_volatility:  0.05               # 15% tarket volatility for efficient risk optimizer             

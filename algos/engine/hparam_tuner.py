@@ -16,20 +16,22 @@ from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, ImportableExecAlgorithmConfig, LoggingConfig, ImportableFeeModelConfig, ImportableFillModelConfig
 from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.backtest.models import FillModel, MakerTakerFeeModel
+from nautilus_trader.backtest.models import FillModel, FeeModel
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.backtest.node import BacktestEngineConfig
-#from nautilus_trader.common.component import RiskEngine   to fix
-from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig, MakerTakerFeeModelConfig, FillModelConfig
+#from nautilus_trader.common.component import RiskEngine   TODO: fix
+from nautilus_trader.backtest.config import BacktestRunConfig, BacktestVenueConfig
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm, TWAPExecAlgorithmConfig
 from nautilus_trader.backtest.node import BacktestNode
-from pathlib import Path
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.model.objects import Price, Quantity, Money
 from copy import deepcopy
 
 import pandas_market_calendars as market_calendars
 from math import exp
+from pathlib import Path
+from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Dict, Any, Optional, Tuple
 from unittest import loader
@@ -366,23 +368,22 @@ class OptunaHparamsTuner:
         if self.best_model_params_flat is None or self.best_model_path is None:
             raise ValueError("Must run optimize_model() before optimize_strategy()")
         
-        strategy_name = self.strategy_params.get('strategy_name', 'TopKStrategy')
-
-        try:
-            # Try to import from algos module
-            strategy_module = importlib.import_module(f"algos.{strategy_name}")
-            StrategyClass = getattr(strategy_module, strategy_name, None)
-            
-            if StrategyClass is None:
-                # Try without redundant naming (e.g., algos.TopKStrategy.Strategy)
-                StrategyClass = getattr(strategy_module, "Strategy", None)
-            
-            if StrategyClass is None:
-                raise ImportError(f"Could not find strategy class in algos.{strategy_name}")
-                
-        except ImportError as e:
-            logger.error(f"Failed to import strategy {strategy_name}: {e}")
-            raise
+        #strategy_name = self.strategy_params.get('strategy_name', 'TopKStrategy')
+        #try:
+        #    # Try to import from algos module
+        #    strategy_module = importlib.import_module(f"algos.{strategy_name}")
+        #    StrategyClass = getattr(strategy_module, strategy_name, None)
+        #    
+        #    if StrategyClass is None:
+        #        # Try without redundant naming (e.g., algos.TopKStrategy.Strategy)
+        #        StrategyClass = getattr(strategy_module, "Strategy", None)
+        #    
+        #    if StrategyClass is None:
+        #        raise ImportError(f"Could not find strategy class in algos.{strategy_name}")
+        #        
+        #except ImportError as e:
+        #    logger.error(f"Failed to import strategy {strategy_name}: {e}")
+        #    raise
 
         # Create MLflow experiment for strategy optimization
         with mlflow.start_run(
@@ -448,14 +449,15 @@ class OptunaHparamsTuner:
                         mlflow.log_metric(metric_name, metric_value)
                     
                     # Use Portfolio return as objective
-                    scores = tuple(metrics[obj] for obj in objectives )
-                    
+                    scores = tuple(metrics[obj] for obj in objectives)
+                    scores_dict = {obj: metrics[obj] for obj in metrics if obj in objectives}
+
                     # Store trial attributes
                     trial.set_user_attr("metrics", metrics)
                     trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
-                    trial.set_system_attr("strategy_params_path", strategy_params_path)
+                    trial.set_user_attr("strategy_params_path", str(strategy_params_path))
                     
-                    logger.info(f"  Trial {trial.number}: Scores = {scores:.4f}")
+                    logger.info(f"  Trial {trial.number}: Scores = {scores_dict}")
                     
                     return scores
             
@@ -477,7 +479,7 @@ class OptunaHparamsTuner:
             mlflow.log_params({
                 f"best_strategy_{k}": v for k, v in best_trial.params.items()
             })
-            mlflow.log_metric("best_strategy_sharpe", best_trial.value) # type: ignore
+            mlflow.log_metrics("best_strategy_metric", best_trial.value) # type: ignore
             
             logger.info(f"\nBest strategy trial: {best_trial.number}")
             logger.info(f"Best strategy Sharpe: {best_trial.value:.4f}")
@@ -572,7 +574,7 @@ class OptunaHparamsTuner:
         # Run backtest
         node.run()
 
-        engine = node.get_engines()
+        engine = node.get_engines()[0]
         venue = Venue(self.strategy_params["venue_name"])
 
         # Calculate metrics using Nautilus built-in analyzer
@@ -583,101 +585,167 @@ class OptunaHparamsTuner:
         return metrics
 
     def _compute_metrics(self, engine: BacktestEngine, venue: Venue, strategy_params_flat: Dict) -> Dict:
-        # Calculate metrics using Nautilus built-in analyzer
+        """
+        Compute comprehensive metrics and generate all Nautilus reports.
+        Logs all reports to MLflow as both tables and CSV artifacts.
+        
+        Returns:
+            Dictionary of key performance metrics
+        """
         metrics = {}
 
-        # Get portfolio analyzer for comprehensive metrics
-        portfolio_analyzer = engine.analyzer
-        
-        # Get account for final balance
+        # Get portfolio, trader, and account
+        portfolio = getattr(engine, "portfolio", None)
+        portfolio_analyzer = getattr(portfolio, "analyzer", None) if portfolio is not None else None
+        trader = getattr(engine, "trader", None)
         account = engine.cache.account_for_venue(venue)
-        
+
         try:
-            # Get portfolio statistics from analyzer
-            stats = portfolio_analyzer.get_portfolio_stats()
-            
-            # TODO: decide what to store/analyze
-            # check: https://github.com/nautechsystems/nautilus_trader/tree/develop/nautilus_trader/analysis/statistics
-            # check: https://nautilustrader.io/docs/latest/concepts/reports
+            # ===== GENERATE ALL REPORTS =====
+            if trader is not None:
+                # 1. Orders Report
+                try:
+                    orders_report = trader.generate_orders_report()
+                    if not orders_report.empty:
+                        mlflow.log_table(orders_report, "orders_report.json")
+                        #orders_report.to_csv("orders_report.csv")
+                        #mlflow.log_artifact("orders_report.csv")
+                        logger.info(f"Logged orders report: {len(orders_report)} orders")
+                except Exception as e:
+                    logger.warning(f"Could not generate orders report: {e}")
 
-            # Extract key metrics
-            metrics['sharpe_ratio'] = stats.get('sharpe_ratio', 0.0) if stats else 0.0
-            metrics['sortino_ratio'] = stats.get('sortino_ratio', 0.0) if stats else 0.0
-            metrics['calmar_ratio'] = stats.get('calmar_ratio', 0.0) if stats else 0.0
-            metrics['max_drawdown'] = stats.get('max_drawdown', 0.0) if stats else 0.0
-            
-            # Get returns statistics
-            returns_stats = portfolio_analyzer.get_returns_stats() if hasattr(portfolio_analyzer, 'get_returns_stats') else {}
-            metrics['total_return'] = returns_stats.get('total_return', 0.0) if returns_stats else 0.0
-            metrics['annual_return'] = returns_stats.get('annual_return', 0.0) if returns_stats else 0.0
-            metrics['daily_vol'] = returns_stats.get('daily_vol', 0.0) if returns_stats else 0.0
-            
-            # Get trade statistics
-            trade_stats = portfolio_analyzer.get_trade_stats() if hasattr(portfolio_analyzer, 'get_trade_stats') else {}
-            metrics['num_trades'] = trade_stats.get('total_trades', 0) if trade_stats else 0
-            metrics['win_rate'] = trade_stats.get('win_rate', 0.0) if trade_stats else 0.0
-            metrics['avg_win'] = trade_stats.get('avg_win', 0.0) if trade_stats else 0.0
-            metrics['avg_loss'] = trade_stats.get('avg_loss', 0.0) if trade_stats else 0.0
-            metrics['profit_factor'] = trade_stats.get('profit_factor', 0.0) if trade_stats else 0.0
+                # 2. Order Fills Report (summary of filled orders)
+                try:
+                    order_fills_report = trader.generate_order_fills_report()
+                    if not order_fills_report.empty:
+                        mlflow.log_table(order_fills_report, "order_fills_report.json")
+                        #order_fills_report.to_csv("order_fills_report.csv")
+                        #mlflow.log_artifact("order_fills_report.csv")
+                        logger.info(f"Logged order fills report: {len(order_fills_report)} filled orders")
+                except Exception as e:
+                    logger.warning(f"Could not generate order fills report: {e}")
 
-            logger.info(f"Metrics loaded successfully")
+                # 3. Fills Report (individual fill events)
+                try:
+                    fills_report = trader.generate_fills_report()
+                    if not fills_report.empty:
+                        mlflow.log_table(fills_report, "fills_report.json")
+                        #fills_report.to_csv("fills_report.csv")
+                        #mlflow.log_artifact("fills_report.csv")
+                        logger.info(f"Logged fills report: {len(fills_report)} fills")
+                except Exception as e:
+                    logger.warning(f"Could not generate fills report: {e}")
+
+                # 4. Positions Report (includes snapshots for NETTING OMS)
+                try:
+                    positions_report = trader.generate_positions_report()
+                    if not positions_report.empty:
+                        mlflow.log_table(positions_report, "positions_report.json")
+                        #positions_report.to_csv("positions_report.csv")
+                        #mlflow.log_artifact("positions_report.csv")
+                        logger.info(f"Logged positions report: {len(positions_report)} positions")
+                except Exception as e:
+                    logger.warning(f"Could not generate positions report: {e}")
+
+                # 5. Account Report (balance changes over time)
+                try:
+                    account_report = trader.generate_account_report(venue)
+                    if not account_report.empty:
+                        mlflow.log_table(account_report, "account_report.json")
+                        #account_report.to_csv("account_report.csv")
+                        #mlflow.log_artifact("account_report.csv")
+                        logger.info(f"Logged account report: {len(account_report)} snapshots")
+                except Exception as e:
+                    logger.warning(f"Could not generate account report: {e}")
+
+            # ===== EXTRACT PORTFOLIO STATISTICS =====
+            stats_general = {}
+            returns_stats = {}
+            pnl_stats = {}
             
+            if portfolio_analyzer is not None:
+                # Get general performance statistics
+                if hasattr(portfolio_analyzer, "get_performance_stats_general"):
+                    stats_general = portfolio_analyzer.get_performance_stats_general()
+                elif hasattr(portfolio_analyzer, "get_portfolio_stats"):
+                    stats_general = portfolio_analyzer.get_portfolio_stats()
+
+                # Get returns statistics
+                if hasattr(portfolio_analyzer, "get_performance_stats_returns"):
+                    returns_stats = portfolio_analyzer.get_performance_stats_returns()
+                elif hasattr(portfolio_analyzer, "get_returns_stats"):
+                    returns_stats = portfolio_analyzer.get_returns_stats()
+
+                # Get PnL statistics
+                if hasattr(portfolio_analyzer, "get_performance_stats_pnls"):
+                    pnl_stats = portfolio_analyzer.get_performance_stats_pnls()
+
+            # Combine all stats and log numeric values
+            all_stats = {**stats_general, **returns_stats, **pnl_stats}
+            all_stats = {k: float(v) for k, v in all_stats.items() if isinstance(v, (int, float))}
+
+            # Extract Returns metrics
+            metrics['returns_volatility'] = all_stats.get('Returns Volatility (252 days)', 0.0)
+            metrics['avg_return'] = all_stats.get('Average (Return)', 0.0)
+            metrics['avg_loss_pct'] = all_stats.get('Average Loss (Return)', 0.0)
+            metrics['avg_win_pct'] = all_stats.get('Average Win (Return)', 0.0)
+            metrics['sharpe_ratio'] = all_stats.get('Sharpe Ratio (252 days)', 0.0)
+            metrics['sortino_ratio'] = all_stats.get('Sortino Ratio (252 days)' , 0.0)
+            metrics['profit_factor'] = all_stats.get('Profit Factor', 0.0)
+            metrics['risk_return_ratio'] = all_stats.get('Risk Return Ratio', 0.0)
+
+            # Extract PnL metrics
+            metrics['total_pnl'] = all_stats.get('PnL (total)', 0.0)
+            metrics['total_pnl_pct'] = all_stats.get('PnL% (total)', 0.0)
+            metrics['max_drawdown'] = all_stats.get('Max Drawdown', 0.0)
+            metrics['max_winner'] = all_stats.get('Max Winner', 0.0)
+            metrics['avg_winner'] = all_stats.get('Avg Winner', 0.0)
+            metrics['min_winner'] = all_stats.get('Min Winner', 0.0)
+            metrics['min_loser'] = all_stats.get('Min Loser', 0.0)
+            metrics['avg_loser'] = all_stats.get('Avg Loser', 0.0)
+            metrics['max_loser'] = all_stats.get('Max Loser', 0.0)
+            metrics["expectancy"] = all_stats.get('Expectancy', 0.0)
+            metrics["win_rate"] = all_stats.get('Win Rate', 0.0)
+            
+            # Get trade count from cache
+            positions_closed = list(engine.cache.positions_closed())
+            metrics['num_trades'] = len(positions_closed)
+
+            logger.info(f"Extracted {len(metrics)} metrics successfully")
+
         except Exception as e:
-            logger.warning(f"Could not get analyzer metrics: {e}, calculating manually")
-            
-            # Fallback to manual calculation if analyzer methods not available
+            logger.warning(f"Error in comprehensive metrics collection: {e}, using fallback")
+
+            # Fallback manual calculations
             positions = list(engine.cache.positions_closed())
             num_trades = len(positions)
-            
+
             if num_trades > 0:
                 winning_trades = sum(1 for p in positions if p.realized_pnl.as_double() > 0)
                 win_rate = winning_trades / num_trades
                 
-                # Calculate PnLs
-                pnls = [p.realized_pnl.as_double() for p in positions]
-                avg_pnl = sum(pnls) / len(pnls) if pnls else 0
-                
-                # Calculate returns from equity curve
                 initial_balance = float(strategy_params_flat['initial_cash'])
                 final_balance = float(account.balance_total(strategy_params_flat["currency"]).as_double())
                 total_return = (final_balance / initial_balance) - 1 if initial_balance > 0 else 0
-                
-                # Simple Sharpe calculation
-                if len(pnls) > 1:
-                    returns = [(pnls[i] / initial_balance) for i in range(len(pnls))]
-                    if len(returns) > 0 and all(r == returns[0] for r in returns):
-                        sharpe_ratio = 0.0  # All returns are the same
-                    else:
-                        import numpy as np
-                        returns_array = np.array(returns)
-                        sharpe_ratio = (np.mean(returns_array) / np.std(returns_array)) * np.sqrt(252) if np.std(returns_array) > 0 else 0
-                else:
-                    sharpe_ratio = 0.0
-                    
-                metrics = {
-                    'sharpe_ratio': sharpe_ratio,
-                    'total_return': total_return,
-                    'max_drawdown': 0.0,  # Would need equity curve to calculate
-                    'win_rate': win_rate,
-                    'num_trades': num_trades,
-                    'avg_pnl': avg_pnl,
-                    'final_balance': final_balance,
-                }
-            else:
-                # No trades executed
-                initial_balance = float(strategy_params_flat['initial_cash'])
-                final_balance = float(account.balance_total(strategy_params_flat["currency"]).as_double())
-                
+
                 metrics = {
                     'sharpe_ratio': 0.0,
-                    'total_return': (final_balance / initial_balance) - 1 if initial_balance > 0 else 0,
-                    'max_drawdown': 0.0,
-                    'win_rate': 0.0,
+                    'total_pnl_pct': total_return,
+                    'win_rate': win_rate,
+                    'num_trades': num_trades,
+                }
+            else:
+                initial_balance = float(strategy_params_flat['initial_cash'])
+                final_balance = float(account.balance_total(strategy_params_flat["currency"]).as_double())
+
+                metrics = {
+                    'sharpe_ratio': 0.0,
+                    'total_pnl_pct': (final_balance / initial_balance) - 1 if initial_balance > 0 else 0,
                     'num_trades': 0,
-                    'final_balance': final_balance,
                 }
 
         return metrics
+
     
     def _add_dates(self, cfg, offset, to_strategy = False) -> Dict:
         
@@ -739,6 +807,7 @@ class OptunaHparamsTuner:
     
     def _produce_backtest_config(self, backtest_cfg, start, end) -> BacktestRunConfig:
 
+        fee_model = backtest_cfg["STRATEGY"]["fee_model"]["name"]
         # Initialize Venue configs
         venue_configs = [
             BacktestVenueConfig(
@@ -760,11 +829,15 @@ class OptunaHparamsTuner:
 
                 ),
                 fee_model=ImportableFeeModelConfig(
-                    fee_model_path = "nautilus_trader.backtest.models:MakerTakerFeeModel",
-                    config_path = "nautilus_trader.backtest.config:MakerTakerFeeModelConfig",
-                    config = {},
+                    fee_model_path = f"algos.fees.{fee_model}:{fee_model}",
+                    config_path = f"algos.fees.{fee_model}:{fee_model}Config",
+                    config = { "config" : {
+                                    "commission_per_unit": Money(float(backtest_cfg["STRATEGY"]["fee_model"]["commission_per_unit"]) , backtest_cfg["STRATEGY"]["currency"]),  
+                                    "min_commission": Money( backtest_cfg["STRATEGY"]["fee_model"]["min_commission"] , backtest_cfg["STRATEGY"]["currency"]),
+                                    "max_commission_pct": Decimal(backtest_cfg["STRATEGY"]["fee_model"]["max_commission_pct"])
+                                }
+                    },
                 ),
-                # TODO: implement fee model
             ),
         ]
         bar_spec = freq2barspec(backtest_cfg["STRATEGY"]["freq"])
@@ -783,20 +856,7 @@ class OptunaHparamsTuner:
         # Initialize Strategy
         strategy_name = self.strategy_params['strategy_name']
         model_name = self.model_params["model_name"]
-        try:
-            # Try to import from algos module
-            strategy_module = importlib.import_module(f"algos.{strategy_name}")
-            StrategyClass = getattr(strategy_module, strategy_name, None)
-            if StrategyClass is None:
-                # Try without redundant naming (e.g., algos.TopKStrategy.Strategy)
-                StrategyClass = getattr(strategy_module, "Strategy", None)
-            if StrategyClass is None:
-                raise ImportError(f"Could not find strategy class in algos.{strategy_name}")
-        except ImportError as e:
-            logger.error(f"Failed to import strategy {strategy_name}: {e}")
-            raise
-        #strategy = StrategyClass(config=backtest_cfg)
-        # TODO: add the fees from transactions and costs from config, add risk engine
+        # TODO:  add risk engine
         config=BacktestRunConfig(
                 engine=BacktestEngineConfig(
                     trader_id=f"Backtest-{model_name}-{strategy_name}",

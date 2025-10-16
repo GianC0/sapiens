@@ -69,7 +69,6 @@ class PortfolioOptimizer:
         self, 
         ef: EfficientFrontier, 
         allowed_weight_ranges: np.ndarray,
-        commission_rate: float,
     ) -> None:
         """
         Apply all portfolio constraints to EfficientFrontier object.
@@ -77,7 +76,6 @@ class PortfolioOptimizer:
         Args:
             ef: EfficientFrontier object to apply constraints to
             allowed_weight_ranges: Array of shape (n_assets, 2) with [min, max] for each asset
-            commission_rate: Commission rate for round-trip trades
         """
         # 1. ADV/Liquidity constraints
         if allowed_weight_ranges is not None:
@@ -88,12 +86,6 @@ class PortfolioOptimizer:
                 if bool(w_max <= self.weight_bounds[1]):
                     ef.add_constraint(lambda w, idx=i, wmax=w_max: w[idx] <= wmax)
         
-        # 2. Global commission (L1 / gross exposure) constraint:
-        # Ensure sum of absolute weights leaves room for round-trip commissions
-        if commission_rate > 0:
-            max_deployment = 1.0 - (2 * commission_rate)
-            ef.add_constraint(lambda w, md=max_deployment: cp.sum(cp.abs(w)) <= md)
-            logger.debug(f"Applied commission constraint: max deployment = {max_deployment:.4f}")
     
     def _apply_constraints_and_top_k(
         self,
@@ -101,7 +93,6 @@ class PortfolioOptimizer:
         stage1_weights: np.ndarray,
         selector_k: int,
         allowed_weight_ranges: np.ndarray,
-        commission_rate: float
     ) -> None:
         """
         Force non-top-k weights to zero and reapply constraints.
@@ -111,7 +102,6 @@ class PortfolioOptimizer:
             stage1_weights: Weights from first optimization pass
             selector_k: Number of assets to select
             allowed_weight_ranges: Per-asset weight bounds
-            commission_rate: Commission rate for constraints
         """
         # Pick top-k indices by absolute weight
         idx_sorted = np.argsort(-np.abs(stage1_weights))
@@ -123,7 +113,7 @@ class PortfolioOptimizer:
                 ef.add_constraint(lambda w, idx=i: w[idx] == 0.0)
         
         # Reapply other constraints
-        self._apply_constraints(ef, allowed_weight_ranges, commission_rate)
+        self._apply_constraints(ef, allowed_weight_ranges)
 
     def _get_safe_fallback_weights(
         self, 
@@ -139,19 +129,19 @@ class PortfolioOptimizer:
         """
         
         # Option 1: Try to maintain current positions if provided
-        if current_weights and len(current_weights) == n_assets:
-            # Check if current weights are within new constraints
-            if allowed_weight_ranges:
-                valid_current = True
-                for i in range(n_assets):
-                    w_min, w_max = allowed_weight_ranges[i]
-                    if current_weights[i] < w_min or current_weights[i] > w_max:
-                        valid_current = False
-                        break
-                
-                if valid_current:
-                    logger.info("Optimization failed: maintaining current positions")
-                    return current_weights
+        #if current_weights and len(current_weights) == n_assets:
+        #    # Check if current weights are within new constraints
+        #    if allowed_weight_ranges:
+        #        valid_current = True
+        #        for i in range(n_assets):
+        #            w_min, w_max = allowed_weight_ranges[i]
+        #            if current_weights[i] < w_min or current_weights[i] > w_max:
+        #                valid_current = False
+        #                break
+        #        
+        #        if valid_current:
+        #            logger.info("Optimization failed: maintaining current positions")
+        #            return current_weights
         
         # Option 2: Return zero weights (hold cash outside of portfolio)
         logger.warning("Optimization failed: no feasible allocation, holding cash or all to risk free")
@@ -164,7 +154,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
         self.risk_free_rate = risk_free_rate
     
-    def optimize(self, er: pd.Series, cov: pd.DataFrame, rf: float, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, commission_rate: float, **kwargs) -> np.ndarray:
+    def optimize(self, er: pd.Series, cov: pd.DataFrame, rf: float, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, **kwargs) -> np.ndarray:
         """
         Find weights that maximize Sharpe ratio.
         
@@ -185,7 +175,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
                 solver=self.solver
             )
             # Apply all constraints (without top-k)
-            self._apply_constraints(ef, allowed_weight_ranges, commission_rate)
+            self._apply_constraints(ef, allowed_weight_ranges)
             
             # Maximize Sharpe ratio
             ef.max_sharpe(risk_free_rate=risk_free)
@@ -208,7 +198,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
                 # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, commission_rate)
+                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_sharpe(risk_free_rate=rf)
@@ -234,7 +224,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
 class MinVarianceOptimizer(PortfolioOptimizer):
     """Minimum variance portfolio optimizer using PyPortfolioOpt."""
     
-    def optimize(self, er: pd.Series, cov: pd.DataFrame, rf: float, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, commission_rate: float, **kwargs) -> np.ndarray:
+    def optimize(self, er: pd.Series, cov: pd.DataFrame, rf: float, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, **kwargs) -> np.ndarray:
         """
         Find minimum variance portfolio.
         
@@ -251,7 +241,7 @@ class MinVarianceOptimizer(PortfolioOptimizer):
             )
 
             # Add all constraints
-            self._apply_constraints(ef, allowed_weight_ranges, commission_rate)
+            self._apply_constraints(ef, allowed_weight_ranges)
             
             # Minimize volatility
             ef.min_volatility()
@@ -274,7 +264,7 @@ class MinVarianceOptimizer(PortfolioOptimizer):
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
                 # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, commission_rate)
+                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_sharpe(risk_free_rate=rf)
@@ -313,7 +303,7 @@ class M2Optimizer(PortfolioOptimizer):
         """
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
     
-    def optimize(self, er: pd.Series, cov: pd.DataFrame, rf: float, benchmark_vol: float, allowed_weight_ranges: np.ndarray , current_weights: np.ndarray, commission_rate: float, **kwargs) -> np.ndarray:
+    def optimize(self, er: pd.Series, cov: pd.DataFrame, rf: float, benchmark_vol: float, allowed_weight_ranges: np.ndarray , current_weights: np.ndarray, **kwargs) -> np.ndarray:
         """
         Find weights that maximize M² measure.
         
@@ -334,7 +324,7 @@ class M2Optimizer(PortfolioOptimizer):
             # and then scale to match benchmark volatility
 
             # Add all constraints
-            self._apply_constraints(ef, allowed_weight_ranges, commission_rate)
+            self._apply_constraints(ef, allowed_weight_ranges, )
             
             # First get max Sharpe portfolio
             ef.max_sharpe(risk_free_rate=rf)
@@ -355,7 +345,7 @@ class M2Optimizer(PortfolioOptimizer):
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
                 # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, commission_rate)
+                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_sharpe(risk_free_rate=rf)
@@ -416,7 +406,7 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
         self.risk_aversion = risk_aversion
     
-    def optimize(self, er: pd.Series, cov: pd.DataFrame, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, commission_rate: float, **kwargs) -> np.ndarray:
+    def optimize(self, er: pd.Series, cov: pd.DataFrame, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, **kwargs) -> np.ndarray:
         """
         Find weights that maximize quadratic utility.
         
@@ -455,7 +445,7 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
                 # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, commission_rate)
+                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_quadratic_utility(risk_aversion=self.risk_aversion)
@@ -494,7 +484,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
         """
         super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
     
-    def optimize(self, er: pd.Series, cov: pd.DataFrame, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, target_volatility: float, commission_rate: float, **kwargs) -> np.ndarray:
+    def optimize(self, er: pd.Series, cov: pd.DataFrame, allowed_weight_ranges: np.ndarray, current_weights: np.ndarray, target_volatility: float, **kwargs) -> np.ndarray:
         """
         Find weights that maximize return for given risk level.
         """
@@ -530,7 +520,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
                 # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, commission_rate)
+                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.efficient_risk(target_volatility=target_volatility)
