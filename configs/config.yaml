@@ -155,8 +155,9 @@ STRATEGY:
     # Hyperparameter tuning Settings and Objectives
     # Objectives: sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown, total_return, annual_return, daily_vol
     tune_hparams: true
-    n_trials: 1      
-    objectives: # use only nautilus_trader portfolio_analyzer statistics
+    n_trials: 1 
+    primary_objective:  "total_pnl_pct"       # used to determine the overall single best hp tuning trial in multi-objective optimization       
+    objectives:                             # use only nautilus_trader portfolio_analyzer statistics
       ## Performance / Returns ##
       #returns_volatility: minimize      
       #avg_return: maximize

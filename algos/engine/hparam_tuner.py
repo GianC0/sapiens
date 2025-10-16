@@ -369,8 +369,8 @@ class OptunaHparamsTuner:
 
             # Parse Objectives and directions. Structure: obj:direction
             objectives, directions = zip(*self.strategy_params['objectives'].items())
+            primary_obj_index = objectives.index(self.strategy_params.get("primary_objective", "total_pnl_pct"))
             
-            # TODO: ensure propoer direction depending on all the metrics
             study = optuna.create_study(
                 study_name=strategy_study_name,
                 storage=storage,
@@ -442,29 +442,37 @@ class OptunaHparamsTuner:
                 study.optimize(strategy_objective, n_trials=1)
             
             # Get best trial
-            best_trial = study.best_trial
+            best_trials = study.best_trials
+            logger.info(f"Considering best trial for {objectives[primary_obj_index]} as the overall multi-objective best trial")
+
+            if study.directions[primary_obj_index] == optuna.study.StudyDirection.MINIMIZE:
+                best_trial = min(best_trials, key=lambda t: t.values[primary_obj_index])
+            else:
+                best_trial = max(best_trials, key=lambda t: t.values[primary_obj_index])
+            
             self.best_strategy_params_flat = self.strategy_params | best_trial.params
             
             # Log best results
             mlflow.log_params({
                 f"best_strategy_{k}": v for k, v in best_trial.params.items()
             })
-            mlflow.log_metrics("best_strategy_metric", best_trial.value) # type: ignore
+            mlflow.log_metric(f"best_strategy_{objectives[primary_obj_index]}", best_trial.values[primary_obj_index])
             
             logger.info(f"\nBest strategy trial: {best_trial.number}")
-            logger.info(f"Best strategy Sharpe: {best_trial.value:.4f}")
+            logger.info(f"Best strategy {objectives[primary_obj_index]}: {best_trial.values[primary_obj_index]:.4f}")
             logger.info(f"Best strategy hparams: {best_trial.params}")
             
             # Save strategy optimization results
             strategy_results = {
                 "best_trial": best_trial.number,
-                "best_sharpe": best_trial.value,
+                "best_primary_obj": best_trial.values[primary_obj_index],
                 "best_hparams": best_trial.params,
                 "best_metrics": best_trial.user_attrs.get("metrics", {}),
                 "all_trials": [
                     {
                         "number": t.number,
-                        "value": t.value,
+                        "primary_objective_idx":primary_obj_index, 
+                        "values": t.values,
                         "params": t.params,
                         "state": str(t.state),
                     }
