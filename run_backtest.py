@@ -91,7 +91,7 @@ def main():
     logger.info(f"Optimized configuration saved to: {optimized_config_flat_path}")
     
     
-    
+""" 
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 3: FINAL BACKTEST
     # ═══════════════════════════════════════════════════════════════════
@@ -103,6 +103,9 @@ def main():
     # Set backtest dates
     backtest_start = pd.Timestamp(optimized_config_flat["STRATEGY"]["backtest_start"], tz="UTC")
     backtest_end = pd.Timestamp(optimized_config_flat["STRATEGY"]["backtest_end"], tz="UTC")
+
+    # Test directory
+    test_dir = run_dir / "test" 
 
     logger.info(f"Running final backtest from {backtest_start} to {backtest_end}")
     
@@ -118,14 +121,24 @@ def main():
             "end": str(backtest_end),
         })
         mlflow.log_artifact(str(optimized_config_flat_path))
+        mlflow.log_param("test_directory", str(test_dir))
         
         # Run backtest
-        final_metrics = tuner._backtest(
+        final_metrics, final_time_series = tuner._backtest(
             model_params_flat = optimized_config_flat["MODEL"],
             strategy_params_flat = optimized_config_flat["STRATEGY"],
             start = backtest_start,
             end = backtest_end,
         )
+
+
+        tuner._generate_performance_charts(
+            time_series=final_time_series,
+            strategy_params_flat=optimized_config_flat["STRATEGY"],
+            trial_number=-1,  # -1 indicates final backtest
+            output_dir=test_dir
+        )
+        
         
         # Log all metrics
         for metric_name, metric_value in final_metrics.items():
@@ -155,7 +168,7 @@ def main():
     logger.info("\n" + "="*70)
     logger.info("BACKTEST COMPLETE")
     logger.info("="*70)
-
+"""
 
 if __name__ == "__main__":
     main()

@@ -148,9 +148,9 @@ class CsvBarLoader:
         self._benchmark_data = None
         
         if benchmarks_file.exists():
-            df = pd.read_csv(benchmarks_file, parse_dates=['dt'])
+            df = pd.read_csv(benchmarks_file, parse_dates=['dt'], index_col='dt')
             df.rename(columns={"dt": "Date"}, inplace=True)
-            df.index = pd.to_datetime(df.index) 
+            #df.index = pd.to_datetime(df.index) 
             df.index = df.index.tz_localize('America/New_York').tz_convert('UTC')
 
             
