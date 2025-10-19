@@ -11,7 +11,7 @@ Each phase gets its own Optuna study and MLflow experiment.
 
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, ImportableExecAlgorithmConfig, LoggingConfig, ImportableFeeModelConfig, ImportableFillModelConfig
+from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, ImportableExecAlgorithmConfig, LoggingConfig, ImportableFeeModelConfig, ImportableFillModelConfig, RiskEngineConfig
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.models import FillModel, FeeModel
 from nautilus_trader.model.data import Bar, BarType
@@ -891,7 +891,12 @@ class OptunaHparamsTuner:
                         config_path="nautilus_trader.examples.algorithms.twap:TWAPExecAlgorithmConfig",
                         config={}  # Empty config or you can pass TWAP-specific params here
                     )],
-                    #risk_engine = RiskEngine
+                    risk_engine=RiskEngineConfig(
+                        bypass=False,
+                        max_order_submit_rate="100/00:00:01",
+                        max_notional_per_order={},
+
+                    ),
 
                     cache=CacheConfig(
                         bar_capacity=backtest_cfg["STRATEGY"].get("engine", {}).get("cache", {}).get("bar_capacity", 4096)

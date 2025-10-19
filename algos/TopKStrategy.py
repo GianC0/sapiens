@@ -227,8 +227,11 @@ class TopKStrategy(Strategy):
                 # in live should be done through self.request_bars
                 self.on_historical_data(bar_type = bar_type, start = self.data_load_start)
                 
-                # subscribe bars for walk forward
+                # Subscribe bars for walk forward
                 self.subscribe_bars(bar_type)
+                
+                # Subscribe to instrument close events
+                self.subscribe_instrument_close(instrument.id)
 
 
 
@@ -1026,7 +1029,6 @@ class TopKStrategy(Strategy):
         for position in self.cache.positions_open(venue = self.venue):
             instrument_id = position.instrument_id
             bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
-            
             
             # Aggregate positions for each instrument (for HEDGING accounts)
             if instrument_id not in positions_by_instrument:
