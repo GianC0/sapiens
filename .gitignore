@@ -6,6 +6,7 @@ __pycache__/
 # Added by Gian
 logs/
 mlruns/
+data/
 .env
 .vscode
 

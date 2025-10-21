@@ -24,6 +24,7 @@ from nautilus_trader.backtest.node import BacktestNode
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from nautilus_trader.model.objects import Price, Quantity, Money
 
+import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.gridspec import GridSpec
@@ -51,6 +52,21 @@ import logging
 logger = logging.getLogger(__name__)
 
 from algos.engine.data_loader import CsvBarLoader
+from algos.engine.performance_plots import (
+    get_frequency_params,
+    align_series,
+    plot_balance_breakdown,
+    plot_cumulative_returns,
+    plot_rolling_sharpe,
+    plot_risk_free_rate,
+    plot_period_returns,
+    plot_returns_distribution,
+    plot_active_returns,
+    plot_active_returns_heatmap,
+    plot_rolling_ratios,
+    plot_underwater,
+    plot_portfolio_allocation,
+)
 from models.utils import freq2pdoffset, yaml_safe, freq2barspec
 
 
@@ -429,7 +445,7 @@ class OptunaHparamsTuner:
                         time_series=time_series,
                         strategy_params_flat=strategy_params_flat,
                         trial_number=trial.number,
-                        output_dir=trial_path
+                        output_dir=trial_path/"charts",
                     )
                     
                     # Log all metrics
@@ -643,8 +659,8 @@ class OptunaHparamsTuner:
                     if not positions_report.empty:
                         mlflow.log_table(positions_report, "positions_report.json")
                         time_series['positions'] = positions_report
-                        #positions_report.to_csv("positions_report.csv")
-                        #mlflow.log_artifact("positions_report.csv")
+                        positions_report.to_csv("positions_report.csv")
+                        mlflow.log_artifact("positions_report.csv")
                         
                         logger.info(f"Logged positions report: {len(positions_report)} positions")
                 except Exception as e:
@@ -656,8 +672,8 @@ class OptunaHparamsTuner:
                     if not account_report.empty:
                         mlflow.log_table(account_report, "account_report.json")
                         time_series['account'] = account_report
-                        #account_report.to_csv("account_report.csv")
-                        #mlflow.log_artifact("account_report.csv")
+                        account_report.to_csv("account_report.csv")
+                        mlflow.log_artifact("account_report.csv")
                         logger.info(f"Logged account report: {len(account_report)} snapshots")
                 except Exception as e:
                     logger.warning(f"Could not generate account report: {e}")
@@ -914,383 +930,192 @@ class OptunaHparamsTuner:
     def _generate_performance_charts(self, time_series: Dict, strategy_params_flat: Dict, 
                                     trial_number: int, output_dir: Path):
         """
-        Generate comprehensive performance charts from Nautilus Trader data.
-        Works with any bar frequency (1min, 5min, 1H, 1D, etc.).
+        Generate comprehensive performance charts using modular plotting functions.
+        
+        Args:
+            time_series: Dictionary containing account, positions, and other time series
+            strategy_params_flat: Strategy configuration parameters
+            trial_number: Trial number for identification
+            output_dir: Directory to save charts
         """
-        # Extract and process account data from Nautilus
+        # Extract and validate account data
         if 'account' not in time_series or time_series['account'].empty:
             logger.warning("No account data available for charting")
             return
         
         try:
-            # Get bar frequency from config
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Get frequency parameters
             freq = strategy_params_flat.get('freq', '1D')
+            freq_params = get_frequency_params(freq)
+            resample_freq = freq_params['resample_freq']
+            periods_per_year = freq_params['periods_per_year']
+            annualization_factor = freq_params['annualization_factor']
             
-            # Determine periods per year for annualization
-            if 'D' in freq or 'B' in freq:  # Daily or Business day
-                periods_per_year = 252
-                resample_freq = '1D'
-                weekly_freq = 'W'
-                monthly_freq = 'ME'
-            elif 'H' in freq:  # Hourly
-                periods_per_year = 252 * 6.5  # ~1638 trading hours per year
-                resample_freq = '1H'
-                weekly_freq = '1D'
-                monthly_freq = 'W'
-            elif 'T' in freq or 'm' in freq:  # Minutes
-                # Extract number of minutes
-                match = re.search(r'(\d+)', freq)
-                minutes = int(match.group(1)) if match else 1
-                periods_per_year = 252 * 6.5 * 60 / minutes  # Trading minutes per year (6.5h per day)
-                resample_freq = freq
-                weekly_freq = '1D'
-                monthly_freq = 'W'
-            else:  # Default to daily
-                periods_per_year = 252
-                resample_freq = '1D'
-                weekly_freq = 'W'
-                monthly_freq = 'ME'
+            logger.info(
+                f"Generating charts: freq={freq}, periods/year={periods_per_year:.0f}, "
+                f"resample={resample_freq}"
+            )
             
-            annualization_factor = np.sqrt(periods_per_year)
+            # Process account data
+            acc_df = time_series['account'].copy().sort_index()
             
-            logger.info(f"Using frequency: {freq}, periods/year: {periods_per_year:.0f}, resample: {resample_freq}")
+            # ═══════════════════════════════════════════════════════════════
+            # 1. Balance Breakdown (Multi-Currency)
+            # ═══════════════════════════════════════════════════════════════
+            fig1 = plot_balance_breakdown(
+                account_df=acc_df,
+                resample_freq=resample_freq,
+                save_path=output_dir / 'balance_breakdown.png'
+            )
             
-            # Process Nautilus account report
-            acc_df = time_series['account'].copy()
-            acc_df = acc_df.sort_index()
+            # Extract portfolio values for returns calculation
+            portfolio_values = None
+            # TODO: Handle Multi-currency portfolio values from strategy params
+            currency_data = acc_df[acc_df['currency'] == strategy_params_flat["currency"].code]
+            portfolio_values = currency_data['total'].resample(resample_freq).last().ffill()
+
             
-            # Get balance column
-            balance_col = None
-            for col in ['total', "locked", "free", "currency" 'cash_balance', 'equity']:
-                if col in acc_df.columns:
-                    balance_col = col
-                    break
-            
-            if balance_col is None:
-                logger.warning(f"No balance column found. Available: {acc_df.columns.tolist()}")
+            if portfolio_values is None or len(portfolio_values) < 2:
+                logger.warning("Insufficient portfolio value data")
                 return
             
-            # Resample to standard frequency and forward-fill
-            portfolio_values = acc_df[balance_col].resample(resample_freq).last().ffill()
             portfolio_values = portfolio_values.dropna()
             
-            if len(portfolio_values) < 2:
-                logger.warning(f"Insufficient data points: {len(portfolio_values)}")
-                return
-            
-            # Calculate returns
-            returns = pd.to_numeric(portfolio_values).pct_change().fillna(0)
+            # Calculate strategy returns
+            strategy_ret = pd.to_numeric(portfolio_values).pct_change().fillna(0)
             
             # Get benchmark and risk-free data
             benchmark_returns = self.loader.benchmark_returns
             risk_free_returns = self.loader.risk_free_df['risk_free']
             
-            # Align all series - resample benchmark/rf to match strategy frequency
-            benchmark_resampled = benchmark_returns.resample(resample_freq).apply(lambda x: (1 + x).prod() - 1 if len(x) > 0 else 0)
-            rf_resampled = risk_free_returns.resample(resample_freq).apply(lambda x: (1 + x).prod() - 1 if len(x) > 0 else 0)
+            # Align all series with proper timezone handling
+            strategy_ret, benchmark_ret, rf_ret = align_series(
+                strategy_ret, benchmark_returns, risk_free_returns, resample_freq
+            )
             
-            common_dates = returns.index.intersection(benchmark_resampled.index)
-            if len(common_dates) < 2:
-                logger.warning(f"Insufficient overlapping dates: {len(common_dates)}")
+            n_periods = len(strategy_ret)
+            logger.info(f"Aligned series: {n_periods} periods")
+            
+            if n_periods < 2:
+                logger.warning("Insufficient aligned data for charting")
                 return
             
-            strategy_ret = returns.loc[common_dates]
-            benchmark_ret = benchmark_resampled.loc[common_dates]
-            rf_ret = rf_resampled.reindex(common_dates, method='ffill').fillna(0)
+            # Calculate adaptive window sizes
+            window = max(5, int(periods_per_year / 2))  # ~2 days
+            #window = max(5, int(periods_per_year / 25))  # ~2 weeks
+            #window = max(10, int(periods_per_year / 12))  # ~1 month
             
-            output_dir.mkdir(parents=True, exist_ok=True)
-            plt.style.use('seaborn-v0_8-darkgrid')
+            # ═══════════════════════════════════════════════════════════════
+            # 2. Cumulative Returns
+            # ═══════════════════════════════════════════════════════════════
+            fig2 = plot_cumulative_returns(
+                strategy_ret=strategy_ret,
+                benchmark_ret=benchmark_ret,
+                save_path=output_dir / 'cumulative_returns.png'
+            )
             
-            n_periods = len(common_dates)
-            logger.info(f"Generating charts with {n_periods} periods ({freq} frequency)")
+            # ═══════════════════════════════════════════════════════════════
+            # 3. Rolling Sharpe Ratio
+            # ═══════════════════════════════════════════════════════════════
+            fig3 = plot_rolling_sharpe(
+                strategy_ret=strategy_ret,
+                benchmark_ret=benchmark_ret,
+                rf_ret=rf_ret,
+                window=window,
+                annualization_factor=annualization_factor,
+                save_path=output_dir / 'rolling_sharpe_comparison.png'
+            )
             
-            # Adaptive window sizes based on frequency
-            short_window = max(5, int(periods_per_year / 25))  # ~2 weeks equivalent
-            medium_window = max(10, int(periods_per_year / 12))  # ~1 month equivalent
+            # ═══════════════════════════════════════════════════════════════
+            # 4. Risk-Free Rate
+            # ═══════════════════════════════════════════════════════════════
+            fig4 = plot_risk_free_rate(
+                rf_ret=rf_ret,
+                save_path=output_dir / 'risk_free_rate.png'
+            )
             
-            # 1. Cumulative Returns Comparison
-            fig, ax = plt.subplots(figsize=(12, 6))
-            strategy_cum = (1 + strategy_ret).cumprod() * 100 - 100
-            benchmark_cum = (1 + benchmark_ret).cumprod() * 100 - 100
+            # ═══════════════════════════════════════════════════════════════
+            # 5. Period Returns (Weekly/Daily)
+            # ═══════════════════════════════════════════════════════════════
+            weekly_freq = freq_params['weekly_freq']
+            period_label = 'Weekly' if weekly_freq == 'W' else 'Daily' if weekly_freq == '1D' else 'Aggregated'
             
-            ax.plot(strategy_cum.index, strategy_cum.values, label='Strategy', linewidth=2, color='steelblue')
-            ax.plot(benchmark_cum.index, benchmark_cum.values, label='Benchmark', linewidth=2, alpha=0.7, color='orange')
-            ax.axhline(y=0, color='black', linestyle='--', alpha=0.3)
-            ax.set_title('Cumulative Returns (%)', fontsize=14, fontweight='bold')
-            ax.set_xlabel('Date')
-            ax.set_ylabel('Returns (%)')
-            ax.legend(loc='best')
-            ax.grid(True, alpha=0.3)
-            plt.tight_layout()
-            chart_path = output_dir / 'cumulative_returns.png'
-            plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-            mlflow.log_artifact(str(chart_path))
-            plt.close(fig)
+            fig5 = plot_period_returns(
+                strategy_ret=strategy_ret,
+                benchmark_ret=benchmark_ret,
+                agg_freq=weekly_freq,
+                period_label=period_label,
+                save_path=output_dir / 'period_returns.png'
+            )
             
-            # 2. Rolling Sharpe Ratio Comparison
-            if n_periods >= medium_window:
-                fig, ax = plt.subplots(figsize=(12, 6))
-                
-                rolling_sharpe_s = ((strategy_ret.rolling(medium_window).mean() - rf_ret.rolling(medium_window).mean()) / 
-                                    strategy_ret.rolling(medium_window).std() * annualization_factor)
-                rolling_sharpe_b = ((benchmark_ret.rolling(medium_window).mean() - rf_ret.rolling(medium_window).mean()) / 
-                                    benchmark_ret.rolling(medium_window).std() * annualization_factor)
-                
-                ax.plot(rolling_sharpe_s.index, rolling_sharpe_s.values, label='Strategy Sharpe', linewidth=2, color='steelblue')
-                ax.plot(rolling_sharpe_b.index, rolling_sharpe_b.values, label='Benchmark Sharpe', linewidth=2, alpha=0.7, color='orange')
-                ax.axhline(y=0, color='black', linestyle='--', alpha=0.3)
-                ax.set_title(f'Rolling Sharpe Ratio ({medium_window}-period)', fontsize=14, fontweight='bold')
-                ax.set_xlabel('Date')
-                ax.set_ylabel('Sharpe Ratio (Annualized)')
-                ax.legend(loc='best')
-                ax.grid(True, alpha=0.3)
-                plt.tight_layout()
-                chart_path = output_dir / 'rolling_sharpe_comparison.png'
-                plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-                mlflow.log_artifact(str(chart_path))
-                plt.close(fig)
+            # ═══════════════════════════════════════════════════════════════
+            # 6. Returns Distribution
+            # ═══════════════════════════════════════════════════════════════
+            monthly_freq = freq_params['monthly_freq']
+            period_label = 'Monthly' if monthly_freq == 'ME' else 'Weekly' if monthly_freq == 'W' else 'Aggregated'
             
-            # 3. Risk-Free Rate
-            fig, ax = plt.subplots(figsize=(12, 4))
-            rf_cum = (1 + rf_ret).cumprod() * 100 - 100
-            ax.plot(rf_cum.index, rf_cum.values, label='Risk-Free Rate', linewidth=2, color='green')
-            ax.set_title('Risk-Free Rate (Cumulative)', fontsize=14, fontweight='bold')
-            ax.set_xlabel('Date')
-            ax.set_ylabel('Cumulative Return (%)')
-            ax.legend(loc='best')
-            ax.grid(True, alpha=0.3)
-            plt.tight_layout()
-            chart_path = output_dir / 'risk_free_rate.png'
-            plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-            mlflow.log_artifact(str(chart_path))
-            plt.close(fig)
+            fig6 = plot_returns_distribution(
+                strategy_ret=strategy_ret,
+                agg_freq=monthly_freq,
+                period_label=period_label,
+                save_path=output_dir / 'returns_distribution.png'
+            )
             
-            # 4. Aggregated Returns Comparison (weekly for intraday, weekly for daily)
-            if n_periods >= 5:
-                strategy_agg = strategy_ret.resample(weekly_freq).apply(lambda x: (1 + x).prod() - 1 if len(x) > 0 else 0) * 100
-                benchmark_agg = benchmark_ret.resample(weekly_freq).apply(lambda x: (1 + x).prod() - 1 if len(x) > 0 else 0) * 100
-                
-                # Remove empty periods
-                strategy_agg = strategy_agg[strategy_agg != 0]
-                benchmark_agg = benchmark_agg[benchmark_agg != 0]
-                
-                if len(strategy_agg) > 0:
-                    fig, ax = plt.subplots(figsize=(14, 6))
-                    x = np.arange(len(strategy_agg))
-                    width = 0.35
-                    ax.bar(x - width/2, strategy_agg.values, width, label='Strategy', alpha=0.8, color='steelblue')
-                    ax.bar(x + width/2, benchmark_agg.values, width, label='Benchmark', alpha=0.8, color='orange')
-                    ax.axhline(y=0, color='black', linestyle='--', alpha=0.3)
-                    
-                    period_label = 'Weekly' if weekly_freq == 'W' else 'Daily' if weekly_freq == '1D' else 'Aggregated'
-                    ax.set_title(f'{period_label} Returns Comparison (%)', fontsize=14, fontweight='bold')
-                    ax.set_xlabel('Period Ending')
-                    ax.set_ylabel('Return (%)')
-                    
-                    # Smart x-axis labeling
-                    n_bars = len(strategy_agg)
-                    tick_spacing = max(1, n_bars // 10)
-                    tick_indices = x[::tick_spacing]
-                    tick_labels = [strategy_agg.index[i].strftime('%Y-%m-%d') for i in tick_indices]
-                    ax.set_xticks(tick_indices)
-                    ax.set_xticklabels(tick_labels, rotation=45, ha='right')
-                    
-                    ax.legend(loc='best')
-                    ax.grid(True, alpha=0.3, axis='y')
-                    plt.tight_layout()
-                    chart_path = output_dir / 'period_returns.png'
-                    plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-                    mlflow.log_artifact(str(chart_path))
-                    plt.close(fig)
+            # ═══════════════════════════════════════════════════════════════
+            # 7. Active Returns
+            # ═══════════════════════════════════════════════════════════════
+            fig7 = plot_active_returns(
+                strategy_ret=strategy_ret,
+                benchmark_ret=benchmark_ret,
+                freq=freq,
+                save_path=output_dir / 'active_returns.png'
+            )
             
-            # 5. Aggregated Returns Distribution (monthly for intraday/daily)
-            if n_periods >= medium_window:
-                strategy_monthly = strategy_ret.resample(monthly_freq).apply(lambda x: (1 + x).prod() - 1 if len(x) > 0 else np.nan) * 100
-                strategy_monthly = strategy_monthly.dropna()
-                
-                if len(strategy_monthly) >= 2:
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    n_bins = min(20, max(5, len(strategy_monthly) // 2))
-                    n, bins, patches = ax.hist(strategy_monthly.values, bins=n_bins, alpha=0.7, edgecolor='black', color='steelblue')
-                    ax.axvline(x=strategy_monthly.mean(), color='red', linestyle='--', 
-                            linewidth=2, label=f'Mean: {strategy_monthly.mean():.2f}%')
-                    ax.axvline(x=strategy_monthly.median(), color='blue', linestyle='--', 
-                            linewidth=2, label=f'Median: {strategy_monthly.median():.2f}%')
-                    
-                    period_label = 'Monthly' if monthly_freq == 'ME' else 'Weekly' if monthly_freq == 'W' else 'Aggregated'
-                    ax.set_title(f'Distribution of {period_label} Returns', fontsize=14, fontweight='bold')
-                    ax.set_xlabel(f'{period_label} Return (%)')
-                    ax.set_ylabel('Frequency')
-                    ax.legend(loc='best')
-                    ax.grid(True, alpha=0.3, axis='y')
-                    plt.tight_layout()
-                    chart_path = output_dir / 'returns_distribution.png'
-                    plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-                    mlflow.log_artifact(str(chart_path))
-                    plt.close(fig)
+            # ═══════════════════════════════════════════════════════════════
+            # 8. Active Returns Heatmap (for daily+ data)
+            # ═══════════════════════════════════════════════════════════════
+            fig8 = plot_active_returns_heatmap(
+                strategy_ret=strategy_ret,
+                benchmark_ret=benchmark_ret,
+                save_path=output_dir / 'active_returns_heatmap.png'
+            )
             
-            # 6. Active Returns (Strategy - Benchmark)
-            active_returns = (strategy_ret - benchmark_ret) * 100
+            # ═══════════════════════════════════════════════════════════════
+            # 9. Rolling Risk Metrics (Sharpe, Sortino, M²)
+            # ═══════════════════════════════════════════════════════════════
+            fig9 = plot_rolling_ratios(
+                strategy_ret=strategy_ret,
+                benchmark_ret=benchmark_ret,
+                rf_ret=rf_ret,
+                window=window,
+                periods_per_year=periods_per_year,
+                annualization_factor=annualization_factor,
+                save_path=output_dir / 'rolling_ratios.png'
+            )
             
-            fig, ax = plt.subplots(figsize=(12, 6))
-            ax.plot(active_returns.index, active_returns.values, linewidth=1.5, alpha=0.8, color='purple')
-            ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-            ax.fill_between(active_returns.index, active_returns.values, 0, 
-                            where=(active_returns.values > 0), alpha=0.3, color='green', label='Outperformance')
-            ax.fill_between(active_returns.index, active_returns.values, 0, 
-                            where=(active_returns.values <= 0), alpha=0.3, color='red', label='Underperformance')
-            ax.set_title(f'Active Returns (%) - {freq} frequency', fontsize=14, fontweight='bold')
-            ax.set_xlabel('Date')
-            ax.set_ylabel('Active Return (%)')
-            ax.legend(loc='best')
-            ax.grid(True, alpha=0.3)
-            plt.tight_layout()
-            chart_path = output_dir / 'active_returns.png'
-            plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-            mlflow.log_artifact(str(chart_path))
-            plt.close(fig)
+            # ═══════════════════════════════════════════════════════════════
+            # 10. Underwater Plot (Drawdown)
+            # ═══════════════════════════════════════════════════════════════
+            fig10 = plot_underwater(
+                strategy_ret=strategy_ret,
+                save_path=output_dir / 'underwater_plot.png'
+            )
             
-            # 7. Active Returns Heatmap (Month x Year) - only for daily+ data
-            if resample_freq == '1D' and n_periods >= 30:
-                active_monthly = active_returns.to_frame('active_ret')
-                active_monthly['year'] = active_monthly.index.year
-                active_monthly['month'] = active_monthly.index.month
-                heatmap_data = active_monthly.groupby(['year', 'month'])['active_ret'].mean().unstack()
-                
-                if not heatmap_data.empty and heatmap_data.shape[0] > 0 and heatmap_data.shape[1] > 0:
-                    fig, ax = plt.subplots(figsize=(max(12, heatmap_data.shape[1] * 1.5), max(8, heatmap_data.shape[0] * 0.5)))
-                    
-                    vmax = np.nanmax(np.abs(heatmap_data.values))
-                    vmin = -vmax if vmax > 0 else -1
-                    vmax = vmax if vmax > 0 else 1
-                    
-                    im = ax.imshow(heatmap_data.T.values, aspect='auto', cmap='RdYlGn', vmin=vmin, vmax=vmax)
-                    
-                    ax.set_xticks(np.arange(len(heatmap_data.columns)))
-                    ax.set_yticks(np.arange(len(heatmap_data.T.index)))
-                    ax.set_xticklabels(heatmap_data.columns)
-                    ax.set_yticklabels(heatmap_data.T.index)
-                    
-                    threshold = vmax * 0.5
-                    for i in range(len(heatmap_data.T.index)):
-                        for j in range(len(heatmap_data.columns)):
-                            val = heatmap_data.T.iloc[i, j]
-                            if not np.isnan(val):
-                                text_color = "white" if abs(val) > threshold else "black"
-                                ax.text(j, i, f'{val:.2f}', ha="center", va="center", 
-                                    color=text_color, fontsize=9, fontweight='bold')
-                    
-                    plt.colorbar(im, ax=ax, label='Active Return (%)')
-                    ax.set_title('Active Returns Heatmap (Month x Year)', fontsize=14, fontweight='bold')
-                    ax.set_xlabel('Year')
-                    ax.set_ylabel('Month')
-                    plt.tight_layout()
-                    chart_path = output_dir / 'active_returns_heatmap.png'
-                    plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-                    mlflow.log_artifact(str(chart_path))
-                    plt.close(fig)
+            # ═══════════════════════════════════════════════════════════════
+            # 11. Portfolio Allocation (if position data available)
+            # ═══════════════════════════════════════════════════════════════
+            fig11 = plot_portfolio_allocation(
+                positions_df=time_series['positions'],
+                resample_freq=resample_freq,
+                save_path=output_dir / 'portfolio_allocation.png'
+            )
+
+            mlflow.log_artifacts(str(output_dir))
+
             
-            # 8. Rolling Risk Metrics
-            if n_periods >= short_window:
-                fig, axes = plt.subplots(3, 1, figsize=(12, 10))
-                
-                # Sharpe
-                rolling_sharpe = ((strategy_ret.rolling(short_window).mean() - rf_ret.rolling(short_window).mean()) / 
-                                strategy_ret.rolling(short_window).std() * annualization_factor)
-                axes[0].plot(rolling_sharpe.index, rolling_sharpe.values, linewidth=2, color='steelblue')
-                axes[0].axhline(y=0, color='black', linestyle='--', alpha=0.3)
-                axes[0].set_title(f'Rolling Sharpe Ratio ({short_window}-period)', fontweight='bold')
-                axes[0].set_ylabel('Sharpe (Annualized)')
-                axes[0].grid(True, alpha=0.3)
-                
-                # Sortino
-                def downside_std(returns):
-                    downside = returns[returns < 0]
-                    return np.sqrt(np.mean(downside**2)) if len(downside) > 0 else np.nan
-                
-                rolling_sortino = ((strategy_ret.rolling(short_window).mean() - rf_ret.rolling(short_window).mean()) / 
-                                strategy_ret.rolling(short_window).apply(downside_std) * annualization_factor)
-                axes[1].plot(rolling_sortino.index, rolling_sortino.values, linewidth=2, color='orange')
-                axes[1].axhline(y=0, color='black', linestyle='--', alpha=0.3)
-                axes[1].set_title(f'Rolling Sortino Ratio ({short_window}-period)', fontweight='bold')
-                axes[1].set_ylabel('Sortino (Annualized)')
-                axes[1].grid(True, alpha=0.3)
-                
-                # M²
-                rolling_port_vol = strategy_ret.rolling(short_window).std() * annualization_factor
-                rolling_bench_vol = benchmark_ret.rolling(short_window).std() * annualization_factor
-                rolling_port_ret = strategy_ret.rolling(short_window).mean() * periods_per_year
-                rolling_rf_annual = rf_ret.rolling(short_window).mean() * periods_per_year
-                
-                rolling_m2 = np.where(
-                    rolling_port_vol > 0,
-                    (rolling_port_ret - rolling_rf_annual) * (rolling_bench_vol / rolling_port_vol) + rolling_rf_annual,
-                    np.nan
-                )
-                rolling_m2 = pd.Series(rolling_m2, index=strategy_ret.index)
-                
-                axes[2].plot(rolling_m2.index, rolling_m2.values * 100, linewidth=2, color='green')
-                axes[2].set_title(f'Rolling Modigliani M² ({short_window}-period)', fontweight='bold')
-                axes[2].set_xlabel('Date')
-                axes[2].set_ylabel('M² (% Annualized)')
-                axes[2].grid(True, alpha=0.3)
-                
-                plt.tight_layout()
-                chart_path = output_dir / 'rolling_ratios.png'
-                plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-                mlflow.log_artifact(str(chart_path))
-                plt.close(fig)
-            
-            # 9. Underwater Plot
-            cumulative = (1 + strategy_ret).cumprod()
-            running_max = cumulative.expanding().max()
-            drawdown = (cumulative - running_max) / running_max * 100
-            
-            fig, ax = plt.subplots(figsize=(12, 6))
-            ax.fill_between(drawdown.index, drawdown.values, 0, alpha=0.5, color='red')
-            ax.plot(drawdown.index, drawdown.values, linewidth=2, color='darkred')
-            ax.set_title('Underwater Plot (Drawdown from Peak)', fontsize=14, fontweight='bold')
-            ax.set_xlabel('Date')
-            ax.set_ylabel('Drawdown (%)')
-            ax.grid(True, alpha=0.3)
-            ax.set_ylim(bottom=min(drawdown.min() * 1.1, -1))
-            plt.tight_layout()
-            chart_path = output_dir / 'underwater_plot.png'
-            plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-            mlflow.log_artifact(str(chart_path))
-            plt.close(fig)
-            
-            # 10. Portfolio Allocation Changes
-            if 'positions' in time_series and not time_series['positions'].empty:
-                try:
-                    pos_df = time_series['positions'].copy()
-                    required_cols = ['instrument_id', 'quantity', 'ts_event']
-                    
-                    if all(col in pos_df.columns for col in required_cols):
-                        pos_df['date'] = pd.to_datetime(pos_df['ts_event'], unit='ns', utc=True)
-                        # Resample positions to match chart frequency
-                        pos_df = pos_df.set_index('date').sort_index()
-                        allocation = pos_df.groupby([pd.Grouper(freq=resample_freq), 'instrument_id'])['quantity'].sum().unstack(fill_value=0)
-                        
-                        if not allocation.empty and len(allocation) > 1:
-                            fig, ax = plt.subplots(figsize=(12, 8))
-                            allocation.plot(kind='area', stacked=True, ax=ax, alpha=0.7, linewidth=0)
-                            ax.set_title('Portfolio Allocation Over Time', fontsize=14, fontweight='bold')
-                            ax.set_xlabel('Date')
-                            ax.set_ylabel('Position Size')
-                            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-                            ax.grid(True, alpha=0.3)
-                            plt.tight_layout()
-                            chart_path = output_dir / 'portfolio_allocation.png'
-                            plt.savefig(chart_path, dpi=150, bbox_inches='tight')
-                            mlflow.log_artifact(str(chart_path))
-                            plt.close(fig)
-                except Exception as e:
-                    logger.warning(f"Could not generate portfolio allocation chart: {e}")
-            
-            logger.info(f"Successfully generated performance charts for {freq} frequency data")
+            logger.info(f"Successfully generated performance charts for trial {trial_number}")
             
         except Exception as e:
             logger.error(f"Error generating performance charts: {e}", exc_info=True)
-            import traceback
-            traceback.print_exc()

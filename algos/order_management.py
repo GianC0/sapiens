@@ -594,6 +594,7 @@ class OrderManager:
             time_in_force=self.timing_force,
             exec_algorithm_id=ExecAlgorithmId("TWAP"),
             exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
+            
         )
 
     def _create_limit_order(
