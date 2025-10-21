@@ -128,7 +128,7 @@ class OrderManager:
         self.twap_interval = config.get('execution', {}).get('twap', {}).get('interval_secs', 2.5)
         self.adv_lookback = config.get('liquidity', {}).get('adv_lookback', 30)
         self.max_adv_pct = config.get('liquidity', {}).get('max_adv_pct', 0.05)
-        self.timing_force = TimeInForce[config.get('execution', {}).get('timing_force', TimeInForce.DAY)]
+        self.timing_force = TimeInForce[config.get('execution', {}).get('timing_force', TimeInForce.GTC)]
         self.use_limit_orders = config.get('execution', {}).get('use_limit_orders', False)
         self.limit_order_offset_bps = config.get('execution', {}).get('limit_offset_bps', 5)
         self.max_order_retries = config.get('execution', {}).get('max_retries', 3)
@@ -594,6 +594,7 @@ class OrderManager:
             time_in_force=self.timing_force,
             exec_algorithm_id=ExecAlgorithmId("TWAP"),
             exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
+            
         )
 
     def _create_limit_order(

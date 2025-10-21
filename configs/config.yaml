@@ -182,8 +182,9 @@ STRATEGY:
     # Hyperparameter tuning Settings and Objectives
     # Objectives: sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown, total_return, annual_return, daily_vol
     tune_hparams: true
-    n_trials: 1      
-    objectives: # use only nautilus_trader portfolio_analyzer statistics
+    n_trials: 1 
+    primary_objective:  "total_pnl_pct"     # used to determine the overall single best hp tuning trial in multi-objective optimization       
+    objectives:                             # use only nautilus_trader portfolio_analyzer statistics
       ## Performance / Returns ##
       #returns_volatility: minimize      
       #avg_return: maximize
@@ -241,7 +242,7 @@ STRATEGY:
 
     # Order execution algorithm
     execution:
-      timing_force: "DAY"      # Specifies how long the order will remain open or active before any remaining quantity is canceled.
+      timing_force: "GTC"      # Specifies how long the order will remain open or active before any remaining quantity is canceled.
       #exec_algo: twap         # Specifies to use TWAP execution algorithm, Default: whole
       twap:                    # Split parent order into 4 TWAP child orders, each after 2.5 seconds 
         slices: 1              # 4 separate orders

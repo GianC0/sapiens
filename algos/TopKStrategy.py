@@ -38,7 +38,7 @@ from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Log
 from nautilus_trader.core.data import Data
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.objects import Price, Quantity
-from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose
+from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose, MarkPriceUpdate
 from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.orders import MarketOrder
@@ -229,8 +229,12 @@ class TopKStrategy(Strategy):
                 # in live should be done through self.request_bars
                 self.on_historical_data(bar_type = bar_type, start = self.data_load_start)
                 
-                # subscribe bars for walk forward
+                # Subscribe bars for walk forward
                 self.subscribe_bars(bar_type)
+                
+                # Subscribe to instrument events
+                self.subscribe_mark_prices(instrument.id)
+                self.subscribe_instrument_close(instrument.id)
 
 
 
@@ -296,29 +300,6 @@ class TopKStrategy(Strategy):
     def on_load(self, state: dict[str, bytes]) -> None:
         return
     
-    """
-    Ensure all positions are closed at end of backtest for accurate P&L.
-    def on_dispose(self) -> None:
-        """"""
-        logger.info("Strategy disposal: liquidating all positions for final P&L calculation")
-        
-        # Force close all open positions at current market prices
-        for position in self.cache.positions_open(venue=self.venue):
-            instrument_id = position.instrument_id
-            symbol = instrument_id.symbol.value
-            
-            logger.info(f"Final liquidation: closing {symbol} position of {position.signed_qty}")
-            self.order_manager.close_position(position)
-        
-        # Cancel any pending orders
-        self.order_manager.cancel_all_orders()
-        
-        # Log final NAV for verification
-        final_nav = self._calculate_portfolio_nav()
-        logger.info(f"Final NAV at disposal: {final_nav:.2f}")
-        
-        return
-    """
 
     def on_final_liquidation(self, event: TimeEvent):
         """Liquidate all positions before backtest ends."""
@@ -513,7 +494,8 @@ class TopKStrategy(Strategy):
         self.cache.add_bars(bars)
         logger.info(f"Added {len(bars)}  bars for {bar_type.instrument_id.value}")
         
-
+    def on_mark_price(self, update: MarkPriceUpdate) -> None:
+        logger.info("NEW MARKET PRICE UPDATE")
         
 
 
@@ -1038,7 +1020,6 @@ class TopKStrategy(Strategy):
         for position in self.cache.positions_open(venue = self.venue):
             instrument_id = position.instrument_id
             bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
-            
             
             # Aggregate positions for each instrument (for HEDGING accounts)
             if instrument_id not in positions_by_instrument:
