@@ -67,6 +67,7 @@ from algos.engine.data_loader import CsvBarLoader, FeatureBarData
 from algos.engine.OptimizerFactory import create_optimizer
 from models.utils import freq2pdoffset, freq2barspec
 from algos.order_management import OrderManager
+from algos.engine.data_augmentation import DataAugmentor
 
 
 # ========================================================================== #
@@ -93,8 +94,6 @@ class TopKStrategy(Strategy):
         # TODO: quick dirty fix. implement proper typing
         cfg = config.config
 
-        self.data_params = cfg["DATA"]
-
         # safe handling of variable
         currency = cfg["STRATEGY"]["currency"]
         if currency == "USD":
@@ -107,7 +106,9 @@ class TopKStrategy(Strategy):
         # create params dictionaries
         self.strategy_params = cfg["STRATEGY"]
         self.model_params = cfg["MODEL"]
-        
+        self.data_params = cfg["DATA"]
+
+
         self.model_params["model_dir"] = Path(self.model_params["model_dir"])
 
         self.calendar = market_calendars.get_calendar(cfg["STRATEGY"]["calendar"])
@@ -713,6 +714,8 @@ class TopKStrategy(Strategy):
         """
         data_dict = {}
         
+        augmentor = DataAugmentor(self.data_params, augment_modality= "stream")
+        
         for iid in self.cache.instrument_ids():
             # ensure symbol is in universe
             if iid.symbol.value not in self.universe:
@@ -758,8 +761,16 @@ class TopKStrategy(Strategy):
             df.set_index("Date", inplace=True)
             df.sort_index(inplace=True)  # Ensure chronological order
             
-            data_dict[iid.symbol.value] = df
+            data_dict[iid.symbol.value] = df      
+            
 
+
+        print("Data before augmentation:")
+        print(data_dict)
+        augmentor = DataAugmentor(self.data_params)
+        data_dict = augmentor.augment(data_dict)
+        print("Data after augmentation:")
+        print(data_dict)
         return data_dict 
     
     # TODO: superflous. consider removing

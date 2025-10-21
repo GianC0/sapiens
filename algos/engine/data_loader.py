@@ -24,10 +24,74 @@ from nautilus_trader.model.instruments import Equity
 from nautilus_trader.model.objects import Price, Quantity, Money
 from nautilus_trader.model.currencies import USD,EUR
 from models.utils import freq2barspec
+from algos.engine.data_augmentation import FeatureBar
 #from nautilus_trader.model import Data  # base class for custom data
+import json
+import pyarrow as pa
+from nautilus_trader.serialization.arrow import serializer
 
 logger = logging.getLogger(__name__)
 
+# Define schema
+FEATURE_BAR_SCHEMA = pa.schema([
+    ("bar_type", pa.string()),
+    ("open", pa.float64()),
+    ("high", pa.float64()),
+    ("low", pa.float64()),
+    ("close", pa.float64()),
+    ("volume", pa.float64()),
+    ("ts_event", pa.int64()),
+    ("ts_init", pa.int64()),
+    ("is_revision", pa.bool_()),
+    ("features", pa.string()),
+])
+
+# Encoder: FeatureBar → Arrow table
+def encode_feature_bar(obj: FeatureBar):
+    data = {
+        "bar_type": [str(obj.bar_type)],
+        "open": [float(obj.open)],
+        "high": [float(obj.high)],
+        "low": [float(obj.low)],
+        "close": [float(obj.close)],
+        "volume": [float(obj.volume)],
+        "ts_event": [obj.ts_event],
+        "ts_init": [obj.ts_init],
+        "is_revision": [obj.is_revision],
+        "features": [json.dumps(obj.features)],
+    }
+    table = pa.table(data, schema=FEATURE_BAR_SCHEMA)
+    # Convert table to RecordBatch (Nautilus expects RecordBatch)
+    return table.to_batches()[0]
+
+# Decoder: Arrow table → list of FeatureBar
+def decode_feature_bar(table: pa.Table):
+    bars = []
+    for row in range(table.num_rows):
+        features = json.loads(table["features"][row].as_py())
+        bars.append(
+            FeatureBar(
+                bar_type=table["bar_type"][row].as_py(),
+                open=table["open"][row].as_py(),
+                high=table["high"][row].as_py(),
+                low=table["low"][row].as_py(),
+                close=table["close"][row].as_py(),
+                volume=table["volume"][row].as_py(),
+                ts_event=table["ts_event"][row].as_py(),
+                ts_init=table["ts_init"][row].as_py(),
+                is_revision=table["is_revision"][row].as_py(),
+                features=features,
+            )
+        )
+    return bars
+
+# Register serializer
+serializer.register_arrow(
+    data_cls=FeatureBar,
+    schema=FEATURE_BAR_SCHEMA,
+    encoder=encode_feature_bar,
+    decoder=decode_feature_bar
+)
 
 # ------------------------------------------------------------------ #
 # Custom data class
@@ -279,7 +343,7 @@ class CsvBarLoader:
                 close_val = row_values[col_indices.get('Close', 0)] if 'Close' in col_indices else 0.0
                 volume_val = row_values[col_indices.get('Volume', 0)] if 'Volume' in col_indices else 0.0
                 
-                yield Bar(
+                yield FeatureBar(
                     bar_type=bar_type,
                     open=Price.from_str(f"{open_val:.3f}"),
                     high=Price.from_str(f"{high_val:.3f}"),

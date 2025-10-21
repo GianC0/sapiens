@@ -50,7 +50,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from algos.engine.data_loader import CsvBarLoader
-from models.utils import freq2pdoffset, yaml_safe, freq2barspec, merge_configs
+from models.utils import freq2pdoffset, yaml_safe, freq2barspec
 from algos.engine.data_augmentation import DataAugmentor
 
 
@@ -108,7 +108,7 @@ class OptunaHparamsTuner:
         
 
         # Split hparams into defaults and search spaces
-        self.model_defaults, self.model_search = self._split_hparam_cfg(merge_configs([self.model_hparams, self.data_hparams]))
+        self.model_defaults, self.model_search = self._split_hparam_cfg(self.model_hparams | self.data_hparams)
         self.strategy_defaults, self.strategy_search = self._split_hparam_cfg(self.strategy_hparams)
         self.seed = seed
 
@@ -412,6 +412,8 @@ class OptunaHparamsTuner:
             # Define objective function for strategy
             def strategy_objective(trial: optuna.Trial) -> Tuple:
                 trial_hparams = self._suggest_params(trial, self.strategy_defaults, self.strategy_search)
+                trial_hparams['DATA'] = self.data_params
+                print(trial_hparams)
 
                 offset = self.best_model_params_flat["train_offset"]
                 strategy_params_flat = self._add_dates(self.strategy_params, offset, to_strategy=True ) | trial_hparams
@@ -434,10 +436,9 @@ class OptunaHparamsTuner:
                     mlflow.log_param("phase", "strategy_optimization")
                     mlflow.log_param("model_path", str(self.best_model_path))
                     
-
-
                     # Run backtest with these strategy parameters
                     metrics = self._backtest(
+                        data_params_flat= self.data_params,
                         model_params_flat= self.best_model_params_flat,  # type: ignore
                         strategy_params_flat = strategy_params_flat,
                         start = strategy_params_flat["valid_start"],
@@ -520,6 +521,7 @@ class OptunaHparamsTuner:
 
     def _backtest(
         self,
+        data_params_flat: dict,
         model_params_flat: dict,
         strategy_params_flat: dict,
         start: pd.Timestamp,
@@ -536,6 +538,7 @@ class OptunaHparamsTuner:
         config = {
             'MODEL': model_params_flat ,
             'STRATEGY': strategy_params_flat ,
+            'DATA': data_params_flat,
         }
 
         # Add data starting from t = - (windows_len + 1)

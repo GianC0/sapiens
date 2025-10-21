@@ -24,7 +24,13 @@ from joblib import dump, load
 
 logger = logging.getLogger(__name__)
 
+from nautilus_trader.model.data import Bar, BarType
+
 class DataAugmentor:
+    """
+    Interface class to handle data augmentation for different market data types.
+    """
+
     def __init__( self,
         augmentation_config: Dict[str, Any],
         augment_modality: str = "train", #train or stream
@@ -32,7 +38,7 @@ class DataAugmentor:
         #self.config = augmentation_config
         self.market_data_type = augmentation_config.get("features_to_load", "candles")  #OHLCV, orderbook, possibly more
         self.modality = augment_modality 
-        self.pca = augmentation_config.get("pca", True)
+        self.pca = augmentation_config.get("pca", False)
         self.pca_var_explained = augmentation_config.get("pca_var_explained", 0.95) #if using var explained to choose n_components
 
         # Choose implementation based on market data type
@@ -52,9 +58,9 @@ class DataAugmentor:
 
         # Apply global PCA if enabled
         if self.pca:
-            out = self.apply_PCA(out)
+            out = self.apply_PCA(out, self.pca_var_explained)
         return out
-    
+        
     def apply_PCA(self, data: Dict[str, pd.DataFrame], variance_explained: float = 0.95) -> Dict[str, pd.DataFrame]:
         """
         Apply PCA with per-symbol normalization.
@@ -263,7 +269,32 @@ class _OHCLVAugmentor(_BaseAugmentor):
             elif self.modality == "stream":
                 out.iloc[-1, out.columns.get_loc(indicator_name)] = values
 
-        return out        
+        return out     
+
+
+class FeatureBar(Bar):
+    """Bar extended with computed features like technical indicators."""
+
+    def __init__(self,
+                 bar_type,
+                 open,
+                 high,
+                 low,
+                 close,
+                 volume,
+                 ts_event,
+                 ts_init,
+                 is_revision=False,
+                 features=None):
+        super().__init__(bar_type, open, high, low, close, volume, ts_event, ts_init, is_revision)
+        self.features = features or {}
+
+    def add_feature(self, name: str, value: float):
+        self.features[name] = value
+
+    def get_feature(self, name: str):
+        return self.features.get(name)
+       
 
 class _OrderbookAugmentor:
     def __init__(self, rng):
