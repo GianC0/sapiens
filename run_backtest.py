@@ -16,13 +16,13 @@ from datetime import datetime
 import mlflow
 
 
-
 from nautilus_trader.model.currencies import USD,EUR
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.core.nautilus_pyo3 import CurrencyType
+
 from models.utils import  yaml_safe
 from algos.engine.hparam_tuner import OptunaHparamsTuner
-
+from algos.engine.databento_loader import DatabentoTickLoader
 
 def main():
     # loads configuration file
@@ -37,7 +37,7 @@ def main():
         cfg["STRATEGY"]["PARAMS"]["currency"] = Currency(code='EUR', precision=3, iso4217=978, name='Euro', currency_type=CurrencyType.FIAT)
 
     # Setup directories
-    logs_dir = Path(cfg["STRATEGY"]["PARAMS"]["logs_dir"]).parent  # log_dir is parent directory of strategy
+    logs_dir = Path(cfg["STRATEGY"]["PARAMS"]["logs_dir"]).parent
     #timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     timestamp = "20250922_066666"
     run_dir = logs_dir / "backtests" / timestamp
@@ -53,6 +53,29 @@ def main():
         ]
     )
     logger = logging.getLogger(__name__)
+
+
+    # Setup catalog
+    catalog_path = Path(cfg["STRATEGY"]["PARAMS"]["catalog_path"])
+    catalog_path.mkdir(parents=True, exist_ok=True)
+    
+    # Load DBN tick data to catalog
+    logger.info("Loading Databento trade ticks...")
+    data_load_start = cfg["STRATEGY"]["PARAMS"]["data_load_start"]
+    
+    loader = DatabentoTickLoader(cfg=cfg["STRATEGY"]["PARAMS"],venue_name=cfg["STRATEGY"]["PARAMS"]["venue_name"])
+    catalog = loader.load_to_catalog(catalog_path=catalog_path)
+
+    # Error handling
+    if len(catalog.instruments()) == 0:
+        logger.warning("No instruments in catalog")
+        return {
+            'sharpe_ratio': 0.0,
+            'total_return': 0.0,
+            'max_drawdown': 0.0,
+            'win_rate': 0.0,
+            'num_trades': 0,
+        }, {}
 
     
     logger.info("\n" + "="*70)

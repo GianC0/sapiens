@@ -594,7 +594,7 @@ class OrderManager:
             time_in_force=self.timing_force,
             exec_algorithm_id=ExecAlgorithmId("TWAP"),
             exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
-            
+
         )
 
     def _create_limit_order(
@@ -648,13 +648,22 @@ class OrderManager:
         return net_qty
     
     def _get_current_price(self, instrument_id: InstrumentId) -> Optional[float]:
-        """Get current price for an instrument."""
+        """
+        Get current price from latest trade tick (real-time) or last bar (fallback).
+        """
+        # Try ticks first (most recent price)
+        ticks = self.strategy.cache.trade_ticks(instrument_id)
+        if ticks and len(ticks) > 0:
+            return float(ticks[0].price)  # Index 0 is most recent
+        
+        # Fallback to bars if no ticks available
         bar_type = BarType(instrument_id=instrument_id, bar_spec=self.strategy.bar_spec)
         bars = self.strategy.cache.bars(bar_type)
-        if not bars:
-            logger.warning(f"No bars available for {instrument_id}")
-            return None
-        return float(bars[0].close)
+        if bars and len(bars) > 0:
+            return float(bars[0].close)
+        
+        logger.warning(f"No price data available for {instrument_id}")
+        return None
     
     def _get_available_cash(self) -> float:
         """Get available cash in the account."""

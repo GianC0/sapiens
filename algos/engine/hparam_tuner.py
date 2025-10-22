@@ -23,6 +23,8 @@ from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm, TWAPExec
 from nautilus_trader.backtest.node import BacktestNode
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from nautilus_trader.model.objects import Price, Quantity, Money
+from nautilus_trader.model.data import TradeTick
+
 
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -68,6 +70,7 @@ from algos.engine.performance_plots import (
     plot_portfolio_allocation,
 )
 from models.utils import freq2pdoffset, yaml_safe, freq2barspec
+from algos.engine.databento_loader import DatabentoTickLoader
 
 
 
@@ -83,6 +86,7 @@ class OptunaHparamsTuner:
         self,
         cfg: Dict[str, Any],
         run_timestamp: str,
+        loader: DatabentoTickLoader,
         run_dir: Path = Path("logs/backtests/"),
         seed: int = 2025,
     ):
@@ -126,8 +130,9 @@ class OptunaHparamsTuner:
         self.seed = seed
 
         # --- Data Loader and Data Augmentation setup -------------------------------------------
-        self.loader = CsvBarLoader(cfg=self.strategy_params, venue_name=self.strategy_params["venue_name"], columns_to_load=self.model_params["features_to_load"], adjust = self.model_params["adjust"])
-        
+        self.loader = loader
+    
+    
         # Setup MLflow
         self._setup_mlflow()
         
@@ -261,7 +266,7 @@ class OptunaHparamsTuner:
                 
                 start = model_params_flat["train_start"]
                 end = model_params_flat["valid_end"]
-                data_dict = self.loader.get_data(calendar = self.model_params["calendar"] , frequency = self.model_params["freq"],start=start, end=end)
+                data_dict = self.loader.get_ohlcv_data(frequency = self.model_params["freq"], start=start, end=end)
 
                 # Start MLflow run for this trial
                 with mlflow.start_run(
@@ -556,30 +561,6 @@ class OptunaHparamsTuner:
             'MODEL': model_params_flat ,
             'STRATEGY': strategy_params_flat ,
         }
-
-        # Add data starting from t = - (windows_len + 1)
-        bars = []
-        data_load_start = strategy_params_flat["data_load_start"]
-        for bar_or_feature in self.loader.bar_iterator():
-            if isinstance(bar_or_feature, Bar):
-                bar_ts = pd.Timestamp(bar_or_feature.ts_event, unit='ns', tz='UTC')
-                if data_load_start <= bar_ts <= end:
-                    bars.append(bar_or_feature)
-        
-        # Error Handling
-        if len(bars) == 0:
-            logger.warning(f"No bars found in period {start} to {end}")
-            return {
-                'sharpe_ratio': 0.0,
-                'total_return': 0.0,
-                'max_drawdown': 0.0,
-                'win_rate': 0.0,
-                'num_trades': 0,
-            }
-
-        catalog = ParquetDataCatalog(path = strategy_params_flat["catalog_path"],  fs_protocol="file")
-        catalog.write_data(list(self.loader.instruments.values()))
-        catalog.write_data(bars)
 
 
         # Train model on Train + Valid with best HP
@@ -881,12 +862,12 @@ class OptunaHparamsTuner:
         data_configs=[
             BacktestDataConfig(
                 catalog_path=backtest_cfg["STRATEGY"]["catalog_path"],
-                data_cls=Bar,
+                data_cls=TradeTick,
                 start_time=pd.Timestamp.isoformat(start),
                 end_time=pd.Timestamp.isoformat(end),
-                bar_spec=bar_spec,
-                #instrument_ids =  [inst.id.value for inst in self.loader.instruments.values()],
-                bar_types = [BarType(instrument_id=inst.id, bar_spec=bar_spec) for inst in self.loader.instruments.values()],
+                instrument_ids=[inst.id.value for inst in self.loader.instruments.values()],
+                #bar_spec=bar_spec,
+                #bar_types = [BarType(instrument_id=inst.id, bar_spec=bar_spec) for inst in self.loader.instruments.values()],
             )
         ]
 
@@ -915,11 +896,10 @@ class OptunaHparamsTuner:
                     ),
 
                     cache=CacheConfig(
+                        tick_capacity=backtest_cfg["STRATEGY"].get("engine", {}).get("cache", {}).get("tick_capacity", 10000),
                         bar_capacity=backtest_cfg["STRATEGY"].get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
                         ),
                     logging=LoggingConfig(log_level="INFO"),
-                    # TODO: fix fill model issue
-
                     ),
                 data=data_configs,
                 venues=venue_configs,
@@ -987,8 +967,9 @@ class OptunaHparamsTuner:
             strategy_ret = pd.to_numeric(portfolio_values).pct_change().fillna(0)
             
             # Get benchmark and risk-free data
-            benchmark_returns = self.loader.benchmark_returns
-            risk_free_returns = self.loader.risk_free_df['risk_free']
+            data_dict = self.loader.get_ohlcv_data(strategy_params_flat.get('freq', '1D'))
+            benchmark_returns = data_dict[strategy_params_flat["benchmark_ticker"]].pct_change()["close"]
+            risk_free_returns = data_dict[strategy_params_flat["risk_free_ticker"]].pct_change()["close"]
             
             # Align all series with proper timezone handling
             strategy_ret, benchmark_ret, rf_ret = align_series(

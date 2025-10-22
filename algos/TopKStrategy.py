@@ -38,7 +38,7 @@ from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Log
 from nautilus_trader.core.data import Data
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.objects import Price, Quantity
-from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose, MarkPriceUpdate
+from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose, MarkPriceUpdate, TradeTick
 from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.orders import MarketOrder
@@ -51,6 +51,7 @@ from nautilus_trader.backtest.models import FillModel, FeeModel
 from nautilus_trader.core.nautilus_pyo3 import CurrencyType
 from nautilus_trader.model.position import Position
 from nautilus_trader.config import ImportableFeeModelConfig
+from nautilus_trader.common.aggregation import BarAggregator
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
     OrderDenied, OrderEmulated, OrderEvent, OrderExpired,
@@ -59,11 +60,10 @@ from nautilus_trader.model.events import (
     OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated
 )
 
-
 logger = logging.getLogger(__name__)
 # ----- project imports -----------------------------------------------------
 from models.interfaces import MarketModel
-from algos.engine.data_loader import CsvBarLoader, FeatureBarData
+from algos.engine.data_loader import DatabentoTickLoader
 from algos.engine.OptimizerFactory import create_optimizer
 from models.utils import freq2pdoffset, freq2barspec
 from algos.order_management import OrderManager
@@ -119,7 +119,6 @@ class TopKStrategy(Strategy):
 
         # data load start should be conservative: 
         # if bars within retrain_date - data_load_start < min_bars_required, then on_historical fails to load necessary data.  
-
         #self.data_load_start = pd.Timestamp(self.strategy_params["data_load_start"])     # NON-CONSERVATIVE
         self.data_load_start = self.train_start                                           # CONSERVATIVE
 
@@ -148,7 +147,8 @@ class TopKStrategy(Strategy):
         # Loader for data access
         venue_name = self.strategy_params["venue_name"]
         self.venue = Venue(venue_name)
-        self.loader = CsvBarLoader(cfg=self.strategy_params, venue_name=self.venue.value, columns_to_load=self.model_params["features_to_load"], adjust=self.model_params["adjust"])
+        self.loader = DatabentoTickLoader(cfg=self.strategy_params, venue_name=self.venue.value)
+
         #self.catalog = ParquetDataCatalog( path = self.strategy_params["catalog_path"], fs_protocol="file")
         self.universe: List[str] = []  # Ordered list of instruments
         self.active_mask: Optional[torch.Tensor] = None  # (I,)
@@ -225,7 +225,8 @@ class TopKStrategy(Strategy):
 
                 # request historical bars
                 # in live should be done through self.request_bars
-                self.on_historical_data(bar_type = bar_type, start = self.data_load_start)
+                self.request_bars(bar_type)
+                #self.on_historical_data(bar_type = bar_type, start = self.data_load_start)
                 
                 # Subscribe bars for walk forward
                 self.subscribe_bars(bar_type)
@@ -425,7 +426,7 @@ class TopKStrategy(Strategy):
         data_dict = self._cache_to_dict(window = (rolling_window_size))  # Get all latest
         if not data_dict:
             return
-        # all assets have same number of bars is ensured by get_data()
+        
         total_bars = len(next(iter(data_dict.values())))
         
         # Update active mask
@@ -465,7 +466,24 @@ class TopKStrategy(Strategy):
         
         return
 
-
+    def on_trade_tick(self, tick: TradeTick):
+        """
+        Handle trade ticks for:
+        1. Bar aggregation (via BarAggregator)
+        2. Real-time risk monitoring
+        """
+        instrument_id = tick.instrument_id
+        
+        # Feed tick to bar aggregator (automatically creates bars)
+        if instrument_id in self._bar_aggregators:
+            self._bar_aggregators[instrument_id].handle_trade_tick(tick)
+        
+        # Real-time risk monitoring using latest tick price
+        instrument = self.cache.instrument(instrument_id)
+        current_price = float(tick.price)
+        
+        # Check trailing stops in real-time
+        self._check_trailing_stop(instrument, current_price)
     def on_instrument(self, instrument: Instrument) -> None:
         """Handle new instrument events."""
         #TODO: should account for insertion and delisting at the same time. insertion needs portfolio selection
@@ -676,8 +694,7 @@ class TopKStrategy(Strategy):
             
             
             model = ModelClass(**self.model_params)
-            train_data = self.loader.get_data(calendar = self.model_params["calendar"] , frequency = self.model_params["freq"], start = self.train_start , end = self.train_end)
-            # all assets have same number of bars is ensured by get_data()
+            train_data = self.loader.get_ohlcv_data( frequency = self.model_params["freq"], start = self.train_start , end = self.train_end)
             total_bars = len(next(iter(train_data.values())))
             model.initialize(data = train_data, total_bars = total_bars)
 
@@ -775,35 +792,6 @@ class TopKStrategy(Strategy):
                     self._historical_buffer[symbol] = historical_data.iloc[-lookback_periods:]
 
     # ----- weight optimiser ------------------------------------------
-    def _get_risk_free_rate_return(self, timestamp: pd.Timestamp) -> float:
-        """Get risk-free rate for given timestamp with average fallback logic."""
-        if self.loader._benchmark_data is None:
-            return 0.0
-        
-        df = self.risk_free_df
-        
-        # Try exact date first
-        if timestamp in df.index:
-            rf_now = df.loc[timestamp, 'risk_free']
-            if not pd.isna(rf_now):
-                return float(rf_now)
-        
-        # Fallback: nearest available data
-        nearest_idx = df.index.get_indexer([timestamp], method='nearest')[0]
-        if nearest_idx >= 0:
-            return float(df.iloc[nearest_idx]['risk_free'])
-        
-        # Last Fallback: average over window [now - freq, now + freq]
-        freq_offset = freq2pdoffset(self.strategy_params["freq"])
-        start = timestamp - freq_offset
-        end = timestamp + freq_offset
-        
-        window_data = df.loc[(df.index >= start) & (df.index <= end), 'risk_free']
-        
-        if len(window_data) > 0:
-            return float(window_data.mean() )
-        
-        return 0.0
     
     def _get_benchmark_volatility(self, timestamp: pd.Timestamp) -> Optional[float]:
         """Calculate benchmark volatility using same lookback as optimizer."""
@@ -827,10 +815,17 @@ class TopKStrategy(Strategy):
         False -> keep optimizer sign).
         """
         now = pd.Timestamp(self.clock.utc_now())
-        current_rf = self._get_risk_free_rate_return(now)
+
+        # Compute risk free rate return
+        risk_free_ticker = self.strategy_params["risk_free_ticker"]
+        rf_id = InstrumentId(symbol=risk_free_ticker, venue = self.venue)
+        latest_rf = float(self.cache.trade_ticks(rf_id))
+        second_last_rf = float(self.cache.trade_ticks(rf_id, index = 1))
+        current_rf = (latest_rf - second_last_rf) / second_last_rf
+
 
         # build candidate list excluding risk free ticker
-        risk_free_ticker = self.strategy_params["risk_free_ticker"]
+        
 
         # gather return series and allowed ranges for valid symbols
         returns_data = []
