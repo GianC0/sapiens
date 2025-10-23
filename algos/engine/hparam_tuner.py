@@ -9,6 +9,9 @@ Orchestrates two-phase hyperparameter optimization:
 Each phase gets its own Optuna study and MLflow experiment.
 """
 
+from copy import Error
+from pdb import run
+from httpx import delete
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, ImportableExecAlgorithmConfig, LoggingConfig, ImportableFeeModelConfig, ImportableFillModelConfig, RiskEngineConfig
@@ -132,37 +135,12 @@ class OptunaHparamsTuner:
     
         # Setup MLflow
         self.mlflow_client = MlflowClient(tracking_uri="file:logs/mlflow")
-        
-        
-        # Optimization Best Parameters 
-        self.best_model_params_flat = {}
-        self.best_model_path = None
-        self.best_strategy_params_flat = {}
-        self.results = {}
+
+        # Generate unique optimization ID
+        self.optimization_id = f"opt_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         # TODO: ensure that when no optim is run, then this still works
-    
-    def _setup_mlflow(self):
 
-                # Create parent experiment for this optimization run
-        model_name = self.model_params.get('model_name', 'Unknown')
-        strategy_name = self.strategy_params.get('strategy_name', 'Unknown')
-        exp_name = f"Backtest-{model_name}-{strategy_name}"
-        mlflow.set_experiment(exp_name)
-        
-        # Start parent run
-        self.parent_run = mlflow.start_run(
-            run_name=f"{self.run_timestamp}",
-            nested=False
-        )
-        
-        # Log configuration
-        mlflow.log_params({
-            "model_params": self.model_params,
-            "strategy_params": self.strategy_params,
-        })
-
-    
     def _split_hparam_cfg(self, hp_cfg: dict) -> Tuple[dict, dict]:
         """
         Split hyperparameter config into defaults and search space.
@@ -220,13 +198,13 @@ class OptunaHparamsTuner:
 
         # Setup run path
         model_name = self.model_params["model_name"]
-        path = self.run_dir / "Models" / model_name
+        study_path = self.run_dir / "Models" / model_name
 
         # Create/Load MLflow Model experiment for optimization
-        parent_run_id = self._get_mlflow_parent_run_id(exp_name="Models", parent_name=model_name)
-            
+        parent_run_id = self._get_model_parent_run_id()
+
         # Setup Optuna study for model
-        storage = RDBStorage(f"sqlite:///{path / "model_hpo.db"}")
+        storage = RDBStorage(f"sqlite:///{study_path / "model_hpo.db"}")
         study = optuna.create_study(
             study_name=model_name,
             storage=storage,
@@ -234,6 +212,9 @@ class OptunaHparamsTuner:
             sampler=optuna.samplers.TPESampler(seed=self.seed),
             load_if_exists=True,
         )
+
+        # save old best trial to update the "is_best_model" tag at the end
+        old_best_trial = study.best_trial
 
         # Initialize Model Class
         mod = importlib.import_module(f"models.{model_name}.{model_name}")
@@ -249,7 +230,7 @@ class OptunaHparamsTuner:
             # setting train_offset and model_dir to model flatten config dictionary
             # adding train_offset here to avoid type overwite later  (pandas.offset -> str)
             train_offset = trial_hparams["train_offset"]
-            model_dir = path /  f"trial_{trial.number}"
+            model_dir = study_path /  f"trial_{trial.number}"
             model_dir.mkdir(parents=True, exist_ok=True)
             model_params_flat  = self._add_dates(self.model_params, train_offset, to_strategy=False) # merged dictionary
             model_params_flat["model_dir"] = model_dir
@@ -268,18 +249,21 @@ class OptunaHparamsTuner:
                 nested=True,
                 parent_run_id=parent_run_id
             ) as trial_run:
-                # Log trial parameters
+                
+                # Log trial parameters and tags
                 mlflow.log_params(trial_hparams)
-                mlflow.log_param("train_offset", train_offset)
                 mlflow.log_param("trial_number", trial.number)
+                mlflow.set_tags({
+                    "optimization_id": self.optimization_id,
+                    "model_name": model_name,
+                    "phase": "model_hpo"
+                })
                 
                 # storing the model yaml config for reproducibility
-                with open(model_dir / 'config.yaml', 'w', encoding="utf-8") as f:
+                with open(model_dir / 'model_config.yaml', 'w', encoding="utf-8") as f:
                     yaml.dump(yaml_safe(model_params_flat), f, sort_keys=False)
-                mlflow.log_artifact(str(model_dir / 'config.yaml'))
+                mlflow.log_artifact(str(model_dir / 'model_config.yaml'))
                 
-                
-                # Initialize and train model TODO: ensure train data has validation set as well
                 # leave this order to make train_offset be overwritten by flat params type
                 model = ModelClass(**(trial_hparams | model_params_flat) )
                 
@@ -287,20 +271,22 @@ class OptunaHparamsTuner:
                 total_bars = len(next(iter(data_dict.values())))
 
                 # Validation is run automatically if valid_end is set
+                # TODO: data_dict contains valid and train data because model is splitting it internally: 
+                # this should be separated into 2 model calls: .initialize(train_start -> train_end) and .validate(valid_start, valid_end)
                 score = model.initialize(data = data_dict, total_bars = total_bars)
                 
-                # Log results
+                # Log best validation loss (with early-stopping)
+                mlflow.log_metric("best_validation_loss", score)
+
+                # Log per-epoch metrics
                 epochs_metrics = model._epoch_logs
                 for m in epochs_metrics:
                     epoch = m.pop("epoch")
                     mlflow.log_metrics(m, step=epoch)
-                mlflow.log_metric("best_validation_loss", score)
-                mlflow.pytorch.log_model( model , name = model_name) # type: ignore
                 
                 # Store model directory in trial
                 trial.set_user_attr("model_path", str(model_dir / "init.pt"))
-                trial.set_user_attr("best_model_params_flat", yaml_safe(trial_hparams | model_params_flat) )
-                trial.set_user_attr("best_model_hparams", trial_hparams)
+                trial.set_user_attr("model_params_flat", yaml_safe(trial_hparams | model_params_flat) )
                 trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
                 
                 logger.info(f"  Trial {trial.number}: loss = {score:.6f}")
@@ -316,32 +302,28 @@ class OptunaHparamsTuner:
         if self.model_params["tune_hparams"] is True and n_trials >= 1:
             study.optimize(model_objective, n_trials=n_trials)
         
-        # Get best trial
-        best_trial = study.best_trial
-        self.best_model_params_flat = best_trial.user_attrs["best_model_params_flat"]
-        # quick and dirty fix
-        self.best_model_params_flat["train_offset"] = self.best_model_params_flat["train_offset"]
+        # Remove best model tag from old best trial
+        self.mlflow_client.delete_tag(run_id = old_best_trial.user_attrs["mlflow_run_id"], key = "is_best_model")
 
-        self.best_model_path = Path(best_trial.user_attrs["model_path"])
-        
-        # Log best results
-        mlflow.log_param("best_hparams", best_trial.user_attrs["best_model_hparams"] )
-        
+        # Add the best model tag to the new best trial
+        best_trial = study.best_trial
         if best_trial is None:
             raise Exception("Could not compute hp optimization of model")
-        
-        mlflow.log_metric("best_model_loss", best_trial.value) # type: ignore
+        self.mlflow_client.set_tag(best_trial.user_attrs["mlflow_run_id"], "is_best_model", "true")
+
+        # quick and dirty fix
+        #self.best_model_params_flat["train_offset"] = self.best_model_params_flat["train_offset"]
         
         logger.info(f"\nBest model trial: {best_trial.number}")
         logger.info(f"Best model loss: {best_trial.value:.6f}")
-        logger.info(f"Best model hparams: {best_trial.user_attrs["best_model_hparams"]}")
         
         return {
-            "hparams": self.best_model_params_flat,
-            "model_path": self.best_model_path,
+            "model_path": best_trial.user_attrs["model_path"],
+            "models_params_flat": best_trial.user_attrs["model_params_flat"],
+            "mlflow_run_id": best_trial.user_attrs["mlflow_run_id"], 
         }
 
-    def optimize_strategy(self, ) -> Dict[str, Any]:
+    def optimize_strategy(self, model_name: Optional[str] = None) -> Dict[str, Any]:
         """
         Phase 2: Optimize strategy hyperparameters using best model.
         
@@ -352,189 +334,224 @@ class OptunaHparamsTuner:
         logger.info("PHASE 2: STRATEGY HYPERPARAMETER OPTIMIZATION")
         logger.info(f"{'='*60}\n")
         
-        if self.best_model_params_flat is None or self.best_model_path is None:
+        # If model_name = None then best model overall ( any family )
+        best_model_params_flat = self.get_best_model_params_flat(model_name)
+        if best_model_params_flat is None:
             raise ValueError("Must run optimize_model() before optimize_strategy()")
+        best_model_name = best_model_params_flat["model_name"]
+        best_model_mlflow_run_id = self.get_best_model_mlflow_run_id(model_name = best_model_name)
+
+
+        # Setup run path
+        strategy_name = self.strategy_params['strategy_name']
+        study_path = self.run_dir / "Strategies" / f"{strategy_name}_{best_model_name}"
+
+        # Create/Load MLflow Strategy experiment for optimization
+        parent_run_id = self._get_strategy_parent_run_id(model_name = best_model_name)
         
-        #strategy_name = self.strategy_params.get('strategy_name', 'TopKStrategy')
-        #try:
-        #    # Try to import from algos module
-        #    strategy_module = importlib.import_module(f"algos.{strategy_name}")
-        #    StrategyClass = getattr(strategy_module, strategy_name, None)
-        #    
-        #    if StrategyClass is None:
-        #        # Try without redundant naming (e.g., algos.TopKStrategy.Strategy)
-        #        StrategyClass = getattr(strategy_module, "Strategy", None)
-        #    
-        #    if StrategyClass is None:
-        #        raise ImportError(f"Could not find strategy class in algos.{strategy_name}")
-        #        
-        #except ImportError as e:
-        #    logger.error(f"Failed to import strategy {strategy_name}: {e}")
-        #    raise
+        # Setup Optuna study for strategy
+        storage = RDBStorage(f"sqlite:///{study_path / "strategy_hpo.db" }")
 
-        # Create MLflow experiment for strategy optimization
-        with mlflow.start_run(
-            run_name="Strategy_Optimization",
-            nested=True,
-            parent_run_id=
-        ) as strategy_opt_run:
-            
-            # Tag runs for easy filtering and comparison
-            mlflow.set_tag("optimization_type", "strategy")
-            mlflow.set_tag("model_name", self.model_params['model_name'])
-            mlflow.set_tag("strategy_name", self.strategy_params['strategy_name'])
-            mlflow.set_tag("run_timestamp", self.run_timestamp)
-            
-            # Setup Optuna study for strategy
-            strategy_study_name = f"strategy_{self.strategy_params['strategy_name']}"
-            strategy_db_path = self.run_dir / "strategy_hpo.db"
-            storage = RDBStorage(f"sqlite:///{strategy_db_path}")
+        # Parse Objectives and directions. Structure: obj:direction
+        objectives, directions = zip(*self.strategy_params['objectives'].items())
+        primary_obj_index = objectives.index(self.strategy_params.get("primary_objective", "total_pnl_pct"))
+        
+        study = optuna.create_study(
+            study_name= f"{strategy_name}_{best_model_name}",
+            storage=storage,
+            directions=list(directions),  # follow the specific directions given in config for each metric
+            sampler=optuna.samplers.TPESampler(seed=self.seed),
+            load_if_exists=True,
+        )
 
-            # Parse Objectives and directions. Structure: obj:direction
-            objectives, directions = zip(*self.strategy_params['objectives'].items())
-            primary_obj_index = objectives.index(self.strategy_params.get("primary_objective", "total_pnl_pct"))
-            
-            study = optuna.create_study(
-                study_name=strategy_study_name,
-                storage=storage,
-                directions=list(directions),  # follow the specific directions given in config for each metric
-                sampler=optuna.samplers.TPESampler(seed=self.seed),
-                load_if_exists=True,
-            )
-            
-            # Define objective function for strategy
-            def strategy_objective(trial: optuna.Trial) -> Tuple:
-                trial_hparams = self._suggest_params(trial, self.strategy_defaults, self.strategy_search)
+        # save old best trial to update the "is_best_model" tag at the end
+        old_best_trial = study.best_trial
+        
+        # Define objective function for strategy
+        def strategy_objective(trial: optuna.Trial) -> Tuple:
+            trial_hparams = self._suggest_params(trial, self.strategy_defaults, self.strategy_search)
 
-                offset = self.best_model_params_flat["train_offset"]
-                strategy_params_flat = self._add_dates(self.strategy_params.copy(), offset, to_strategy=True ) | trial_hparams
-                strategy_params_flat["catalog_path"] = str(self.run_dir / "catalog")
-                #self.best_model_params_flat["train_offset"] = freq2pdoffset(offset)
+            offset = best_model_params_flat["train_offset"]
+            strategy_params_flat = self._add_dates(self.strategy_params.copy(), offset, to_strategy=True ) | trial_hparams
+            
+            # Start MLflow run for this trial
+            with mlflow.start_run(
+                run_name=f"trial_{trial.number}",
+                nested=True,
+                parent_run_id=parent_run_id
+            ) as trial_run:
                 
-                # Start MLflow run for this trial
-                with mlflow.start_run(
-                    run_name=f"strategy_trial_{trial.number}",
-                    nested=True,
-                    parent_run_id=strategy_opt_run.info.run_id
-                ) as trial_run:
-                    # Log trial parameters
-                    trial_path = self.run_dir / "strategy"/ f"trial{trial.number}"
-                    trial_config_path = trial_path / "strategy_config.yaml"        # necessary for nautilus trader
-                    trial_config_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(trial_config_path, 'w') as f:
-                        yaml.dump(yaml_safe(strategy_params_flat), f)
-                    mlflow.log_params(trial_hparams)
-                    mlflow.log_param("trial_number", trial.number)
-                    mlflow.log_param("phase", "strategy_optimization")
-                    mlflow.log_param("model_path", str(self.best_model_path))
-                    
+                trial_path = study_path / f"trial{trial.number}"
+                trial_config_path = trial_path / "strategy_config.yaml"        # necessary for nautilus trader
+                trial_config_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Log trial parameters
+                mlflow.log_params(trial_hparams)
+                mlflow.log_param("trial_number", trial.number)
+                mlflow.set_tags({
+                    "optimization_id": self.optimization_id,
+                    "strategy_name": self.strategy_params['strategy_name'],
+                    "model_name": best_model_name,
+                    "model_hpo_run_id": best_model_mlflow_run_id,
+                    "phase": "strategy_hpo"
+                })
+                
+                # Storing strategy params for reproducibility
+                with open(trial_config_path, 'w', encoding='utf-8') as f:
+                    yaml.dump(yaml_safe(strategy_params_flat), f)
+                mlflow.log_artifact(str(trial_config_path))
 
+                # Run backtest with these strategy parameters
+                metrics, time_series = self._backtest(
+                    model_params_flat= best_model_params_flat,
+                    strategy_params_flat = strategy_params_flat,
+                    start = strategy_params_flat["valid_start"],
+                    end = strategy_params_flat["valid_end"],
+                )
 
-                    # Run backtest with these strategy parameters
-                    metrics, time_series = self._backtest(
-                        model_params_flat= self.best_model_params_flat,  # type: ignore
-                        strategy_params_flat = strategy_params_flat,
-                        start = strategy_params_flat["valid_start"],
-                        end = strategy_params_flat["valid_end"],
-                    )
+                # Generate and log charts
+                logger.info(f"Generating performance charts trial {trial.number}...")
+                self._generate_performance_charts(
+                    time_series=time_series,
+                    strategy_params_flat=strategy_params_flat,
+                    run_id=trial_run.info.run_id,
+                    output_dir=trial_path/"charts",
+                )
+                
+                # Log all metrics
+                for metric_name, metric_value in metrics.items():
+                    mlflow.log_metric(metric_name, metric_value)
+                for key, ts in time_series.items():
+                    mlflow.log_metric(key, ts)
+                
+                # Use Portfolio return as objective
+                scores = tuple(metrics[obj] for obj in objectives)
+                scores_dict = {obj: metrics[obj] for obj in metrics if obj in objectives}
 
-                    # Generate and log charts
-                    logger.info(f"Generating performance charts trial {trial.number}...")
-                    self._generate_performance_charts(
-                        time_series=time_series,
-                        strategy_params_flat=strategy_params_flat,
-                        trial_number=trial.number,
-                        output_dir=trial_path/"charts",
-                    )
-                    
-                    # Log all metrics
-                    for metric_name, metric_value in metrics.items():
-                        mlflow.log_metric(metric_name, metric_value)
-                    
-                    # Use Portfolio return as objective
-                    scores = tuple(metrics[obj] for obj in objectives)
-                    scores_dict = {obj: metrics[obj] for obj in metrics if obj in objectives}
+                # Store trial attributes
+                trial.set_user_attr("metrics", metrics)
+                trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
+                trial.set_user_attr("trial_config_path", str(trial_config_path))
+                
+                logger.info(f"  Trial {trial.number}: Scores = {scores_dict}")
+                
+                return scores
+        
+        # Run optimization
+        n_trials = self.strategy_params.get("n_trials", 1)
+        if self.strategy_params.get("tune_hparams", True) and n_trials > 0:
+            logger.info(f"Running {n_trials} strategy trials...")
+            study.optimize(strategy_objective, n_trials=n_trials)
+        else:
+            logger.info("Strategy hyperparameter tuning disabled, using defaults")
+            # Run single trial with defaults
+            study.optimize(strategy_objective, n_trials=1)
 
-                    # Store trial attributes
-                    trial.set_user_attr("metrics", metrics)
-                    trial.set_user_attr("time_series_keys", list(time_series.keys()))
-                    trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
-                    trial.set_user_attr("trial_config_path", str(trial_config_path))
-                    
-                    logger.info(f"  Trial {trial.number}: Scores = {scores_dict}")
-                    
-                    return scores
-            
-            # Run optimization
-            n_trials = self.strategy_params.get("n_trials", 1)
-            if self.strategy_params.get("tune_hparams", True) and n_trials > 0:
-                logger.info(f"Running {n_trials} strategy trials...")
-                study.optimize(strategy_objective, n_trials=n_trials)
-            else:
-                logger.info("Strategy hyperparameter tuning disabled, using defaults")
-                # Run single trial with defaults
-                study.optimize(strategy_objective, n_trials=1)
-            
-            # Get best trial
-            best_trials = study.best_trials
-            logger.info(f"Considering best trial for {objectives[primary_obj_index]} as the overall multi-objective best trial")
+        # Remove best model tag from old best trial
+        self.mlflow_client.delete_tag(run_id = old_best_trial.user_attrs["mlflow_run_id"], key = "is_best_strategy_for_model")
 
-            if study.directions[primary_obj_index] == optuna.study.StudyDirection.MINIMIZE:
-                best_trial = min(best_trials, key=lambda t: t.values[primary_obj_index])
-            else:
-                best_trial = max(best_trials, key=lambda t: t.values[primary_obj_index])
+        # Get best trial based on primary metric
+        best_trials = study.best_trials
+        logger.info(f"Considering best trial for {objectives[primary_obj_index]} as the overall multi-objective best trial")
+        if study.directions[primary_obj_index] == optuna.study.StudyDirection.MINIMIZE:
+            best_trial = min(best_trials, key=lambda t: t.values[primary_obj_index])
+        else:
+            best_trial = max(best_trials, key=lambda t: t.values[primary_obj_index])
+        if best_trial is None:
+            raise Exception("Could not compute hp optimization of model")
+        
+        # Set best trial tag in MLflow for plotting
+        best_strategy_model_run_id = best_trial.user_attrs["mlflow_run_id"]
+        self.mlflow_client.set_tag(best_strategy_model_run_id, "is_best_strategy_for_model", "true")
+        self.mlflow_client.set_tag(best_strategy_model_run_id, "primary_objective", objectives[primary_obj_index])
+        
+        logger.info(f"\nBest strategy trial: {best_trial.number}")
+        logger.info(f"Best strategy {objectives[primary_obj_index]}: {best_trial.values[primary_obj_index]:.4f}")
+        logger.info(f"Best strategy hparams: {best_trial.params}")
+        
 
-            self.best_strategy_params_flat = self.strategy_params | best_trial.params
-            
-            # Set best trial tag in MLflow for plotting
-            client = mlflow.MlflowClient()
-            client.set_tag(best_trial.user_attrs["mlflow_run_id"], "best_trial", "true")
-            client.set_tag(best_trial.user_attrs["mlflow_run_id"], "primary_objective", objectives[primary_obj_index])
-
-            # Log best results
-            mlflow.log_param("best_trial_charts_directory", str(self.run_dir / "strategy"/ f"trial{best_trial.number}"))
-            mlflow.log_params({
-                f"best_strategy_{k}": v for k, v in best_trial.params.items()
-            })
-            mlflow.log_metric(f"best_strategy_{objectives[primary_obj_index]}", best_trial.values[primary_obj_index])
-            
-            logger.info(f"\nBest strategy trial: {best_trial.number}")
-            logger.info(f"Best strategy {objectives[primary_obj_index]}: {best_trial.values[primary_obj_index]:.4f}")
-            logger.info(f"Best strategy hparams: {best_trial.params}")
-            
-            # Save strategy optimization results
-            strategy_results = {
-                "best_trial": best_trial.number,
-                "best_primary_obj": best_trial.values[primary_obj_index],
-                "best_hparams": best_trial.params,
-                "best_metrics": best_trial.user_attrs.get("metrics", {}),
-                "all_trials": [
-                    {
-                        "number": t.number,
-                        "primary_objective_idx":primary_obj_index, 
-                        "values": t.values,
-                        "params": t.params,
-                        "state": str(t.state),
-                    }
-                    for t in study.trials
-                ]
-            }
-            
-            #results_path = self.run_dir / "strategy_optimization_results.yaml"
-            #with open(results_path, 'w') as f:
-            #    yaml.dump(yaml_safe(strategy_results), f)
-            #mlflow.log_artifact(str(results_path))
         
         return {
             "best_params_path": best_trial.user_attrs.get("trial_config_path"),
             "hparams": best_trial.params,
-            "metrics": best_trial.user_attrs.get("metrics", {})
+            "metrics": best_trial.user_attrs.get("metrics", {}),
+            "mlflow_run_id": best_strategy_model_run_id,
         }
     
-    def get_best_config_flat(self, ) -> Dict[str, Any]:
-        config = {"MODEL": self.best_model_params_flat , "STRATEGY": self.best_strategy_params_flat }
+    def run_final_backtest(self, 
+                           backtest_start: str, 
+                           backtest_end: str, 
+                           strategy_hpo_run_id: str,
+                           optimization_id: str = '',
+                           ) -> Tuple[Dict, Dict]:
+        """Run final backtest with strategy run_id containing the best execution for strategy-model combo"""
+        # Setup experiment
+        exp = self.mlflow_client.get_experiment_by_name("Backtests")
+        if exp is None:
+            exp_id = mlflow.create_experiment("Backtests")
+        else:
+            exp_id = exp.experiment_id
+        
+        # Retrieve strategy and model flat params
+        model_name = self.mlflow_client.get_run(run_id = strategy_hpo_run_id).data.params.get("model_name")
+        strategy_name = self.mlflow_client.get_run(run_id = strategy_hpo_run_id).data.params.get("strategy_name")
+        full_flat = self.get_best_full_params_flat(model_name=model_name, strategy_name = strategy_name)
+        model_params_flat = full_flat["MODEL"]
+        strategy_params_flat = full_flat["STRATEGY"]
+        
+        tags = {
+                "strategy_name": strategy_name,
+                "model_name": model_name,
+                "strategy_hpo_run_id": strategy_hpo_run_id,
+                "phase": "backtest"
+            }
+        if optimization_id:
+            tags["optimization_id"] = optimization_id
 
-        return config
+        logger.info(f"Running final backtest from {backtest_start} to {backtest_end}")
+        run = self.mlflow_client.create_run(
+            experiment_id=exp_id, 
+            tags=tags, 
+            run_name=f"Backtest_{strategy_name}_{model_name}"
+        )
+        run_id = run.info.run_id
+        
+        # Log backtest params
+        self.mlflow_client.log_param( run_id= run_id, key = "config", value = full_flat )
+        self.mlflow_client.log_param( run_id= run_id, key = "backtest_start", value = backtest_start )
+        self.mlflow_client.log_param( run_id= run_id, key = "backtest_end", value = backtest_end )
+
+            
+        # Save and log optimized config
+        backtest_path = self.run_dir / "Backtests" / f"{strategy_name}_{model_name}"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        optimized_config_flat_path = backtest_path / f"{timestamp}_config.yaml"
+        with open(optimized_config_flat_path, 'w') as f:
+            yaml.dump(yaml_safe(full_flat), f)
+        self.mlflow_client.log_artifact( run_id= run_id, local_path = str(optimized_config_flat_path) )
+        
+        # Run backtest
+        final_metrics, final_time_series = self._backtest(
+            model_params_flat=model_params_flat,
+            strategy_params_flat=strategy_params_flat,
+            start=pd.Timestamp(backtest_start),
+            end=pd.Timestamp(backtest_end),
+        )
+        
+        # Generate charts
+        self._generate_performance_charts(
+            time_series=final_time_series,
+            strategy_params_flat=strategy_params_flat,
+            run_id=run_id,
+            output_dir=backtest_path / "charts"
+        )
+        
+        # Log all metrics
+        for metric_name, metric_value in final_metrics.items():
+            self.mlflow_client.log_metric(run_id=run_id, key=metric_name, value=metric_value)
+        for key, ts in final_time_series.items():
+            self.mlflow_client.log_metric(run_id = run_id, key = key, value = ts)
+        return final_metrics, final_time_series
 
     def _backtest(
         self,
@@ -902,14 +919,14 @@ class OptunaHparamsTuner:
         return config
     
     def _generate_performance_charts(self, time_series: Dict, strategy_params_flat: Dict, 
-                                    trial_number: int, output_dir: Path):
+                                    run_id: str, output_dir: Path):
         """
         Generate comprehensive performance charts using modular plotting functions.
         
         Args:
             time_series: Dictionary containing account, positions, and other time series
             strategy_params_flat: Strategy configuration parameters
-            trial_number: Trial number for identification
+            run_id: strategy run_id from mlflow to store the artifacts
             output_dir: Directory to save charts
         """
         # Extract and validate account data
@@ -1087,27 +1104,317 @@ class OptunaHparamsTuner:
                 save_path=output_dir / 'portfolio_allocation.png'
             )
 
-            mlflow.log_artifacts(str(output_dir))
+            self.mlflow_client.log_artifacts(run_id = run_id , local_dir = str(output_dir))
 
             
-            logger.info(f"Successfully generated performance charts for trial {trial_number}")
+            logger.info(f"Successfully generated performance charts")
             
         except Exception as e:
             logger.error(f"Error generating performance charts: {e}", exc_info=True)
 
-    def _get_mlflow_parent_run_id(self, exp_name: str, parent_name: str):
-        "Return mlflow parent run_id for strategy or model experiments by name"
-        exp = self.mlflow_client.get_experiment_by_name(exp_name)
+
+    def _get_model_parent_run_id(self,) -> str:
+        """Get or create parent run for model family in 'Models' experiment."""
+        exp = self.mlflow_client.get_experiment_by_name("Models")
         if exp is None:
-            exp_id = self.mlflow_client.create_experiment(exp_name)
+            exp_id = self.mlflow_client.create_experiment("Models")
         else:
             exp_id = exp.experiment_id
-        name = parent_name
-        filter_str = f"tags.is_parent = 'true' AND tags.name = '{name}'"
-        parent_run = self.mlflow_client.search_runs([exp_id], filter_string=filter_str, max_results=1)
-        if parent_run:
-            return parent_run[0].info.run_id
+
+        # Search for existing parent run for this model family
+        model_name = self.model_params["model_name"]
+        filter_str = f"tags.model_name = '{model_name}' AND tags.is_parent = 'true'"
+        runs = self.mlflow_client.search_runs([exp_id], filter_string=filter_str, max_results=1)
+        
+        if runs:
+            return runs[0].info.run_id
         else:
-            tags = {"is_parent":"true" , "name":name}
-            run = self.mlflow_client.create_run(experiment_id=exp_id, tags=tags)
+            # Create new parent run
+            tags = {
+                "is_parent": "true", 
+                "model_name": model_name, 
+                "optimization_id": self.optimization_id, 
+                "phase": "model_hpo" 
+            }
+            run = self.mlflow_client.create_run(
+                experiment_id=exp_id, 
+                tags=tags, 
+                run_name=model_name 
+            )
+            run_id = run.info.run_id
+
+            # Log model family params
+            for k , p in self.model_params.items():
+                self.mlflow_client.log_param( run_id= run_id, key = k, value = p )
+
+            return run_id
+
+    def _get_strategy_parent_run_id(self, model_name : str) -> str:
+        """Get or create parent run for strategy+model combo in 'Strategies' experiment."""
+        exp = self.mlflow_client.get_experiment_by_name("Strategies")
+        if exp is None:
+            exp_id = self.mlflow_client.create_experiment("Strategies")
+        else:
+            exp_id = exp.experiment_id
+        
+        strategy_name = self.strategy_params['strategy_name']
+        run_name = f"{strategy_name}_{model_name}"
+        
+        # Search for existing parent for this combo
+        filter_str = (f"tags.strategy_name = '{strategy_name}' AND "
+                    f"tags.model_name = '{model_name}' AND "
+                    f"tags.is_parent = 'true'")
+        runs = self.mlflow_client.search_runs([exp_id], filter_string=filter_str, max_results=1)
+        
+        if runs:
+            return runs[0].info.run_id
+        
+        else:
+            best_model_run_id = self.get_best_model_mlflow_run_id(model_name=model_name)
+            best_model_params_flat = self.get_best_model_params_flat(model_name=model_name)
+
+            # Create new parent run
+            tags = {
+                "optimization_id": self.optimization_id,
+                "is_parent": "true",
+                "strategy_name": strategy_name,
+                "model_name": model_name,
+                "best_model_run_id": best_model_run_id,
+                "phase": "strategy_hpo"
+            }
+            run = self.mlflow_client.create_run(
+                experiment_id=exp_id,
+                tags=tags,
+                run_name=run_name
+            )
+
+            run_id = run.info.run_id
+
+            # Retrieve the best model params for model_name family
+
+
+
+            # Log Strategy family params
+            self.mlflow_client.log_param(run_id = run_id, key = "best_model_params_flat", value = best_model_params_flat)
+            for k , p in self.strategy_params.items():
+                self.mlflow_client.log_param( run_id= run_id, key = k, value = p )
+
             return run.info.run_id
+        
+
+    def get_best_model_params_flat(self, model_name: Optional[str]) -> Dict:
+        """Returns flat params dictionary of model_name familiy (if specified) or best model overall (any family)"""
+        
+        exp = self.mlflow_client.get_experiment_by_name("Models")
+        if exp is None:
+            raise Error(f"No model optimization has been run yet")
+        
+        # Specific to a model_name (if specified)
+        if model_name:
+
+            model_runs = self.mlflow_client.search_runs(
+                experiment_ids=[exp.experiment_id],
+                filter_string=f"tags.model_name = '{model_name}' AND tags.is_best_model = 'true'",
+                max_results=1
+                )
+            if not model_runs:
+                raise Error(f"No model optimization has been run yet for family: {model_name}")
+            best_model_params_flat = model_runs[0].data.tags["best_model_params_flat"]
+            return best_model_params_flat
+
+        # Return best_model_params_flat of best model overall ( any family )
+        model_runs = self.mlflow_client.search_runs(
+            experiment_ids=[exp.experiment_id],
+            filter_string="tags.is_best_model = 'true'",
+            order_by=["metrics.best_validation_loss ASC"],
+            max_results=1
+        )
+        if not model_runs:
+            raise Error(f"No model optimization has been run yet for family: {model_name}")
+
+        best_model_params_flat = model_runs[0].data.tags["best_model_params_flat"]
+        return best_model_params_flat
+    
+    def get_best_model_mlflow_run_id(self, model_name: Optional[str]) -> Dict:
+        """Returns the mlflow best run_id of the specified model_name (if specified) or the run_id of the best model overall (any family) """
+        
+        exp = self.mlflow_client.get_experiment_by_name("Models")
+        if exp is None:
+            raise Error(f"No model optimization has been run yet")
+        
+        # Specific to a model_name (if specified)
+        if model_name:
+            model_runs = self.mlflow_client.search_runs(
+                experiment_ids=[exp.experiment_id],
+                filter_string=f"tags.model_name = '{model_name}' AND tags.is_best_model = 'true'",
+                max_results=1
+                )
+            if not model_runs:
+                raise Error(f"No model optimization has been run yet for family: {model_name}")
+            best_model_mlflow_run_id = model_runs[0].data.tags["mlflow_run_id"]
+            return best_model_mlflow_run_id
+
+        # Return best_model_params_flat of best model overall ( any family )
+        model_runs = self.mlflow_client.search_runs(
+            experiment_ids=[exp.experiment_id],
+            filter_string="tags.is_best_model = 'true'",
+            order_by=["metrics.best_validation_loss ASC"],
+            max_results=1
+        )
+        if not model_runs:
+            raise Error(f"No model optimization has been run yet for family: {model_name}")
+
+        best_model_mlflow_run_id = model_runs[0].data.tags["mlflow_run_id"]
+        return best_model_mlflow_run_id
+    
+    def get_best_full_params_flat(self, primary_objective_with_direction: Dict[str,str] = {"total_pnl_pct" : "maximize"}, strategy_name: Optional[str] = None, model_name: Optional[str] = None):
+        """ Returns best full flat params dictionary (MODEL & STRATEGY) filtering by
+            strategy_nam (if specified), best model name (if specified) or best 
+            strategy + model combo overall.
+            
+            Args:
+                primary_objective_with_direction: Dictionary with Strategy optimization primary objective and direction (maximize, minimize)
+                strategy_name: Filter by specific strategy (optional)
+                model_name: Filter by specific model (optional)
+            
+            Returns:
+                Dict with "MODEL" and "STRATEGY" keys containing best flat params
+           """
+        
+        # Set experiments for mlflow
+        strategy_exp = self.mlflow_client.get_experiment_by_name("Strategies")
+        model_exp = self.mlflow_client.get_experiment_by_name("Models")
+        if strategy_exp is None or model_exp is None:
+            raise ValueError(f"Required experiments not found. \nStrategy exp: {strategy_exp} \nModel exp: {model_exp}" )
+        
+        # Built filter of strategy and model
+        filter_parts = ["tags.is_best_strategy_for_model = 'true'"]
+        if strategy_name:
+            filter_parts.append(f"tags.strategy_name = '{strategy_name}'")
+        if model_name:
+            filter_parts.append(f"tags.model_name = '{model_name}'")
+        filter_string = " AND ".join(filter_parts)
+
+        # TODO: ensure all strategies have the primary obj in common (total_pnl_pct)
+        # Matching optuna ordering flag with mlflow search order
+        objective, direction = next(iter(primary_objective_with_direction.items()))
+        if direction not in ("maximize", "minimize"):
+            raise Error(f"Direction should be either 'maximize' or 'maximize'... it was instead {direction}")
+        if direction == "maximize":
+            search_order = "DESC"
+        else:
+            search_order = "ASC"
+        
+        # Finding best model and strategy runs from filters 
+        strategy_runs = self.mlflow_client.search_runs(
+            experiment_ids=[strategy_exp.experiment_id],
+            filter_string=filter_string,
+            order_by=[f"metrics.{objective} {search_order}"],
+            max_results=1
+        )
+        if not strategy_runs:
+            raise ValueError(f"No matching strategy run found for filters: {filter_string}")
+        
+        best_strategy_run = strategy_runs[0]
+        model_hpo_run_id = best_strategy_run.data.tags.get("model_hpo_run_id")
+        if not model_hpo_run_id:
+            raise ValueError("Strategy run missing model_hpo_run_id tag")
+        
+        best_relative_model_run = self.mlflow_client.get_run(model_hpo_run_id)
+        
+        # Load model params flat for the best model
+        model_config_path = self.mlflow_client.download_artifacts(best_relative_model_run.info.run_id, "model_config.yaml")
+        model_params_flat = {}
+        with open(model_config_path, "r", encoding="utf-8") as f:
+            model_params_flat = yaml.safe_load(f.read())
+        
+        # Load strategy params flat for the best strategy
+        strategy_config_path = self.mlflow_client.download_artifacts(best_relative_model_run.info.run_id, "strategy_config.yaml")
+        strategy_params_flat = {}
+        with open(strategy_config_path, "r", encoding="utf-8") as f:
+            strategy_params_flat = yaml.safe_load(f.read())
+        
+        full_config = {
+            "MODEL": model_params_flat ,
+            "STRATEGY": strategy_params_flat
+        }
+    
+        return full_config
+    
+    def get_strategy_hpo_matrix(self, metric: str = "total_pnl_pct") -> pd.DataFrame:
+        """
+        Generate matrix: strategies × models with best HP tuning metrics.
+        
+        Args:
+            metric: Metric name to display in matrix
+        
+        Returns:
+            DataFrame with strategies as rows, models as columns
+        """
+        exp = self.mlflow_client.get_experiment_by_name("Strategies")
+        if not exp:
+            raise Error(f"No strategies optimization has been run yet")
+
+        runs = self.mlflow_client.search_runs(
+            experiment_ids=[exp.experiment_id],
+            filter_string="tags.is_best_strategy_for_model = 'true'",
+        )
+        
+        data = []
+        for run in runs:
+            data.append({
+                'strategy_name': run.data.tags.get('strategy_name', 'Unknown'),
+                'model_name': run.data.tags.get('model_name', 'Unknown'),
+                metric: run.data.metrics.get(metric, None)
+            })
+        
+        df = pd.DataFrame(data)
+        if df.empty:
+            return df
+        
+        matrix = df.pivot_table(
+            index='strategy_name',
+            columns='model_name',
+            values=metric,
+            #aggfunc='first'
+        )
+        return matrix
+
+    def get_final_backtest_matrix(self, metric: str = "total_pnl_pct") -> pd.DataFrame:
+        """
+        Generate matrix: strategies × models with final backtest metrics.
+        
+        Args:
+            metric: Metric name to display in matrix
+        
+        Returns:
+            DataFrame with strategies as rows, models as columns
+        """
+        exp = self.mlflow_client.get_experiment_by_name("Backtests")
+        if exp is None:
+            logger.warning("No Final_Backtests experiment found")
+            return pd.DataFrame()
+        
+        runs = self.mlflow_client.search_runs(
+            experiment_ids=[exp.experiment_id],
+        )
+        
+        data = []
+        for run in runs:
+            data.append({
+                'strategy_name': run.data.tags.get('strategy_name', 'Unknown'),
+                'model_name': run.data.tags.get('model_name', 'Unknown'),
+                metric: run.data.metrics.get(metric, None)
+            })
+        
+        df = pd.DataFrame(data)
+        if df.empty:
+            return df
+        
+        matrix = df.pivot_table(
+            index='strategy_name',
+            columns='model_name',
+            values=metric,
+#            aggfunc='first'
+        )
+        return matrix

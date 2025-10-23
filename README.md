@@ -114,3 +114,34 @@ Position not too large versus portfolio (max_weight_abs, max_weight_rel)
 Trade not too large versus available liquidity (adv_lookback, max_adv_pct)
 
 
+## Mlflow Experiments structure
+Experiment: Models
+├── Run: "MyModel" (parent - one per model family, reused across sessions)
+│   ├── Tags: {is_parent: true, model_name: "MyModel", optimization_id, phase="model_hpo"}
+│   ├── Params: {...} ← MyModel fixed params
+│   │
+│   └── Run: "trial_0", "trial_1", ... (children)
+│       ├── Tags: {optimization_id, model_name, is_best_model: true/None, phase="model_hpo"}
+│       ├── Params: {window_len, (model_hparams), ... , trial_number}  ← Only Optuna params
+│       ├── Metrics: {best_validation_loss, **per-epoch-metrics}
+|       └── Artifacts: model_config.yaml
+
+Experiment: Strategies  
+├── Run: "MyStrategy_MyModel" (parent - one per strategy-model combo, reused)
+│   ├── Tags: {is_parent: true, strategy_name, model_name, best_model_run_id, optimization_id, phase="strategy_hpo"}
+│   ├── Params: {...} ← MyStrategy fixed params + best_model_params_flat
+│   │
+│   └── Run: "trial_0", "trial_1", ... (children)
+│       ├── Tags: {optimization_id, strategy_name, model_name, 
+│       │         model_hpo_run_id, is_best_strategy_for_model: true/None, phase="strategy_hpo", primary_objective}
+│       ├── Params: {top_k, retrain_offset, ...}  ← Only Optuna params
+│       ├── Metrics: { **backtest metrics (e.g. total_pnl_pct), **time_series (e.g. orders, positions) }
+|       └── Artifacts: strategy_config.yaml + charts
+
+Experiment: Backtests
+└── Run: "MyStrategy_MyModel" (flat - timestamped strategy-model combo runs)
+    ├── Tags: {strategy_name, model_name, Optional(optimization_id),
+    │         strategy_hpo_run_id, phase="backtest"}
+    ├── Params: {config (best params from model+strategy hpo), backtest_start, backtest_end}
+    ├── Metrics: { **backtest metrics (e.g. total_pnl_pct), **time_series (e.g. orders, positions) }
+    └── Artifacts: (timestamp)_config.yaml + charts
