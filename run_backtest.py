@@ -37,34 +37,25 @@ def main():
         cfg["STRATEGY"]["PARAMS"]["currency"] = Currency(code='EUR', precision=3, iso4217=978, name='Euro', currency_type=CurrencyType.FIAT)
 
     # Setup directories
-    logs_dir = Path(cfg["STRATEGY"]["PARAMS"]["logs_dir"]).parent
-    #timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    timestamp = "20250922_066666"
-    run_dir = logs_dir / "backtests" / timestamp
-    run_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = Path("logs/")
 
     # Logging
     logging.basicConfig(    
             level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(f'{run_dir}/backtest.log', encoding='utf-8'),
+            logging.FileHandler(str(logs_dir / "logging.log"), encoding='utf-8'),
             #logging.StreamHandler()  # This adds console output
         ]
     )
     logger = logging.getLogger(__name__)
 
-
-    # Setup catalog
-    catalog_path = Path(cfg["STRATEGY"]["PARAMS"]["catalog_path"])
-    catalog_path.mkdir(parents=True, exist_ok=True)
     
     # Load DBN tick data to catalog
     logger.info("Loading Databento trade ticks...")
-    data_load_start = cfg["STRATEGY"]["PARAMS"]["data_load_start"]
     
     loader = DatabentoTickLoader(cfg=cfg["STRATEGY"]["PARAMS"],venue_name=cfg["STRATEGY"]["PARAMS"]["venue_name"])
-    catalog = loader.load_to_catalog(catalog_path=catalog_path)
+    catalog = loader.load_to_catalog()
 
     # Error handling
     if len(catalog.instruments()) == 0:
@@ -77,7 +68,8 @@ def main():
             'num_trades': 0,
         }, {}
 
-    
+
+
     logger.info("\n" + "="*70)
     logger.info('STARTING HYPERPARAMETER OPTIMIZATION')
     logger.info("="*70 + "\n")
@@ -89,8 +81,8 @@ def main():
     # Initialize tuner
     tuner = OptunaHparamsTuner(
         cfg=cfg,
-        run_timestamp=timestamp,
-        run_dir=run_dir,
+        loader=loader,
+        run_dir=logs_dir,
         seed=2025
     )
     

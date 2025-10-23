@@ -80,7 +80,7 @@ class DatabentoTickLoader:
     
     def load_to_catalog(
         self,
-        catalog_path: Path,
+        catalog_path: Optional[Path] = None,
         start_time: Optional[pd.Timestamp] = None,
         end_time: Optional[pd.Timestamp] = None,
     ) -> ParquetDataCatalog:
@@ -95,6 +95,8 @@ class DatabentoTickLoader:
         Returns:
             ParquetDataCatalog instance
         """
+        if not catalog_path:
+            catalog_path = self._root / "nautilus_catalog"
         catalog = ParquetDataCatalog(path=str(catalog_path))
         
         # Write instruments

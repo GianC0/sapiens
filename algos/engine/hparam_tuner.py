@@ -85,7 +85,6 @@ class OptunaHparamsTuner:
     def __init__(
         self,
         cfg: Dict[str, Any],
-        run_timestamp: str,
         loader: DatabentoTickLoader,
         run_dir: Path = Path("logs/backtests/"),
         seed: int = 2025,
@@ -95,7 +94,7 @@ class OptunaHparamsTuner:
         
         Args:
             cfg: Configuration dictionary
-            run_timestamp: timestamp of this run to use for IDs and paths
+            loader: DatabentoTickLoader with data already loaded
             run_dir: Root directory for logs
             seed: Seed for reproducibility of hp tuning runs
         """
@@ -103,9 +102,7 @@ class OptunaHparamsTuner:
         self.config = cfg
 
         # Log Path
-        self.run_timestamp = run_timestamp
         self.run_dir = run_dir
-        
         
         # Parse configuration sections
         self.model_config = self.config.get('MODEL', {})
@@ -134,7 +131,8 @@ class OptunaHparamsTuner:
     
     
         # Setup MLflow
-        self._setup_mlflow()
+        self.mlflow_client = MlflowClient(tracking_uri="file:logs/mlflow")
+        
         
         # Optimization Best Parameters 
         self.best_model_params_flat = {}
@@ -145,10 +143,8 @@ class OptunaHparamsTuner:
         # TODO: ensure that when no optim is run, then this still works
     
     def _setup_mlflow(self):
-        """Setup MLflow tracking with hierarchical experiments."""
-        mlflow.set_tracking_uri("file:logs/mlruns")
-        
-        # Create parent experiment for this optimization run
+
+                # Create parent experiment for this optimization run
         model_name = self.model_params.get('model_name', 'Unknown')
         strategy_name = self.strategy_params.get('strategy_name', 'Unknown')
         exp_name = f"Backtest-{model_name}-{strategy_name}"
@@ -165,6 +161,7 @@ class OptunaHparamsTuner:
             "model_params": self.model_params,
             "strategy_params": self.strategy_params,
         })
+
     
     def _split_hparam_cfg(self, hp_cfg: dict) -> Tuple[dict, dict]:
         """
@@ -220,127 +217,124 @@ class OptunaHparamsTuner:
         logger.info(f"\n{'='*60}")
         logger.info("PHASE 1: MODEL HYPERPARAMETER OPTIMIZATION")
         logger.info(f"{'='*60}\n")
+
+        # Setup run path
+        model_name = self.model_params["model_name"]
+        path = self.run_dir / "Models" / model_name
+
+        # Create/Load MLflow Model experiment for optimization
+        parent_run_id = self._get_mlflow_parent_run_id(exp_name="Models", parent_name=model_name)
+            
+        # Setup Optuna study for model
+        storage = RDBStorage(f"sqlite:///{path / "model_hpo.db"}")
+        study = optuna.create_study(
+            study_name=model_name,
+            storage=storage,
+            direction='minimize',
+            sampler=optuna.samplers.TPESampler(seed=self.seed),
+            load_if_exists=True,
+        )
+
+        # Initialize Model Class
+        mod = importlib.import_module(f"models.{model_name}.{model_name}")
+        ModelClass = getattr(mod, model_name, None) or getattr(mod, "Model")
+        if ModelClass is None:
+            raise ImportError(f"Could not find model class in models.{model_name}")
+
         
-        # Create MLflow experiment for model optimization
-        with mlflow.start_run(
-            run_name="Model_Optimization",
-            nested=True,
-            parent_run_id=self.parent_run.info.run_id
-        ) as model_opt_run:
+        # Define objective function for model
+        def model_objective(trial: optuna.Trial) -> float:
+            trial_hparams = self._suggest_params(trial, self.model_defaults, self.model_search)
             
-            # Setup Optuna study for model
-            model_study_name = f"model_{self.model_params['model_name']}"
-            model_name = self.model_params['model_name']
-            model_db_path = self.run_dir / "model_hpo.db"
-            storage = RDBStorage(f"sqlite:///{model_db_path}")
-            
-            study = optuna.create_study(
-                study_name=model_study_name,
-                storage=storage,
-                direction='minimize',
-                sampler=optuna.samplers.TPESampler(seed=self.seed),
-                load_if_exists=True,
-            )
+            # setting train_offset and model_dir to model flatten config dictionary
+            # adding train_offset here to avoid type overwite later  (pandas.offset -> str)
+            train_offset = trial_hparams["train_offset"]
+            model_dir = path /  f"trial_{trial.number}"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            model_params_flat  = self._add_dates(self.model_params, train_offset, to_strategy=False) # merged dictionary
+            model_params_flat["model_dir"] = model_dir
 
-            # Initialize Model Class
-            mod = importlib.import_module(f"models.{model_name}.{model_name}")
-            ModelClass = getattr(mod, model_name, None) or getattr(mod, "Model")
-            if ModelClass is None:
-                raise ImportError(f"Could not find model class in models.{model_name}")
-
+            # init data timestamps for data loader
+            # Initialize calendar. NOTE: calendar and freq already added un OptunaHparamTuner __init__
             
-            # Define objective function for model
-            def model_objective(trial: optuna.Trial) -> float:
-                trial_hparams = self._suggest_params(trial, self.model_defaults, self.model_search)
+            # Retrieve CSV Bar data from loader for training
+            start = model_params_flat["train_start"]
+            end = model_params_flat["valid_end"]
+            data_dict = self.loader.get_ohlcv_data(frequency = self.model_params["freq"], start=start, end=end)
+
+            # Start MLflow run for this trial
+            with mlflow.start_run(
+                run_name=f"trial_{trial.number}",
+                nested=True,
+                parent_run_id=parent_run_id
+            ) as trial_run:
+                # Log trial parameters
+                mlflow.log_params(trial_hparams)
+                mlflow.log_param("train_offset", train_offset)
+                mlflow.log_param("trial_number", trial.number)
                 
-                # setting train_offset and model_dir to model flatten config dictionary
-                # adding train_offset here to avoid type overwite later  (pandas.offset -> str)
-                train_offset = trial_hparams["train_offset"]
-                model_dir = self.run_dir / "model" /  f"trial_{trial.number}"
-                model_dir.mkdir(parents=True, exist_ok=True)
-                model_params_flat  = self._add_dates(self.model_params, train_offset, to_strategy=False ) # merged dictionary
-                model_params_flat["model_dir"] = model_dir
-
-                # init data timestamps for data loader
-                # Initialize calendar. NOTE: calendar and freq already added un OptunaHparamTuner __init__
+                # storing the model yaml config for reproducibility
+                with open(model_dir / 'config.yaml', 'w', encoding="utf-8") as f:
+                    yaml.dump(yaml_safe(model_params_flat), f, sort_keys=False)
+                mlflow.log_artifact(str(model_dir / 'config.yaml'))
                 
-                start = model_params_flat["train_start"]
-                end = model_params_flat["valid_end"]
-                data_dict = self.loader.get_ohlcv_data(frequency = self.model_params["freq"], start=start, end=end)
+                
+                # Initialize and train model TODO: ensure train data has validation set as well
+                # leave this order to make train_offset be overwritten by flat params type
+                model = ModelClass(**(trial_hparams | model_params_flat) )
+                
+                # all assets have same number of bars is ensured by get_data()
+                total_bars = len(next(iter(data_dict.values())))
 
-                # Start MLflow run for this trial
-                with mlflow.start_run(
-                    run_name=f"{model_name}_trial_{trial.number}",
-                    nested=True,
-                    parent_run_id=model_opt_run.info.run_id
-                ) as trial_run:
-                    # Log trial parameters
-                    mlflow.log_params(trial_hparams)
-                    mlflow.log_param("train_offset", train_offset)
-                    mlflow.log_param("trial_number", trial.number)
-                    
-                    # storing the model yaml config for reproducibility
-                    with open(model_dir / 'config.yaml', 'w', encoding="utf-8") as f:
-                        yaml.dump(yaml_safe(model_params_flat), f, sort_keys=False)
-                    mlflow.log_artifact(str(model_dir / 'config.yaml'))
-                    
-                    
-                    # Initialize and train model TODO: ensure train data has validation set as well
-                    # leave this order to make train_offset be overwritten by flat params type
-                    model = ModelClass(**(trial_hparams | model_params_flat) )
-                    
-                    # all assets have same number of bars is ensured by get_data()
-                    total_bars = len(next(iter(data_dict.values())))
+                # Validation is run automatically if valid_end is set
+                score = model.initialize(data = data_dict, total_bars = total_bars)
+                
+                # Log results
+                epochs_metrics = model._epoch_logs
+                for m in epochs_metrics:
+                    epoch = m.pop("epoch")
+                    mlflow.log_metrics(m, step=epoch)
+                mlflow.log_metric("best_validation_loss", score)
+                mlflow.pytorch.log_model( model , name = model_name) # type: ignore
+                
+                # Store model directory in trial
+                trial.set_user_attr("model_path", str(model_dir / "init.pt"))
+                trial.set_user_attr("best_model_params_flat", yaml_safe(trial_hparams | model_params_flat) )
+                trial.set_user_attr("best_model_hparams", trial_hparams)
+                trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
+                
+                logger.info(f"  Trial {trial.number}: loss = {score:.6f}")
+                
+            return score
+        
+        # Run optimization
+        # TODO: define case when no hp tuning is needed
+        logger.info(f"Running {self.model_params["n_trials"]} model trials...")
 
-                    # Validation is run automatically if valid_end is set
-                    score = model.initialize(data = data_dict, total_bars = total_bars)
-                    
-                    # Log results
-                    epochs_metrics = model._epoch_logs
-                    for m in epochs_metrics:
-                        epoch = m.pop("epoch")
-                        mlflow.log_metrics(m, step=epoch)
-                    mlflow.log_metric("best_validation_loss", score)
-                    mlflow.pytorch.log_model( model , name = model_name) # type: ignore
-                    
-                    # Store model directory in trial
-                    trial.set_user_attr("model_path", str(model_dir / "init.pt"))
-                    trial.set_user_attr("best_model_params_flat", yaml_safe(trial_hparams | model_params_flat) )
-                    trial.set_user_attr("best_model_hparams", trial_hparams)
-                    trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
-                    
-                    logger.info(f"  Trial {trial.number}: loss = {score:.6f}")
-                    
-                return score
-            
-            # Run optimization
-            # TODO: define case when no hp tuning is needed
-            logger.info(f"Running {self.model_params["n_trials"]} model trials...")
+        # Handle case without optimization
+        n_trials = self.model_params.get("n_trials",1)
+        if self.model_params["tune_hparams"] is True and n_trials >= 1:
+            study.optimize(model_objective, n_trials=n_trials)
+        
+        # Get best trial
+        best_trial = study.best_trial
+        self.best_model_params_flat = best_trial.user_attrs["best_model_params_flat"]
+        # quick and dirty fix
+        self.best_model_params_flat["train_offset"] = self.best_model_params_flat["train_offset"]
 
-            # Handle case without optimization
-            n_trials = self.model_params.get("n_trials",1)
-            if self.model_params["tune_hparams"] is True and n_trials >= 1:
-                study.optimize(model_objective, n_trials=n_trials)
-            
-            # Get best trial
-            best_trial = study.best_trial
-            self.best_model_params_flat = best_trial.user_attrs["best_model_params_flat"]
-            # quick and dirty fix
-            self.best_model_params_flat["train_offset"] = self.best_model_params_flat["train_offset"]
-
-            self.best_model_path = Path(best_trial.user_attrs["model_path"])
-            
-            # Log best results
-            mlflow.log_param("best_hparams", best_trial.user_attrs["best_model_hparams"] )
-            
-            if best_trial is None:
-                raise Exception("Could not compute hp optimization of model")
-            
-            mlflow.log_metric("best_model_loss", best_trial.value) # type: ignore
-            
-            logger.info(f"\nBest model trial: {best_trial.number}")
-            logger.info(f"Best model loss: {best_trial.value:.6f}")
-            logger.info(f"Best model hparams: {best_trial.user_attrs["best_model_hparams"]}")
+        self.best_model_path = Path(best_trial.user_attrs["model_path"])
+        
+        # Log best results
+        mlflow.log_param("best_hparams", best_trial.user_attrs["best_model_hparams"] )
+        
+        if best_trial is None:
+            raise Exception("Could not compute hp optimization of model")
+        
+        mlflow.log_metric("best_model_loss", best_trial.value) # type: ignore
+        
+        logger.info(f"\nBest model trial: {best_trial.number}")
+        logger.info(f"Best model loss: {best_trial.value:.6f}")
+        logger.info(f"Best model hparams: {best_trial.user_attrs["best_model_hparams"]}")
         
         return {
             "hparams": self.best_model_params_flat,
@@ -382,7 +376,7 @@ class OptunaHparamsTuner:
         with mlflow.start_run(
             run_name="Strategy_Optimization",
             nested=True,
-            parent_run_id=self.parent_run.info.run_id
+            parent_run_id=
         ) as strategy_opt_run:
             
             # Tag runs for easy filtering and comparison
@@ -1100,3 +1094,20 @@ class OptunaHparamsTuner:
             
         except Exception as e:
             logger.error(f"Error generating performance charts: {e}", exc_info=True)
+
+    def _get_mlflow_parent_run_id(self, exp_name: str, parent_name: str):
+        "Return mlflow parent run_id for strategy or model experiments by name"
+        exp = self.mlflow_client.get_experiment_by_name(exp_name)
+        if exp is None:
+            exp_id = self.mlflow_client.create_experiment(exp_name)
+        else:
+            exp_id = exp.experiment_id
+        name = parent_name
+        filter_str = f"tags.is_parent = 'true' AND tags.name = '{name}'"
+        parent_run = self.mlflow_client.search_runs([exp_id], filter_string=filter_str, max_results=1)
+        if parent_run:
+            return parent_run[0].info.run_id
+        else:
+            tags = {"is_parent":"true" , "name":name}
+            run = self.mlflow_client.create_run(experiment_id=exp_id, tags=tags)
+            return run.info.run_id

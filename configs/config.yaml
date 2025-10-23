@@ -144,7 +144,6 @@ STRATEGY:
 
     # Paths
     data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
-    logs_dir: "logs/strategies/"
 
     # Engine settings
     engine:
