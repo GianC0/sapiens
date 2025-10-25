@@ -112,6 +112,7 @@ def freq2pdoffset(freq_str: str):
         "s":  "s",             # seconds
         "min": "min",          # minutes
         "h":   "h",            # hours
+        "H":   "h",            # hours
         # daily & above
         "D":  "D",             # calendar days
         "B":  "B",             # business days

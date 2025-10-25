@@ -13,7 +13,7 @@ from copy import Error
 from pdb import run
 from httpx import delete
 from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.identifiers import Venue
+from nautilus_trader.model.identifiers import Venue, InstrumentId
 from nautilus_trader.config import BacktestDataConfig, CacheConfig, ImportableStrategyConfig, ImportableExecAlgorithmConfig, LoggingConfig, ImportableFeeModelConfig, ImportableFillModelConfig, RiskEngineConfig
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.models import FillModel, FeeModel
@@ -39,7 +39,7 @@ from math import exp
 from pathlib import Path
 from decimal import Decimal
 from pathlib import Path
-from typing import Callable, Dict, Any, Optional, Tuple
+from typing import Callable, Dict, Any, Optional, Tuple, List
 from unittest import loader
 import optuna
 from optuna.storages import RDBStorage
@@ -88,7 +88,7 @@ class OptunaHparamsTuner:
     def __init__(
         self,
         cfg: Dict[str, Any],
-        loader: DatabentoTickLoader,
+        catalog: ParquetDataCatalog,
         run_dir: Path = Path("logs/backtests/"),
         seed: int = 2025,
     ):
@@ -97,7 +97,7 @@ class OptunaHparamsTuner:
         
         Args:
             cfg: Configuration dictionary
-            loader: DatabentoTickLoader with data already loaded
+            catalog: NautilusParquetDataCatalog with data already loaded
             run_dir: Root directory for logs
             seed: Seed for reproducibility of hp tuning runs
         """
@@ -129,8 +129,8 @@ class OptunaHparamsTuner:
         self.strategy_defaults, self.strategy_search = self._split_hparam_cfg(self.strategy_hparams)
         self.seed = seed
 
-        # --- Data Loader and Data Augmentation setup -------------------------------------------
-        self.loader = loader
+        # --- ParquetDataCatalog and Data Augmentation setup -------------------------------------------
+        self.catalog = catalog
     
     
         # Setup MLflow
@@ -185,16 +185,13 @@ class OptunaHparamsTuner:
         
         return params
     
-    def optimize_model(self) -> Dict[str, Any]:
+    def optimize_model(self, instrument_ids: List[InstrumentId]) -> Dict[str, Any]:
         """
         Phase 1: Optimize model hyperparameters.
         
         Returns:
             Dictionary with best hyperparameters and model directory
         """
-        logger.info(f"\n{'='*60}")
-        logger.info("PHASE 1: MODEL HYPERPARAMETER OPTIMIZATION")
-        logger.info(f"{'='*60}\n")
 
         # Setup run path
         model_name = self.model_params["model_name"]
@@ -204,6 +201,7 @@ class OptunaHparamsTuner:
         parent_run_id = self._get_model_parent_run_id()
 
         # Setup Optuna study for model
+        study_path.mkdir(parents=True, exist_ok=True)
         storage = RDBStorage(f"sqlite:///{study_path / "model_hpo.db"}")
         study = optuna.create_study(
             study_name=model_name,
@@ -214,7 +212,10 @@ class OptunaHparamsTuner:
         )
 
         # save old best trial to update the "is_best_model" tag at the end
-        old_best_trial = study.best_trial
+        try:
+            old_best_trial = study.best_trial
+        except ValueError:
+            old_best_trial = None
 
         # Initialize Model Class
         mod = importlib.import_module(f"models.{model_name}.{model_name}")
@@ -241,9 +242,10 @@ class OptunaHparamsTuner:
             # Retrieve CSV Bar data from loader for training
             start = model_params_flat["train_start"]
             end = model_params_flat["valid_end"]
-            data_dict = self.loader.get_ohlcv_data(frequency = self.model_params["freq"], start=start, end=end)
+            data_dict = self.get_ohlcv_data_from_catalog(frequency = self.model_params["freq"], start=start, end=end, instrument_ids=instrument_ids)
 
             # Start MLflow run for this trial
+            mlflow.set_tracking_uri("file:logs/mlflow")
             with mlflow.start_run(
                 run_name=f"trial_{trial.number}",
                 nested=True,
@@ -303,12 +305,14 @@ class OptunaHparamsTuner:
             study.optimize(model_objective, n_trials=n_trials)
         
         # Remove best model tag from old best trial
-        self.mlflow_client.delete_tag(run_id = old_best_trial.user_attrs["mlflow_run_id"], key = "is_best_model")
+        if old_best_trial:
+            self.mlflow_client.delete_tag(run_id = old_best_trial.user_attrs["mlflow_run_id"], key = "is_best_model")
 
         # Add the best model tag to the new best trial
-        best_trial = study.best_trial
-        if best_trial is None:
-            raise Exception("Could not compute hp optimization of model")
+        try:
+            best_trial = study.best_trial
+        except ValueError:
+            raise Exception(f"Model {model_name} has never been been through hyper-parameters tuning")
         self.mlflow_client.set_tag(best_trial.user_attrs["mlflow_run_id"], "is_best_model", "true")
 
         # quick and dirty fix
@@ -330,9 +334,6 @@ class OptunaHparamsTuner:
         Returns:
             Dictionary with best strategy hyperparameters and performance metrics
         """
-        logger.info(f"\n{'='*60}")
-        logger.info("PHASE 2: STRATEGY HYPERPARAMETER OPTIMIZATION")
-        logger.info(f"{'='*60}\n")
         
         # If model_name = None then best model overall ( any family )
         best_model_params_flat = self.get_best_model_params_flat(model_name)
@@ -350,6 +351,7 @@ class OptunaHparamsTuner:
         parent_run_id = self._get_strategy_parent_run_id(model_name = best_model_name)
         
         # Setup Optuna study for strategy
+        study_path.mkdir(parents=True, exist_ok=True)
         storage = RDBStorage(f"sqlite:///{study_path / "strategy_hpo.db" }")
 
         # Parse Objectives and directions. Structure: obj:direction
@@ -375,6 +377,7 @@ class OptunaHparamsTuner:
             strategy_params_flat = self._add_dates(self.strategy_params.copy(), offset, to_strategy=True ) | trial_hparams
             
             # Start MLflow run for this trial
+            mlflow.set_tracking_uri("file:logs/mlflow")
             with mlflow.start_run(
                 run_name=f"trial_{trial.number}",
                 nested=True,
@@ -552,6 +555,8 @@ class OptunaHparamsTuner:
         for key, ts in final_time_series.items():
             self.mlflow_client.log_metric(run_id = run_id, key = key, value = ts)
         return final_metrics, final_time_series
+
+
 
     def _backtest(
         self,
@@ -837,6 +842,7 @@ class OptunaHparamsTuner:
     def _produce_backtest_config(self, backtest_cfg, start, end) -> BacktestRunConfig:
 
         fee_model = backtest_cfg["STRATEGY"]["fee_model"]["name"]
+        
         # Initialize Venue configs
         venue_configs = [
             BacktestVenueConfig(
@@ -870,6 +876,8 @@ class OptunaHparamsTuner:
             ),
         ]
         bar_spec = freq2barspec(backtest_cfg["STRATEGY"]["freq"])
+        if "catalog_path" not in backtest_cfg["STRATEGY"]:
+            raise ValueError("catalog_path must be set in strategy config")
         data_configs=[
             BacktestDataConfig(
                 catalog_path=backtest_cfg["STRATEGY"]["catalog_path"],
@@ -1113,7 +1121,7 @@ class OptunaHparamsTuner:
             logger.error(f"Error generating performance charts: {e}", exc_info=True)
 
 
-    def _get_model_parent_run_id(self,) -> str:
+    def _get_model_parent_run_id(self) -> str:
         """Get or create parent run for model family in 'Models' experiment."""
         exp = self.mlflow_client.get_experiment_by_name("Models")
         if exp is None:
@@ -1200,8 +1208,96 @@ class OptunaHparamsTuner:
                 self.mlflow_client.log_param( run_id= run_id, key = k, value = p )
 
             return run.info.run_id
-        
 
+    # Add new method to OptunaHparamsTuner class
+    def get_ohlcv_data_from_catalog(
+        self,
+        frequency: str,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
+        instrument_ids: Optional[List[InstrumentId]] = None,
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Aggregate trade ticks from catalog into OHLCV bars.
+        
+        Args:
+            frequency: Pandas frequency string (e.g., '1D', '1H', '5T')
+            start: Start timestamp (inclusive)
+            end: End timestamp (inclusive)
+            instrument_ids: List of instrument IDs objects. 
+                        If None, uses all instruments in catalog.
+        
+        Returns:
+            Dictionary mapping symbol strings to OHLCV DataFrames with columns:
+            ['open', 'high', 'low', 'close', 'volume']
+        """
+        # Get all instruments if not specified
+        if instrument_ids is None:
+            instruments = self.catalog.instruments(instrument_type=TradeTick)
+            instrument_ids = [inst.id.value for inst in instruments]
+        
+        data_dict = {}
+        
+        for iid in instrument_ids:
+            try:
+                # Query trade ticks from catalog
+                ticks = self.catalog.trade_ticks(
+                    instrument_ids=[iid],
+                    start=start,
+                    end=end
+                )
+                
+                if not ticks or len(ticks) == 0:
+                    logger.warning(f"No ticks found for {iid}")
+                    continue
+                
+                # Vectorized conversion: pre-allocate arrays
+                n_ticks = len(ticks)
+                timestamps = np.empty(n_ticks, dtype='int64')
+                prices = np.empty(n_ticks, dtype=np.float64)
+                sizes = np.empty(n_ticks, dtype=np.float64)
+                
+                # Batch extract attributes
+                for i, tick in enumerate(ticks):
+                    timestamps[i] = tick.ts_event
+                    prices[i] = float(tick.price)
+                    sizes[i] = float(tick.size)
+                
+                # Create DataFrame with timezone-aware index
+                df = pd.DataFrame(
+                    {'price': prices, 'size': sizes},
+                    index=pd.to_datetime(timestamps, unit='ns', utc=True)
+                )
+                
+                # Resample to OHLCV (single operation)
+                ohlcv_df = df.resample(frequency).agg({
+                    'price': ['first', 'max', 'min', 'last'],
+                    'size': 'sum'
+                })
+                
+                # Flatten multi-level columns
+                ohlcv_df.columns = ['_'.join(col) for col in ohlcv_df.columns]
+                ohlcv_df.rename(columns={
+                    'price_first': 'open',
+                    'price_max': 'high',
+                    'price_min': 'low',
+                    'price_last': 'close',
+                    'size_sum': 'volume'
+                }, inplace=True)
+                
+                # Drop periods with no trades
+                ohlcv_df.dropna(subset=['close'], inplace=True)
+                
+                # Extract symbol (format: "SYMBOL.VENUE")
+                #symbol = iid.split('.')[0]
+                data_dict[iid.value] = ohlcv_df
+                
+            except Exception as e:
+                logger.error(f"Error aggregating OHLCV for {iid}: {e}")
+                continue
+        
+        return data_dict
+    
     def get_best_model_params_flat(self, model_name: Optional[str]) -> Dict:
         """Returns flat params dictionary of model_name familiy (if specified) or best model overall (any family)"""
         

@@ -27,8 +27,8 @@ MODEL:
     save_backups: false          # whether to save backups during walk-forward
 
     # Hyperparameter tuning settings
-    tune_hparams:    false        # Use Optuna Bayesian search.            
-    n_trials:        1          # Optuna trials for each run. Used only if tune_hparams is true
+    tune_hparams:    true        # Use Optuna Bayesian search.            
+    n_trials:        2          # Optuna trials for each run. Used only if tune_hparams is true
 
   # Default hyper-parameters defined by model are overwritten by this Optuna configuration
   HPARAMS:  # optuna_type: "categorical", low-high (assumed float), int_low-high, log_low-high
@@ -39,7 +39,7 @@ MODEL:
       optuna:
         optuna_type: "categorical"
         #choices: ["3BME", "6BME", "12BME"]
-        choices: ["5BME"] #, "2BME", "3BME"]
+        choices: ["5B"] #, "2BME", "3BME"]
 
     # L : look-back window length
     window_len:  
@@ -126,10 +126,10 @@ STRATEGY:
 
     # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
-    freq: 1D                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
+    freq: 1h                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
     #train_offset:               # Optimized during model hp tuning
-    backtest_start: "2024-01-01" # Start of walk-forward evaluation.
-    backtest_end:   "2025-01-01" # End of walk-forward evaluation.
+    backtest_start: "2024-06-01" # Start of walk-forward evaluation.
+    backtest_end:   "2024-07-01" # End of walk-forward evaluation.
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     cash_buffer: 50              # cash buffer to always keep in portfolio to cover rounding errors
@@ -138,7 +138,7 @@ STRATEGY:
     rebalance_only: false        # false = all universe instruments are considered for top_k. true = portoflio instruments stay the same, with dynamic reallocation 
     account_type: CASH           # "CASH" = spot trading. "MARGIN" can trade derivatives and options as welll. TODO: "MARGIN" not implememted
     oms_type: NETTING            # Order Management System type. NETTING = only long positions. HEDGING = long and short
-    venue_name: SIM              # name of the venue to use for trading
+    venue_name: SIM             # name of the venue to use for trading
     risk_free_ticker: "SGOV"     # Risk-free ETF to include in portfolio
     benchmark_ticker: "SPY"      # Benchmark for M2 optimization
 
