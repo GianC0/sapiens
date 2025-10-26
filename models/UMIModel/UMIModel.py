@@ -100,7 +100,7 @@ class UMIModel(nn.Module):
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
         # stock universe
-        self._universe: list[str] = []                                                               # list of ordered instruments the model is trained on
+        #self._universe: list[str] = []                                                               # list of ordered instruments the model is trained on
         #self.universe_mult = max(1, int(dynamic_universe_mult))                                     # over-allocation factor for dynamic universe
         
         self.target_idx = target_idx                                                                 # usually "close" is at index 3 in the dataframes
@@ -139,9 +139,6 @@ class UMIModel(nn.Module):
         # Register active mask
         self.I = len(data)
         active_mask = torch.ones(self.I, dtype=torch.bool)  # all stocks are active at initialization
-        
-        # Register new universe
-        self._universe = list(data.keys())
 
         # Build submodules (learners)
         self._build_submodules()
@@ -175,9 +172,6 @@ class UMIModel(nn.Module):
         """
         
         assert torch.numel(active_mask) == self.I, f"Active mask size must match the number of trained instruments ({self.I})"
-
-        # Assert universe
-        assert self._universe == list(data.keys()), "Universe error!"
 
         epochs = warm_training_epochs if warm_training_epochs is not None else self.n_epochs
 
@@ -261,12 +255,6 @@ class UMIModel(nn.Module):
             if indexes < self.L:
                 logger.error(f"Insufficient data: need {self.L}, got {indexes}")
                 return {}
-        
-        # Assert universe matches
-        if self._universe != list(data.keys()):
-            logger.error("Universe mismatch in predict()")
-            return {}
-
 
         # Build panel from current data
         #lookback_periods = self.L   # Need L bars for prediction

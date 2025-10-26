@@ -149,7 +149,7 @@ STRATEGY:
     engine:
       cache:
         bar_capacity: 4096       # ≥ L + pred_len + some safety margin
-        tick_capacity: 10000     # used for TradeTicks Data
+        tick_capacity: 50000     # used for TradeTicks Data
 
 
     # Hyperparameter tuning Settings and Objectives

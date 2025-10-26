@@ -91,8 +91,8 @@ class OptunaHparamsTuner:
         self,
         cfg: Dict[str, Any],
         catalog: ParquetDataCatalog,
+        instrument_ids : List[InstrumentId],
         run_dir: Path = Path("logs/backtests/"),
-        instrument_ids = List[InstrumentId],
         seed: int = 2025,
     ):
         """
@@ -931,7 +931,7 @@ class OptunaHparamsTuner:
                     ),
 
                     cache=CacheConfig(
-                        tick_capacity=backtest_cfg["STRATEGY"].get("engine", {}).get("cache", {}).get("tick_capacity", 10000),
+                        tick_capacity=backtest_cfg["STRATEGY"].get("engine", {}).get("cache", {}).get("tick_capacity", 50000),
                         bar_capacity=backtest_cfg["STRATEGY"].get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
                         ),
                     logging=LoggingConfig(log_level="INFO"),

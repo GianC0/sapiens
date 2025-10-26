@@ -29,6 +29,7 @@ from sympy import total_degree
 import yaml
 import pandas_market_calendars as market_calendars
 import torch
+from decimal import Decimal
 from dataclasses import dataclass, field
 import logging
 from nautilus_trader.model.identifiers import Venue
@@ -42,7 +43,7 @@ from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, Instrumen
 from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.orders import MarketOrder
-from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderSide, TriggerType, TrailingOffsetType
 from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
@@ -67,6 +68,7 @@ from algos.engine.data_loader import DatabentoTickLoader
 from algos.engine.OptimizerFactory import create_optimizer
 from models.utils import freq2pdoffset, freq2barspec
 from algos.order_management import OrderManager
+from algos.engine.hparam_tuner import 
 
 
 # ========================================================================== #
@@ -170,6 +172,7 @@ class TopKStrategy(Strategy):
         self.drawdown_max = self.strategy_params["risk"]["drawdown_max"]
         self.trailing_stop_max = self.strategy_params["risk"]["trailing_stop_max"]
         self.target_volatility = self.strategy_params["risk"]["target_volatility"]
+        self.max_balance_total = None
         
         # Extract execution parameters from config
         self.selector_k = self.strategy_params["top_k"]
@@ -194,9 +197,6 @@ class TopKStrategy(Strategy):
         self.top_k = self.strategy_params.get("top_k", 50)  # Portfolio size
         
 
-        # Risk free rate dataframe to use for Sharpe Ratio
-        self.risk_free_df = self.loader.risk_free_df
-
         # Order Manager for any strategy
         self.order_manager = OrderManager(self, self.strategy_params)
         logger.info("OrderManager initialized")
@@ -214,6 +214,8 @@ class TopKStrategy(Strategy):
 
         # Select universe based on stocks active at walk-forward start with enough history
         self._select_universe()
+
+        self.max_balance_total = self._calculate_portfolio_nav()
 
         # Subscribe to bars for selected universe
         for instrument in self.cache.instruments():
@@ -241,17 +243,9 @@ class TopKStrategy(Strategy):
 
         # Build and initialize model
         self.model = self._initialize_model()
-        self.model._universe = self.universe
 
         # Set initial update time to avoid immediate firing
         self.active_mask = torch.ones(len(self.cache.instruments()), dtype=torch.bool)
-        
-        # initialize the chache with the latest historical window_length data
-        #self._initialize_cache_with_historical_data()
-
-        # Get current time and check if we have enough historical data
-        #now = pd.Timestamp(self.clock.utc_now())
-        
         
         self._last_update_time = pd.Timestamp(self.clock.utc_now())
         self._last_retrain_time = pd.Timestamp(self.clock.utc_now())
@@ -281,9 +275,6 @@ class TopKStrategy(Strategy):
                 callback=self.on_final_liquidation
             )
             logger.info(f"Final liquidation scheduled for {liquidation_time}")
-
-
-
 
     # Not used ATM
     def on_resume(self) -> None:
@@ -319,6 +310,11 @@ class TopKStrategy(Strategy):
         if event.name != "update_timer":
             return
         if self.final_liquidation_happend:
+            return
+
+        # Overall portfolio drawdown condition
+        if self._calculate_portfolio_nav() < self.max_balance_total * self.drawdown_max:
+            self.on_final_liquidation(event)
             return
 
         event_time = pd.to_datetime(event.ts_event, unit="ns", utc=True)
@@ -359,9 +355,9 @@ class TopKStrategy(Strategy):
             return
         
         # TODO: superflous. consider removing compute active mask
-        assert torch.equal(self.active_mask, self._compute_active_mask(data_dict) ) , "Active mask mismatch between strategy and data engine"
+        assert torch.equal(self.active_mask, self._compute_active_mask()) , "Active mask mismatch between strategy and data engine"
 
-        assert self.universe == self.model._universe, "Universe mismatch between strategy and model"
+        #assert self.universe == self.model._universe, "Universe mismatch between strategy and model"
 
         # ensure the model has enough data for prediction
         #start_date = now - freq2pdoffset(self.strategy_params["freq"]) * ( self.min_bars_required) 
@@ -430,7 +426,7 @@ class TopKStrategy(Strategy):
         total_bars = len(next(iter(data_dict.values())))
         
         # Update active mask
-        self.active_mask = self._compute_active_mask(data_dict)
+        self.active_mask = self._compute_active_mask()
         
         # Retrain model with warm start
         self.model.update(
@@ -452,39 +448,10 @@ class TopKStrategy(Strategy):
     # DATA handlers
     # ================================================================= #
     def on_bar(self, bar: Bar):  
-        # assuming on_timer happens before then on_bars are called first,
-        #ts = bar.ts_event
-        instrument = self.cache.instrument(bar.bar_type.instrument_id)
-        # ------------ trailing-stop  ----------------------
-        self._check_trailing_stop(instrument, bar.close)  
-
-        # ------------ drawdown-stop ------------------------
-        #dwd_s = self._check_drowdown_stop()
-        #if dwd_s:
-        #    self.on_dispose()
-        #    return
         
+        logging.info(f"Received Bar: {bar}")
+
         return
-
-    def on_trade_tick(self, tick: TradeTick):
-        """
-        Handle trade ticks for:
-        1. Bar aggregation (via BarAggregator)
-        2. Real-time risk monitoring
-        """
-        instrument_id = tick.instrument_id
-        
-        # Feed tick to bar aggregator (automatically creates bars)
-        if instrument_id in self._bar_aggregators:
-            self._bar_aggregators[instrument_id].handle_trade_tick(tick)
-        
-        # Real-time risk monitoring using latest tick price
-        instrument = self.cache.instrument(instrument_id)
-        current_price = float(tick.price)
-        
-        # Check trailing stops in real-time
-        self._check_trailing_stop(instrument, current_price)
-        
     def on_instrument(self, instrument: Instrument) -> None:
         """Handle new instrument events."""
         #TODO: should account for insertion and delisting at the same time. insertion needs portfolio selection
@@ -511,10 +478,6 @@ class TopKStrategy(Strategy):
         self.cache.add_bars(bars)
         logger.info(f"Added {len(bars)}  bars for {bar_type.instrument_id.value}")
         
-    def on_mark_price(self, update: MarkPriceUpdate) -> None:
-        logger.info("NEW MARKET PRICE UPDATE")
-        
-
 
     # Unused ATM
     def on_data(self, data: Data) -> None:  # Custom data passed to this handler
@@ -607,18 +570,18 @@ class TopKStrategy(Strategy):
             self.order_manager.handle_order_event(event)
     
     def on_order_filled(self, event: OrderFilled) -> None:
-        """Delegate to OrderManager and update trailing stops."""
+        """Auto-submit risk orders on fills."""
         if self.order_manager:
             self.order_manager.on_order_filled(event)
         
-        # Update trailing stops for position management
+        # Submit risk orders for new positions
         instrument_id = event.instrument_id
+        positions = self.cache.positions(instrument_id=instrument_id)
         
-        position = self.cache.positions(instrument_id=instrument_id)
-        if position and position[0].quantity != 0:
-            symbol = instrument_id.symbol.value
-            if symbol not in self.trailing_stops:
-                self.trailing_stops[symbol] = float(event.last_px)
+        if positions:
+            for position in positions:
+                if position.quantity != 0:
+                    self._submit_risk_orders_for_position(position, float(event.last_px))
    
 #    def on_order_event(self, event: OrderEvent) -> None:
 #        """Catch-all for any unhandled order events."""
@@ -642,35 +605,27 @@ class TopKStrategy(Strategy):
     # ================================================================= #
 
     def _select_universe(self):
-        """Select stocks active at walk-forward start with sufficient history."""
-        candidate_universe = self.loader.universe
+        """Select instruments with sufficient data from cache."""
         selected = []
         
-        for ticker in candidate_universe:
-            if ticker not in self.loader._frames:
-                continue
-                
-            df = self.loader._frames[ticker]
+        for instrument in self.cache.instruments(venue=self.venue):
+            symbol = instrument.id.symbol.value
+            bar_type = BarType(instrument_id=instrument.id, bar_spec=self.bar_spec)
             
-            # Check 1: Has enough historical data before walk-forward start
-            train_data = df[df.index <= self.valid_end]
-            if len(train_data) < self.min_bars_required:
-                logger.info(f"Skipping {ticker}: insufficient training data ({len(train_data)} < {self.min_bars_required})")
+            bars = self.cache.bars(bar_type)
+            if not bars or len(bars) < self.min_bars_required:
                 continue
             
-            # Check 2: Active at walk-forward start
-            # Check if we have data extending pred_len periods beyond valid_end
-            pred_window = df[(df.index > self.valid_end)]
+            # Check data extends into valid period
+            if bars:
+                last_bar_time = pd.Timestamp(bars[0].ts_event, unit='ns', utc=True)
+                if last_bar_time < self.valid_start:
+                    continue
             
-            if pred_window.empty:
-                logger.info(f"Skipping {ticker}: not active at walk-forward start")
-                continue
+            selected.append(symbol)
 
-            selected.append(ticker)
-            
-        logger.info(f"Selected {len(selected)} from {len(candidate_universe)} candidates (including risk-free) ")
+        logger.info(f"Selected {len(selected)} from {len(self.cache.instruments(venue=self.venue))} candidates (including benchmark and risk-free) ")
         self.universe = sorted(selected)
-
     def _initialize_model(self) -> MarketModel:
         """Build and initialize the model."""
         # Import model class dynamically
@@ -704,6 +659,32 @@ class TopKStrategy(Strategy):
 
         return model
 
+    def _submit_risk_orders_for_position(self, position: Position, entry_price: float):
+        """Submit stop-loss and trailing stop orders."""
+        instrument_id = position.instrument_id
+        position_id = str(position.id)
+    
+        
+        # Calculate stop prices
+        if position.is_long:
+            order_side = OrderSide.SELL
+        else:
+            order_side = OrderSide.BUY
+        
+        # Submit trailing stop order
+        trailing_order = self.order_factory.trailing_stop_market(
+            instrument_id=instrument_id,
+            order_side=order_side,
+            quantity=Quantity.from_int(abs(int(position.quantity))),
+            trigger_type=TriggerType.DEFAULT,
+            trailing_offset=Decimal(self.trailing_stop_max * 10000),
+            trailing_offset_type=TrailingOffsetType.BASIS_POINTS,
+        )
+        
+        if trailing_order:
+            self.submit_order(trailing_order)
+            self._position_trailing_orders[position_id] = str(trailing_order.client_order_id)
+
         
     def _cache_to_dict(self, window: int) -> Dict[str, pd.DataFrame]:
         """
@@ -712,102 +693,97 @@ class TopKStrategy(Strategy):
         """
         data_dict = {}
         
-        for iid in self.cache.instrument_ids():
-            # ensure symbol is in universe
-            if iid.symbol.value not in self.universe:
-                continue
-            bar_type = BarType(instrument_id=iid, bar_spec= self.bar_spec)
-
-            count = self.cache.bar_count(bar_type)
-            if count < self.min_bars_required:
-                logger.warning(f"Insufficient bars for {iid.symbol}: {count} < {self.min_bars_required}")
+        if window == 0:
+            window = self.strategy_params.get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
+        
+        for symbol in self.universe:
+            instrument_id = InstrumentId(Symbol(symbol), self.venue)
+            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
+            
+            bars = self.cache.bars(bar_type)
+            if not bars or len(bars) < self.min_bars_required:
                 continue
             
-            # Get bars from cache
-            if window == 0: # load all cache
-                window = self.strategy_params["engine"]["cache"]["bar_capacity"]
-            bars = self.cache.bars(bar_type)[:window]  # Get last 'window' bars (nautilus cache notation is opposite to pandas)
-
-            # ensure there is at least one new bar after the last predition
-            bar_time = pd.to_datetime(bars[0].ts_event, unit="ns", utc=True)
-            if bar_time <= self._last_update_time:
-                logger.warning(f"Bar time {bar_time} not after last update {self._last_update_time}")
-
-            # Collect all bar data into lists
-            bar_data = {
-                "Date": [],
-                "Open": [],
-                "High": [],
-                "Low": [],
-                "Close": [],
-                "Volume": [],
-            }
-            # Convert bars to DataFrame
-            for b in reversed(bars):
-                
-                bar_data["Date"].append(pd.to_datetime(b.ts_event, unit="ns", utc=True)),
-                bar_data["Open"].append(float(b.open))
-                bar_data["High"].append(float(b.high))
-                bar_data["Low"].append(float(b.low))
-                bar_data["Close"].append(float(b.close))
-                bar_data["Volume"].append(float(b.volume))
-
-            # Create DataFrame from collected data
-            df = pd.DataFrame(bar_data)
-            df.set_index("Date", inplace=True)
-            df.sort_index(inplace=True)  # Ensure chronological order
+            bars_to_use = bars[:window]
             
-            data_dict[iid.symbol.value] = df
-
-        return data_dict 
+            # Build DataFrame directly - single pass
+            df = pd.DataFrame({
+                'Open': [float(b.open) for b in reversed(bars_to_use)],
+                'High': [float(b.high) for b in reversed(bars_to_use)],
+                'Low': [float(b.low) for b in reversed(bars_to_use)],
+                'Close': [float(b.close) for b in reversed(bars_to_use)],
+                'Volume': [float(b.volume) for b in reversed(bars_to_use)]
+            }, index=[pd.Timestamp(b.ts_event, unit='ns', utc=True) for b in reversed(bars_to_use)])
+            
+            data_dict[symbol] = df
+        
+        return data_dict
     
+    def _get_risk_free_return(self) -> float:
+        """Get current risk-free return from cache."""
+        rf_ticker = self.strategy_params.get("risk_free_ticker")
+        if not rf_ticker:
+            return 0.0
+        
+        try:
+            rf_instrument_id = InstrumentId(Symbol(rf_ticker), self.venue)
+            bar_type = BarType(rf_instrument_id, self.bar_spec)
+            rf_bars = self.cache.bars(bar_type)
+            
+            if rf_bars and len(rf_bars) >= 2:
+                latest_close = float(rf_bars[0].close)
+                previous_close = float(rf_bars[1].close)
+                return (latest_close - previous_close) / previous_close
+        except Exception as e:
+            logger.warning(f"Could not get risk-free return: {e}")
+        
+        return 0.0
+
+
     # TODO: superflous. consider removing
-    def _compute_active_mask(self, data_dict: Dict[str, pd.DataFrame]) -> torch.Tensor:
+    def _compute_active_mask(self) -> torch.Tensor:
         """Compute mask for active instruments."""
         mask = ~torch.ones(len(self.universe), dtype=torch.bool)
         
-        for i, symbol in enumerate(self.universe):
-            #df = data_dict[symbol]
+        for bt in self.cache.bar_types():
+            idx = self.universe.index(bt.instrument_id.value())
             # Check if data is recent enough
-            last_time = self.loader._frames[symbol].index[-1]
-            now = pd.Timestamp(self.clock.utc_now(),)
-            mask[i] = last_time >= now
+            last_time = self.cache.bar(bt).ts_event
+            now = self.clock.utc_now()
+            mask[idx] = last_time >= now
     
         return mask
-    
-    def _initialize_cache_with_historical_data(self):
-        """Load historical data into strategy's internal buffer for immediate use."""
-        now = pd.Timestamp(self.clock.utc_now())
-        lookback_periods = self.model_params["window_len"] + 1
-        
-        # Store historical data in a buffer
-        self._historical_buffer = {}
-        
-        for symbol in self.universe:
-            if symbol in self.loader._frames:
-                df = self.loader._frames[symbol]
-                # Get data up to current time
-                historical_data = df[df.index < now]
-                if len(historical_data) >= lookback_periods:
-                    # Keep last lookback_periods of historical data
-                    self._historical_buffer[symbol] = historical_data.iloc[-lookback_periods:]
 
     # ----- weight optimiser ------------------------------------------
     
-    def _get_benchmark_volatility(self, timestamp: pd.Timestamp) -> Optional[float]:
-        """Calculate benchmark volatility using same lookback as optimizer."""
-        if self.loader._benchmark_data is None:
+    def _get_benchmark_volatility(self) -> Optional[float]:
+        """Calculated from cached bars."""
+        benchmark_ticker = self.strategy_params.get("benchmark_ticker")
+        if not benchmark_ticker:
             return None
         
-        df = self.loader._benchmark_data
-        lookback_start = timestamp - self.optimizer_lookback
-        
-        # Use iloc with index searching for robust timestamp matching
-        start_idx = df.index.searchsorted(lookback_start, side='left')
-        end_idx = df.index.searchsorted(timestamp, side='right')
-        
-        volatility = df.iloc[start_idx:end_idx]["Benchmark"].std()
-        return volatility
+        try:
+            benchmark_instrument_id = InstrumentId(Symbol(benchmark_ticker), self.venue)
+            bar_type = BarType(benchmark_instrument_id, self.bar_spec)
+            benchmark_bars = self.cache.bars(bar_type)
+            
+            if not benchmark_bars or len(benchmark_bars) < 2:
+                return None
+            
+            lookback_periods = int(self.optimizer_lookback.n)
+            bars_to_use = benchmark_bars[:min(lookback_periods, len(benchmark_bars))]
+            
+            closes = [float(b.close) for b in reversed(bars_to_use)]
+            returns = pd.Series(closes).pct_change().dropna()
+            
+            if len(returns) < 2:
+                return None
+            
+            return float(returns.std())
+            
+        except Exception as e:
+            logger.warning(f"Could not calculate benchmark volatility: {e}")
+            return None
 
     def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
         """Compute target portfolio weights using M2 optimizer and optional sign enforcement.
@@ -818,12 +794,7 @@ class TopKStrategy(Strategy):
         now = pd.Timestamp(self.clock.utc_now())
 
         # Compute risk free rate return
-        risk_free_ticker = self.strategy_params["risk_free_ticker"]
-        rf_id = InstrumentId(symbol=risk_free_ticker, venue = self.venue)
-        latest_rf = float(self.cache.trade_ticks(rf_id))
-        second_last_rf = float(self.cache.trade_ticks(rf_id, index = 1))
-        current_rf = (latest_rf - second_last_rf) / second_last_rf
-
+        current_rf = self._get_risk_free_return()
 
         # build candidate list excluding risk free ticker
         
@@ -916,7 +887,7 @@ class TopKStrategy(Strategy):
             er=pd.Series(valid_expected_returns, index=valid_symbols),
             cov=pd.DataFrame(cov_horizon, index=valid_symbols, columns=valid_symbols),
             rf=current_rf,
-            benchmark_vol=self._get_benchmark_volatility(now),
+            benchmark_vol=self._get_benchmark_volatility(),
             allowed_weight_ranges=np.array(allowed_weight_ranges),
             current_weights = np.array(current_weights),
             selector_k = self.selector_k,
@@ -939,55 +910,6 @@ class TopKStrategy(Strategy):
 
         return w_series.to_dict()
 
-
-    # ----- trailing and drawdown stops for risk --------------------------------------------
-    def _check_trailing_stop(self, instrument: Instrument, price: float):
-        sym = instrument.symbol.value
-        if len(self.portfolio.analyzer._positions) == 0:
-            return
-        position = self.portfolio.analyzer.net_position(instrument)
-        pos = position.quantity if position else 0
-        
-        if pos == 0:
-            self.trailing_stops.pop(sym, None)
-            return
-
-        if pos > 0:                       # long
-            high = self.trailing_stops.get(sym, price)
-            if price > high:
-                self.trailing_stops[sym] = price
-            elif price <= high * (1 - self.trailing_stop_max):
-                self.order_manager.close_all_positions(instrument, reason="trailing_stop")
-                self.trailing_stops.pop(sym, None)
-        else:                             # short
-            low = self.trailing_stops.get(sym, price)
-            if price < low:
-                self.trailing_stops[sym] = price
-            elif price >= low * (1 + self.trailing_stop_max):
-                self.order_manager.close_all_positions(instrument, reason="trailing_stop")
-                self.trailing_stops.pop(sym, None)
-
-    def _check_drowdown_stop(self) -> bool:
-        
-        nav = self._calculate_portfolio_nav()
-        
-        # Initialize max NAV on first real calculation
-        if self.max_registered_portfolio_nav <= 0:
-            self.max_registered_portfolio_nav = nav
-            logger.info(f"Initialized max NAV to {nav:.2f}")
-            return False  # Don't trigger drawdown on initialization
-        
-        self.max_registered_portfolio_nav = max(self.max_registered_portfolio_nav, nav)
-        #self.equity_analyzer.on_equity(ts, nav)
-        
-        threshold = self.max_registered_portfolio_nav * (1 - self.drawdown_max)
-        if nav < threshold:
-            logger.warning(f"Drawdown stop triggered: NAV={nav:.2f} < Threshold={threshold:.2f} (Max={self.max_registered_portfolio_nav:.2f})")
-            self.order_manager.liquidate_all(self.universe) 
-            return True
-
-        return False
-    
     def _calculate_portfolio_nav(self) -> float:
         """Calculate total portfolio value: cash + market value of all positions."""
         # Get cash balance
