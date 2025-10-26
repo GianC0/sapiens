@@ -43,6 +43,7 @@ class DatabentoTickLoader:
         self.stock_trades_dir = self._root / "stocks" / "trades"
         self.etf_trades_dir = self._root / "etf" / "trades"
         self.benchmark_trades_dir = self._root / "benchmarks" / "trades"
+        self.definitions_dir = self._root / "definitions"
         
         if not self.stock_trades_dir.exists():
             raise FileNotFoundError(f"Trades directory not found: {self.stock_trades_dir}")
@@ -51,6 +52,7 @@ class DatabentoTickLoader:
         self._dbn_files = list(self.stock_trades_dir.glob("*.trades.*.dbn.zst"))
         self._dbn_files += list(self.etf_trades_dir.glob("*.trades.*.dbn.zst"))
         self._dbn_files += list(self.benchmark_trades_dir.glob("*.trades.*.dbn.zst"))
+        self._dbn_files += list(self.definitions_dir.glob("*.definition.*.dbn.zst"))
         
         # Extract symbols from filenames
         self._universe = universe if universe else self._extract_symbols()
@@ -67,9 +69,10 @@ class DatabentoTickLoader:
         """Extract symbols from DBN filenames."""
         symbols = []
         for f in self._dbn_files:
-            # Parse: xnas-itch-20240101-20251017.trades.AAPL.dbn.zst
+            # Parse trades: xnas-itch-20240101-20251017.trades.AAPL.dbn.zst
+            # Parse definitions: xnas-itch-20240101-20251016.definition.AAPL.dbn
             parts = f.stem.split('.')
-            if len(parts) >= 3 and parts[1] == 'trades':
+            if len(parts) >= 3 and parts[1] == 'trades' or parts[1] == 'definition':
                 symbol = parts[2]
                 symbols.append(symbol)
         return sorted(set(symbols))
@@ -132,12 +135,26 @@ class DatabentoTickLoader:
             catalog_path = self._root / "nautilus_catalog"
         catalog = ParquetDataCatalog(path=str(catalog_path))
         
-        # Write instruments
-        #catalog.write_data(list(self._instruments.values()))
+        # Firstly log instrument definitions
+        for symbol in self._universe:
+            dbn_file = self._find_dbn_definition_file(symbol)
+            if not dbn_file:
+                logger.warning(f"No DBN definition file found for {symbol}")
+                continue
+            
+            logger.info(f"Loading definition file {symbol} from {dbn_file.name}")
+            definitions = self._databento_loader.from_dbn_file(
+                path=dbn_file,
+                as_legacy_cython=True,  # Rust implementation is broken, use cython
+            )
+
+            catalog.write_data(definitions)
+            logger.info(f"Loaded definition file for {symbol}")
+
         
         # Load each DBN file
         for symbol in self._universe:
-            dbn_file = self._find_dbn_file(symbol)
+            dbn_file = self._find_dbn_trades_file(symbol)
             if not dbn_file:
                 logger.warning(f"No DBN file found for {symbol}")
                 continue
@@ -170,13 +187,20 @@ class DatabentoTickLoader:
         
         return catalog
     
-    def _find_dbn_file(self, symbol: str) -> Optional[Path]:
+    def _find_dbn_trades_file(self, symbol: str) -> Optional[Path]:
         """Find DBN file for a given symbol."""
         for f in self._dbn_files:
             if f".trades.{symbol}." in f.name:
                 return f
         return None
     
+    def _find_dbn_definition_file(self, symbol: str) -> Optional[Path]:
+        """Find DBN file for a given symbol."""
+        for f in self._dbn_files:
+            if f".definition.{symbol}." in f.name:
+                return f
+        return None
+
     def _create_equity_instrument(self, symbol: str) -> Equity:
         """Create Equity instrument."""
         instrument_id = InstrumentId(
@@ -196,3 +220,4 @@ class DatabentoTickLoader:
             ts_event=0,
             ts_init=0,
         )
+    

@@ -91,7 +91,6 @@ class OptunaHparamsTuner:
         self,
         cfg: Dict[str, Any],
         catalog: ParquetDataCatalog,
-        instrument_ids : List[InstrumentId],
         run_dir: Path = Path("logs/backtests/"),
         seed: int = 2025,
     ):
@@ -136,7 +135,7 @@ class OptunaHparamsTuner:
         self.catalog = catalog
 
         # TODO: temporary and will be removed. ideally just query catalog.instruments()
-        self.instrument_ids = instrument_ids 
+        self.instrument_ids = list(set(inst.id for inst in self.catalog.instruments()))
     
     
         # Setup MLflow
@@ -191,7 +190,7 @@ class OptunaHparamsTuner:
         
         return params
     
-    def optimize_model(self, instrument_ids: List[InstrumentId]) -> Dict[str, Any]:
+    def optimize_model(self, ) -> Dict[str, Any]:
         """
         Phase 1: Optimize model hyperparameters.
         
@@ -249,7 +248,7 @@ class OptunaHparamsTuner:
             # Retrieve CSV Bar data from loader for training
             start = model_params_flat["train_start"]
             end = model_params_flat["valid_end"]
-            data_dict = self.get_ohlcv_data_from_catalog(frequency = self.model_params["freq"], start=start, end=end, instrument_ids=instrument_ids)
+            data_dict = self.get_ohlcv_data_from_catalog(frequency = self.model_params["freq"], start=start, end=end, instrument_ids=self.instrument_ids)
 
             # Start MLflow run for this trial
             mlflow.set_tracking_uri("file:logs/mlflow")
@@ -602,6 +601,7 @@ class OptunaHparamsTuner:
 
 
         node = BacktestNode(configs=[backtest_cfg])
+        
 
 
         # Run backtest
@@ -900,9 +900,9 @@ class OptunaHparamsTuner:
                 data_cls=TradeTick,
                 start_time=pd.Timestamp.isoformat(start),
                 end_time=pd.Timestamp.isoformat(end),
-                #instrument_ids=[iid.value for iid in self.instrument_ids],
+                instrument_ids=[iid.value for iid in self.instrument_ids],
                 #bar_spec=bar_spec,
-                bar_types = [freq2bartype(instrument_id=iid, frequency= backtest_cfg["STRATEGY"]["freq"]) for iid in self.instrument_ids],
+                #bar_types = [freq2bartype(instrument_id=iid, frequency= backtest_cfg["STRATEGY"]["freq"]) for iid in self.instrument_ids],
                 )
             ]
 

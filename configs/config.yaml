@@ -138,9 +138,9 @@ STRATEGY:
     rebalance_only: false        # false = all universe instruments are considered for top_k. true = portoflio instruments stay the same, with dynamic reallocation 
     account_type: CASH           # "CASH" = spot trading. "MARGIN" can trade derivatives and options as welll. TODO: "MARGIN" not implememted
     oms_type: NETTING            # Order Management System type. NETTING = only long positions. HEDGING = long and short
-    venue_name: SIM             # name of the venue to use for trading
-    risk_free_ticker: "SGOV"     # Risk-free ETF to include in portfolio
-    benchmark_ticker: "SPY"      # Benchmark for M2 optimization
+    venue_name: XNAS             # name of the venue to use for trading
+    risk_free_ticker: SGOV       # Risk-free ETF to include in portfolio
+    benchmark_ticker: SPY        # Benchmark for M2 optimization
 
     # Paths
     data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
@@ -256,7 +256,7 @@ STRATEGY:
       default: "30D"                    # D = Day
       optuna:
         optuna_type: "categorical"
-        choices: ["7D", "14D"]
+        choices: ["60min", "90min"]
     
     # Light fine-tune epochs
     warm_training_epochs:      

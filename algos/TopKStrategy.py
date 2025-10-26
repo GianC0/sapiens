@@ -9,19 +9,13 @@ Implementation reference:
 https://nautilustrader.io/docs/latest/concepts/strategies
 """
 from __future__ import annotations
-
-import asyncio
-import calendar
 from csv import Error
 import importlib
-import math
 from typing import Any
 from datetime import datetime
 from pathlib import Path
-from pyexpat import model
 from tracemalloc import start
 from typing import Dict, List, Optional
-from flask import config
 from pandas.tseries.frequencies import to_offset
 import numpy as np
 import pandas as pd
@@ -39,20 +33,18 @@ from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Log
 from nautilus_trader.core.data import Data
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.objects import Price, Quantity
-from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose, MarkPriceUpdate, TradeTick
+from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, InstrumentClose, TradeTick
 from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.orders import MarketOrder
 from nautilus_trader.model.enums import OrderSide, TriggerType, TrailingOffsetType
 from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.model.instruments import Instrument
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.backtest.models import FillModel, FeeModel
 from nautilus_trader.core.nautilus_pyo3 import CurrencyType
 from nautilus_trader.model.position import Position
-from nautilus_trader.config import ImportableFeeModelConfig
-from nautilus_trader.model.data.aggregation import BarAggregator
+from nautilus_trader.adapters.databento import DATABENTO_CLIENT_ID
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
     OrderDenied, OrderEmulated, OrderEvent, OrderExpired,
@@ -64,11 +56,11 @@ from nautilus_trader.model.events import (
 logger = logging.getLogger(__name__)
 # ----- project imports -----------------------------------------------------
 from models.interfaces import MarketModel
-from algos.engine.data_loader import DatabentoTickLoader
 from algos.engine.OptimizerFactory import create_optimizer
 from models.utils import freq2pdoffset, freq2barspec
 from algos.order_management import OrderManager
-from algos.engine.hparam_tuner import 
+from models.utils import freq2bartype
+#from algos.engine.hparam_tuner import 
 
 
 # ========================================================================== #
@@ -149,9 +141,7 @@ class TopKStrategy(Strategy):
         # Loader for data access
         venue_name = self.strategy_params["venue_name"]
         self.venue = Venue(venue_name)
-        self.loader = DatabentoTickLoader(cfg=self.strategy_params, venue_name=self.venue.value)
 
-        #self.catalog = ParquetDataCatalog( path = self.strategy_params["catalog_path"], fs_protocol="file")
         self.universe: List[str] = []  # Ordered list of instruments
         self.active_mask: Optional[torch.Tensor] = None  # (I,)
 
@@ -213,29 +203,42 @@ class TopKStrategy(Strategy):
         """Initialize strategy."""
 
         # Select universe based on stocks active at walk-forward start with enough history
-        self._select_universe()
+        #self._select_universe()
+        self.universe = list(set(inst.id.value for inst in self.cache.instruments()))
 
         self.max_balance_total = self._calculate_portfolio_nav()
 
         # Subscribe to bars for selected universe
-        for instrument in self.cache.instruments():
-            if instrument.id.symbol.value in self.universe:
-                bar_type = BarType(
-                    instrument_id=instrument.id,
-                    bar_spec=self.bar_spec
-                )
+        for iid in self.universe:
+            iid = InstrumentId.from_str(iid)
+            bar_type = freq2bartype(instrument_id = iid, frequency=self.strategy_params["freq"])
+            #bar_type = BarType(instrument_id = iid, bar_spec =freq2barspec(freq=self.strategy_params["freq"]) )
 
-                # request historical bars
-                # in live should be done through self.request_bars
-                self.request_bars(bar_type)
-                #self.on_historical_data(bar_type = bar_type, start = self.data_load_start)
-                
-                # Subscribe bars for walk forward
-                self.subscribe_bars(bar_type)
-                
-                # Subscribe to instrument events
-                #self.subscribe_mark_prices(instrument.id)
-                #self.subscribe_instrument_close(instrument.id)
+            # request historical bars
+            # in live should be done through self.request_bars
+            #self.on_historical_data(bar_type = bar_type, start = self.data_load_start)
+            self.request_trade_ticks(instrument_id = iid, 
+                                    start=self.train_start.to_pydatetime(),
+                                    client_id=DATABENTO_CLIENT_ID)
+            # TODO: to fix proper load of historical data during backtest
+            self.request_bars(
+                bar_type=bar_type,
+                start=self.train_start.to_pydatetime(),
+                client_id=DATABENTO_CLIENT_ID,
+                end = None,
+                callback=self.on_historical_data,     # called with the request ID when completed
+                params=None,                          # dict[str, Any], optional
+            )
+            
+            
+            
+            # Subscribe bars for walk forward
+            self.subscribe_bars(bar_type, client_id=DATABENTO_CLIENT_ID)
+            self.subscribe_trade_ticks(iid, client_id=DATABENTO_CLIENT_ID)
+            
+            # Subscribe to instrument events
+            #self.subscribe_mark_prices(instrument.id)
+            #self.subscribe_instrument_close(instrument.id)
 
 
 
@@ -264,9 +267,9 @@ class TopKStrategy(Strategy):
         )    
 
         # Final liquidation timer one bar before the end of backtest
-        schedule = self.calendar.schedule(start_date=str(self.valid_start), end_date=str(self.valid_end))
-        if not schedule.empty:
-            last_trading_time = schedule.index[-1]
+        date_range = self.calendar.schedule(start_date=str(self.valid_start), end_date=str(self.valid_end), )
+        if not date_range.empty:
+            last_trading_time = market_calendars.date_range(date_range, frequency=pd.Timedelta(freq2pdoffset(self.strategy_params["freq"])))[-1]
             liquidation_time = pd.Timestamp(last_trading_time) - freq2pdoffset(self.strategy_params["freq"])
             
             self.clock.set_time_alert(
@@ -293,6 +296,9 @@ class TopKStrategy(Strategy):
 
     def on_final_liquidation(self, event: TimeEvent):
         """Liquidate all positions before backtest ends."""
+        if event.name != "final_liquidation":
+            return
+        
         logger.info("Final liquidation: closing all positions")
         
         for position in self.cache.positions_open(venue=self.venue):
@@ -319,7 +325,7 @@ class TopKStrategy(Strategy):
 
         event_time = pd.to_datetime(event.ts_event, unit="ns", utc=True)
         if event_time <= self._last_update_time:
-            logger.debug(f"Event time {event_time} not after last update {self._last_update_time}")
+            logger.info(f"Event time {event_time} not after last update {self._last_update_time}")
             return
 
         now = pd.Timestamp(self.clock.utc_now()) #.tz_convert(self.calendar.tz)
@@ -339,8 +345,6 @@ class TopKStrategy(Strategy):
         
         logger.info(f"Update timer fired at {now}")
         
-        # Check if drowdown stop is needed
-        self._check_drowdown_stop()
 
         if not self.model.is_initialized:
             logger.warning("MODEL NOT INITIALIZED WITHIN STRATEGY UPDATE() CALL")
@@ -461,14 +465,21 @@ class TopKStrategy(Strategy):
     def on_instrument_status(self, data: InstrumentStatus) -> None:
         pass
     def on_instrument_close(self, data: InstrumentClose) -> None:
-        # update the model mask and ensure the loader still provides same input shape to the model for prediction
+        # TODO: update the model mask and ensure the loader still provides same input shape to the model for prediction
         # remove from cache ??
         pass
-    def on_historical_data(self, bar_type: BarType, start: pd.Timestamp ) -> None: 
+    def on_historical_data(self, data: Data ) -> None: 
         """Load historical data for model prediction at t=0."""
         # Historical data is loaded at startup via loader
-        bars = []
+        # TODO: to change to use self.cache
 
+        bars = []
+        catalog_path = "C:\\Users\\gianc\\Desktop\\PYTHON\\sapiens\\data\\nautilus_catalog"
+        from nautilus_trader.persistence.catalog import ParquetDataCatalog
+        catalog = ParquetDataCatalog(path=catalog_path)
+
+        catalog.bars([])
+        
         for bar_or_feature in self.loader.bar_iterator(start_time=start, end_time=self.train_end, symbols=[bar_type.instrument_id.symbol.value]):
             if isinstance(bar_or_feature, Bar):
                 bar_ts = pd.Timestamp(bar_or_feature.ts_event, unit='ns', tz='UTC')
@@ -631,6 +642,8 @@ class TopKStrategy(Strategy):
         # Import model class dynamically
         mod = importlib.import_module(f"models.{self.model_name}.{self.model_name}")
         ModelClass = getattr(mod, f"{self.model_name}", None) or getattr(mod, "Model")
+
+
         if ModelClass is None:
             raise ImportError(f"Could not find model class in models.{self.model_name}")
 
@@ -647,11 +660,14 @@ class TopKStrategy(Strategy):
         else:
             logger.error(f"Model {self.model_name} not found in {self.model_params["model_dir"]}.")
 
-            
+            # Load all needed bars for the initialization
+            days_range = self.calendar.schedule(start_date=self.train_start, end_date=self.train_end)
+            timestamps = market_calendars.date_range(days_range, frequency=self.strategy_params["freq"])
+            total_bars = len(timestamps)
+            train_data = self._cache_to_dict(window=total_bars)
             
             model = ModelClass(**self.model_params)
-            train_data = self.loader.get_ohlcv_data( frequency = self.model_params["freq"], start = self.train_start , end = self.train_end)
-            total_bars = len(next(iter(train_data.values())))
+            
             model.initialize(data = train_data, total_bars = total_bars)
 
             raise Exception("Model Not Initialized")
@@ -676,7 +692,7 @@ class TopKStrategy(Strategy):
             instrument_id=instrument_id,
             order_side=order_side,
             quantity=Quantity.from_int(abs(int(position.quantity))),
-            trigger_type=TriggerType.DEFAULT,
+            trigger_type=TriggerType.LAST_PRICE,
             trailing_offset=Decimal(self.trailing_stop_max * 10000),
             trailing_offset_type=TrailingOffsetType.BASIS_POINTS,
         )
@@ -686,36 +702,36 @@ class TopKStrategy(Strategy):
             self._position_trailing_orders[position_id] = str(trailing_order.client_order_id)
 
         
-    def _cache_to_dict(self, window: int) -> Dict[str, pd.DataFrame]:
+    def _cache_to_dict(self, window: Optional[int]) -> Dict[str, pd.DataFrame]:
         """
         Convert cache data within the specified window to dictionary format expected by model.
         Efficient implementation using nautilus trader cache's native methods.
         """
         data_dict = {}
         
-        if window == 0:
+        if not window:
             window = self.strategy_params.get("engine", {}).get("cache", {}).get("bar_capacity", 4096)
         
-        for symbol in self.universe:
-            instrument_id = InstrumentId(Symbol(symbol), self.venue)
+        for iid in self.universe:
+            instrument_id = InstrumentId.from_str(iid)
             bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
             
             bars = self.cache.bars(bar_type)
             if not bars or len(bars) < self.min_bars_required:
                 continue
             
-            bars_to_use = bars[:window]
+            bars_to_use = reversed(bars[:window])
             
             # Build DataFrame directly - single pass
             df = pd.DataFrame({
-                'Open': [float(b.open) for b in reversed(bars_to_use)],
-                'High': [float(b.high) for b in reversed(bars_to_use)],
-                'Low': [float(b.low) for b in reversed(bars_to_use)],
-                'Close': [float(b.close) for b in reversed(bars_to_use)],
-                'Volume': [float(b.volume) for b in reversed(bars_to_use)]
-            }, index=[pd.Timestamp(b.ts_event, unit='ns', utc=True) for b in reversed(bars_to_use)])
+                'Open': [float(b.open) for b in bars_to_use],
+                'High': [float(b.high) for b in bars_to_use],
+                'Low': [float(b.low) for b in bars_to_use],
+                'Close': [float(b.close) for b in bars_to_use],
+                'Volume': [float(b.volume) for b in bars_to_use]
+            }, index=[pd.Timestamp(b.ts_event, unit='ns', utc=True) for b in bars_to_use])
             
-            data_dict[symbol] = df
+            data_dict[iid] = df
         
         return data_dict
     
