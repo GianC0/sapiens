@@ -7,4 +7,4 @@ echo "   Access at: http://localhost:5000"
 echo "   Press Ctrl+C to stop"
 echo ""
 
-mlflow ui --backend-store-uri file:./logs/mlruns --host 0.0.0.0 --port 5000
+mlflow ui --backend-store-uri file:./logs/mlflow --host 0.0.0.0 --port 5000

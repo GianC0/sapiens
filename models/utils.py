@@ -13,9 +13,11 @@ from torch.utils.data import Dataset
 import re
 import json
 from pandas.tseries.frequencies import to_offset
-from nautilus_trader.model.data import BarSpecification, BarType, BarAggregation          
-from nautilus_trader.core.rust.model import PriceType       # Prince type =  BID / ASK / MID / LAST …
 
+from nautilus_trader.model.data import BarSpecification, BarType, BarAggregation
+from nautilus_trader.model.enums import AggregationSource
+from nautilus_trader.core.rust.model import PriceType   
+from nautilus_trader.model.identifiers import InstrumentId
 
 def freq2barspec(freq: str,
                     price_type: PriceType = PriceType.LAST
@@ -53,12 +55,11 @@ def freq2barspec(freq: str,
         "ms":  BarAggregation.MILLISECOND,
         "s":   BarAggregation.SECOND,
         "sec": BarAggregation.SECOND,
-        "min": BarAggregation.MINUTE,     # preferred spelling (“1min”)
-        "m":   BarAggregation.MINUTE,     # lower-case m = minute   (pandas-style “1m”)
+        "min": BarAggregation.MINUTE, 
         "h":   BarAggregation.HOUR,
         "d":   BarAggregation.DAY,
         "w":   BarAggregation.WEEK,
-        "M":   BarAggregation.MONTH,      # UPPER-case M = month    (same distinction as pandas)
+        "m":   BarAggregation.MONTH,      
     }
 
     _FREQ_RE = re.compile(r"^\s*([+-]?\d+)\s*([a-zA-Z]+)\s*$")
@@ -71,15 +72,21 @@ def freq2barspec(freq: str,
     if step <= 0:
         raise ValueError("Bar step must be a positive integer.")
 
-    unit = m.group(2)
-    # Minute/month case-sensitivity: keep original case so 'M' ≠ 'm'
-    key = unit if unit == "M" else unit.lower()
+    unit = m.group(2).lower()
 
-    if key not in _BAR_AGG_MAP:
+    if unit.lower() not in _BAR_AGG_MAP:
         raise ValueError(f"Unsupported bar unit {unit!r}")
 
-    aggregation = _BAR_AGG_MAP[key]
+    aggregation = _BAR_AGG_MAP[unit]
     return BarSpecification(step, aggregation, price_type)
+
+def freq2bartype(instrument_id: InstrumentId, frequency: str ) -> BarType:
+    """
+    Convert instrument and bar specification into INTERNALLY aggregated bar_type
+    for strategy execution.
+    """
+
+    return BarType(instrument_id=instrument_id, bar_spec=freq2barspec(freq=frequency), aggregation_source = AggregationSource.INTERNAL )
 
 
 
@@ -169,7 +176,9 @@ class SlidingWindowDataset(Dataset):
         self.pred = pred_len
         self.target_idx = target_idx
         self.with_target = with_target
-        self.n_windows = max(0, 1 + self.panel.size(0) - self.L - (self.pred if with_target else 0))
+        self.n_windows = 1 + self.panel.size(0) - self.L - (self.pred if with_target else 0)
+        # Ensure minimum dataset size
+        assert self.n_windows > 0 , f"Dataset is too small for training. Minimum required rows: {self.L - (self.pred if with_target else 0)} , got instead {self.panel.size(0)}"
 
     def __len__(self):
         return self.n_windows

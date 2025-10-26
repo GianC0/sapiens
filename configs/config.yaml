@@ -126,7 +126,7 @@ STRATEGY:
 
     # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
-    freq: 1h                     # 1 business-day bars ( offset ); managed by pandas_market_calendars (1D = 1B)
+    freq: 30min                  # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
     #train_offset:               # Optimized during model hp tuning
     backtest_start: "2024-06-01" # Start of walk-forward evaluation.
     backtest_end:   "2024-07-01" # End of walk-forward evaluation.
@@ -155,7 +155,7 @@ STRATEGY:
     # Hyperparameter tuning Settings and Objectives
     # Objectives: sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown, total_return, annual_return, daily_vol
     tune_hparams: true
-    n_trials: 1 
+    n_trials: 2 
     primary_objective:  "total_pnl_pct"     # used to determine the overall single best hp tuning trial in multi-objective optimization       
     objectives:                             # use only nautilus_trader portfolio_analyzer statistics
       ## Performance / Returns ##

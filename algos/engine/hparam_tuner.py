@@ -11,6 +11,7 @@ Each phase gets its own Optuna study and MLflow experiment.
 
 from copy import Error
 from pdb import run
+from pyexpat import model
 from httpx import delete
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.identifiers import Venue, InstrumentId
@@ -45,6 +46,7 @@ import optuna
 from optuna.storages import RDBStorage
 import pandas as pd
 from sqlalchemy import Engine
+from torch import mode
 import torch.nn as nn
 import re
 import mlflow
@@ -72,7 +74,7 @@ from algos.engine.performance_plots import (
     plot_underwater,
     plot_portfolio_allocation,
 )
-from models.utils import freq2pdoffset, yaml_safe, freq2barspec
+from models.utils import freq2pdoffset, yaml_safe, freq2barspec, freq2bartype
 from algos.engine.databento_loader import DatabentoTickLoader
 
 
@@ -90,6 +92,7 @@ class OptunaHparamsTuner:
         cfg: Dict[str, Any],
         catalog: ParquetDataCatalog,
         run_dir: Path = Path("logs/backtests/"),
+        instrument_ids = List[InstrumentId],
         seed: int = 2025,
     ):
         """
@@ -131,6 +134,9 @@ class OptunaHparamsTuner:
 
         # --- ParquetDataCatalog and Data Augmentation setup -------------------------------------------
         self.catalog = catalog
+
+        # TODO: temporary and will be removed. ideally just query catalog.instruments()
+        self.instrument_ids = instrument_ids 
     
     
         # Setup MLflow
@@ -235,6 +241,7 @@ class OptunaHparamsTuner:
             model_dir.mkdir(parents=True, exist_ok=True)
             model_params_flat  = self._add_dates(self.model_params, train_offset, to_strategy=False) # merged dictionary
             model_params_flat["model_dir"] = model_dir
+            model_params_flat = trial_hparams | model_params_flat
 
             # init data timestamps for data loader
             # Initialize calendar. NOTE: calendar and freq already added un OptunaHparamTuner __init__
@@ -246,6 +253,7 @@ class OptunaHparamsTuner:
 
             # Start MLflow run for this trial
             mlflow.set_tracking_uri("file:logs/mlflow")
+            mlflow.set_experiment("Models")
             with mlflow.start_run(
                 run_name=f"trial_{trial.number}",
                 nested=True,
@@ -267,7 +275,7 @@ class OptunaHparamsTuner:
                 mlflow.log_artifact(str(model_dir / 'model_config.yaml'))
                 
                 # leave this order to make train_offset be overwritten by flat params type
-                model = ModelClass(**(trial_hparams | model_params_flat) )
+                model = ModelClass(**(model_params_flat) )
                 
                 # all assets have same number of bars is ensured by get_data()
                 total_bars = len(next(iter(data_dict.values())))
@@ -315,8 +323,6 @@ class OptunaHparamsTuner:
             raise Exception(f"Model {model_name} has never been been through hyper-parameters tuning")
         self.mlflow_client.set_tag(best_trial.user_attrs["mlflow_run_id"], "is_best_model", "true")
 
-        # quick and dirty fix
-        #self.best_model_params_flat["train_offset"] = self.best_model_params_flat["train_offset"]
         
         logger.info(f"\nBest model trial: {best_trial.number}")
         logger.info(f"Best model loss: {best_trial.value:.6f}")
@@ -367,17 +373,27 @@ class OptunaHparamsTuner:
         )
 
         # save old best trial to update the "is_best_model" tag at the end
-        old_best_trial = study.best_trial
+        old_best_trials = study.best_trials
+        if len(old_best_trials) > 0 and study.directions[primary_obj_index] == optuna.study.StudyDirection.MINIMIZE:
+            old_best_trial = min(old_best_trials, key=lambda t: t.values[primary_obj_index])
+        elif len(old_best_trials) > 0 and study.directions[primary_obj_index] == optuna.study.StudyDirection.MAXIMIZE:
+            old_best_trial = max(old_best_trials, key=lambda t: t.values[primary_obj_index])
+        else:
+            old_best_trial = None
+            logging.info("No previous old best trial of strategy hpo")
+        
         
         # Define objective function for strategy
         def strategy_objective(trial: optuna.Trial) -> Tuple:
             trial_hparams = self._suggest_params(trial, self.strategy_defaults, self.strategy_search)
 
             offset = best_model_params_flat["train_offset"]
-            strategy_params_flat = self._add_dates(self.strategy_params.copy(), offset, to_strategy=True ) | trial_hparams
+            model_name = best_model_params_flat["model_name"]
+            strategy_params_flat = self._add_dates(self.strategy_params.copy(), offset, to_strategy=True, model_name=model_name ) | trial_hparams
             
             # Start MLflow run for this trial
             mlflow.set_tracking_uri("file:logs/mlflow")
+            mlflow.set_experiment("Strategies")
             with mlflow.start_run(
                 run_name=f"trial_{trial.number}",
                 nested=True,
@@ -451,7 +467,8 @@ class OptunaHparamsTuner:
             study.optimize(strategy_objective, n_trials=1)
 
         # Remove best model tag from old best trial
-        self.mlflow_client.delete_tag(run_id = old_best_trial.user_attrs["mlflow_run_id"], key = "is_best_strategy_for_model")
+        if old_best_trial:
+            self.mlflow_client.delete_tag(run_id = old_best_trial.user_attrs["mlflow_run_id"], key = "is_best_strategy_for_model")
 
         # Get best trial based on primary metric
         best_trials = study.best_trials
@@ -781,7 +798,7 @@ class OptunaHparamsTuner:
         return metrics, time_series
 
     
-    def _add_dates(self, cfg, offset, to_strategy = False) -> Dict:
+    def _add_dates(self, cfg, offset, to_strategy = False, model_name: Optional[str] = None) -> Dict:
         
         # trial HPARAMS -> model PARAMS 
         # Calculate proper date ranges
@@ -818,18 +835,18 @@ class OptunaHparamsTuner:
 
         if to_strategy:
             # Compute data load start for initial window
-            # Need window_len + 1 bars before valid_start
-            window_size = self.best_model_params_flat["window_len"] + 1
+            # Need window_len bars before valid_start
+            window_len = self.get_best_model_params_flat(model_name=model_name)["window_len"]
             
             # Calculate using period count, not time offset
             pre_valid_range = calendar.schedule(start_date=train_start, end_date=valid_start)
             pre_valid_timestamps = market_calendars.date_range(pre_valid_range, frequency=self.model_params["freq"])
             
-            if len(pre_valid_timestamps) >= window_size:
-                data_load_start = pre_valid_timestamps[-window_size]
+            if len(pre_valid_timestamps) >= window_len:
+                data_load_start = pre_valid_timestamps[-window_len]
             else:
                 # If not enough history, use train_start
-                logger.warning(f"Insufficient history for window_len={window_size}, using train_start")
+                logger.warning(f"Insufficient history for window_len={window_len}, using train_start")
                 data_load_start = train_start
             
             cfg["data_load_start"] = data_load_start
@@ -875,7 +892,6 @@ class OptunaHparamsTuner:
                 ),
             ),
         ]
-        bar_spec = freq2barspec(backtest_cfg["STRATEGY"]["freq"])
         if "catalog_path" not in backtest_cfg["STRATEGY"]:
             raise ValueError("catalog_path must be set in strategy config")
         data_configs=[
@@ -884,11 +900,11 @@ class OptunaHparamsTuner:
                 data_cls=TradeTick,
                 start_time=pd.Timestamp.isoformat(start),
                 end_time=pd.Timestamp.isoformat(end),
-                instrument_ids=[inst.id.value for inst in self.loader.instruments.values()],
+                #instrument_ids=[iid.value for iid in self.instrument_ids],
                 #bar_spec=bar_spec,
-                #bar_types = [BarType(instrument_id=inst.id, bar_spec=bar_spec) for inst in self.loader.instruments.values()],
-            )
-        ]
+                bar_types = [freq2bartype(instrument_id=iid, frequency= backtest_cfg["STRATEGY"]["freq"]) for iid in self.instrument_ids],
+                )
+            ]
 
         # Initialize Strategy
         strategy_name = self.strategy_params['strategy_name']
@@ -986,7 +1002,7 @@ class OptunaHparamsTuner:
             strategy_ret = pd.to_numeric(portfolio_values).pct_change().fillna(0)
             
             # Get benchmark and risk-free data
-            data_dict = self.loader.get_ohlcv_data(strategy_params_flat.get('freq', '1D'))
+            data_dict = self.get_ohlcv_data(strategy_params_flat.get('freq', '1D'))
             benchmark_returns = data_dict[strategy_params_flat["benchmark_ticker"]].pct_change()["close"]
             risk_free_returns = data_dict[strategy_params_flat["risk_free_ticker"]].pct_change()["close"]
             
@@ -1209,6 +1225,46 @@ class OptunaHparamsTuner:
 
             return run.info.run_id
 
+    def _filter_to_market_hours(
+        self,
+        df: pd.DataFrame,
+        schedule: pd.DataFrame,
+        instrument_id: str
+    ) -> pd.DataFrame:
+        """
+        Filter tick data to only include regular market hours.
+        
+        Args:
+            df: DataFrame with tick data (index must be timezone-aware)
+            schedule: Market calendar schedule with 'market_open' and 'market_close'
+            instrument_id: Instrument identifier for logging
+        
+        Returns:
+            Filtered DataFrame containing only ticks during market hours
+        """
+        # Get market open/close times in UTC
+        market_opens = schedule['market_open'].dt.tz_convert('UTC')
+        market_closes = schedule['market_close'].dt.tz_convert('UTC')
+        
+        # Create mask for market hours
+        mask = pd.Series(False, index=df.index)
+        for open_time, close_time in zip(market_opens, market_closes):
+            mask |= (df.index >= open_time) & (df.index <= close_time)
+        
+        df_filtered = df[mask]
+        
+        # Log filtering results
+        n_excluded = len(df) - len(df_filtered)
+        if n_excluded > 0:
+            pct_excluded = (n_excluded / len(df)) * 100
+            logger.info(
+                f"{instrument_id}: {len(df):,} total ticks → "
+                f"{len(df_filtered):,} in market hours "
+                f"({n_excluded:,} pre/after-hours excluded, {pct_excluded:.1f}%)"
+            )
+        
+        return df_filtered
+
     # Add new method to OptunaHparamsTuner class
     def get_ohlcv_data_from_catalog(
         self,
@@ -1236,6 +1292,11 @@ class OptunaHparamsTuner:
             instruments = self.catalog.instruments(instrument_type=TradeTick)
             instrument_ids = [inst.id.value for inst in instruments]
         
+        # Create unified date range using market calendar
+        calendar = market_calendars.get_calendar(self.model_params["calendar"])
+        schedule = calendar.schedule(start_date=start, end_date=end)
+        unified_index = market_calendars.date_range(schedule, frequency=frequency)
+
         data_dict = {}
         
         for iid in instrument_ids:
@@ -1268,33 +1329,59 @@ class OptunaHparamsTuner:
                     {'price': prices, 'size': sizes},
                     index=pd.to_datetime(timestamps, unit='ns', utc=True)
                 )
+
+                # Filter to market hours
+                df_filtered = self._filter_to_market_hours(df, schedule, str(iid))
                 
-                # Resample to OHLCV (single operation)
-                ohlcv_df = df.resample(frequency).agg({
+                if len(df_filtered) == 0:
+                    logger.warning(f"No ticks in market hours for {iid}")
+                    continue
+                
+                df_filtered = df_filtered.copy()
+
+                # Find which bar each tick belongs to
+                bar_indices = np.searchsorted(unified_index, df_filtered.index, side='right') - 1
+                
+                # Clip to valid range
+                bar_indices = np.clip(bar_indices, 0, len(unified_index) - 1)
+                
+                # Assign bar timestamps
+                
+                df_filtered['bar_time'] = unified_index[bar_indices]
+                
+                # Group by bar and aggregate
+                ohlcv_df = df_filtered.groupby('bar_time').agg({
                     'price': ['first', 'max', 'min', 'last'],
                     'size': 'sum'
                 })
                 
-                # Flatten multi-level columns
-                ohlcv_df.columns = ['_'.join(col) for col in ohlcv_df.columns]
-                ohlcv_df.rename(columns={
-                    'price_first': 'open',
-                    'price_max': 'high',
-                    'price_min': 'low',
-                    'price_last': 'close',
-                    'size_sum': 'volume'
-                }, inplace=True)
+                # Flatten columns
+                ohlcv_df.columns = ['open', 'high', 'low', 'close', 'volume']
                 
-                # Drop periods with no trades
-                ohlcv_df.dropna(subset=['close'], inplace=True)
+                # Reindex to ensure all periods present (even with no trades)
+                ohlcv_df = ohlcv_df.reindex(unified_index)
                 
-                # Extract symbol (format: "SYMBOL.VENUE")
-                #symbol = iid.split('.')[0]
+                # Forward-fill OHLC, zero-fill volume
+                ohlcv_df[['open', 'high', 'low', 'close']] = ohlcv_df[['open', 'high', 'low', 'close']].ffill()
+                ohlcv_df['volume'] = ohlcv_df['volume'].fillna(0)
+                
+                if ohlcv_df['close'].isna().all():
+                    logger.warning(f"No valid data for {iid} after aggregation")
+                    continue
+                
                 data_dict[iid.value] = ohlcv_df
                 
             except Exception as e:
-                logger.error(f"Error aggregating OHLCV for {iid}: {e}")
+                logger.error(f"Error processing {iid}: {e}")
                 continue
+        
+        # Validate alignment
+        lengths = {iid: len(df) for iid, df in data_dict.items()}
+        if len(set(lengths.values())) > 1:
+            logger.error(f"❌ Misaligned: {lengths}")
+            raise ValueError("Instruments have different bar counts")
+        
+        logger.info(f"✅ All {len(data_dict)} instruments aligned: {list(lengths.values())[0]} bars")
         
         return data_dict
     
@@ -1307,31 +1394,31 @@ class OptunaHparamsTuner:
         
         # Specific to a model_name (if specified)
         if model_name:
-
             model_runs = self.mlflow_client.search_runs(
                 experiment_ids=[exp.experiment_id],
                 filter_string=f"tags.model_name = '{model_name}' AND tags.is_best_model = 'true'",
                 max_results=1
                 )
-            if not model_runs:
-                raise Error(f"No model optimization has been run yet for family: {model_name}")
-            best_model_params_flat = model_runs[0].data.tags["best_model_params_flat"]
-            return best_model_params_flat
-
         # Return best_model_params_flat of best model overall ( any family )
-        model_runs = self.mlflow_client.search_runs(
-            experiment_ids=[exp.experiment_id],
-            filter_string="tags.is_best_model = 'true'",
-            order_by=["metrics.best_validation_loss ASC"],
-            max_results=1
-        )
+        else:
+            model_runs = self.mlflow_client.search_runs(
+                experiment_ids=[exp.experiment_id],
+                filter_string="tags.is_best_model = 'true'",
+                order_by=["metrics.best_validation_loss ASC"],
+                max_results=1
+            )
+
         if not model_runs:
             raise Error(f"No model optimization has been run yet for family: {model_name}")
+        
+        model_config_path = self.mlflow_client.download_artifacts(model_runs[0].info.run_id, "model_config.yaml")
+        model_params_flat = {}
+        with open(model_config_path, "r", encoding="utf-8") as f:
+            model_params_flat = yaml.safe_load(f.read())
 
-        best_model_params_flat = model_runs[0].data.tags["best_model_params_flat"]
-        return best_model_params_flat
+        return model_params_flat
     
-    def get_best_model_mlflow_run_id(self, model_name: Optional[str]) -> Dict:
+    def get_best_model_mlflow_run_id(self, model_name: Optional[str]) -> str:
         """Returns the mlflow best run_id of the specified model_name (if specified) or the run_id of the best model overall (any family) """
         
         exp = self.mlflow_client.get_experiment_by_name("Models")
@@ -1347,10 +1434,10 @@ class OptunaHparamsTuner:
                 )
             if not model_runs:
                 raise Error(f"No model optimization has been run yet for family: {model_name}")
-            best_model_mlflow_run_id = model_runs[0].data.tags["mlflow_run_id"]
+            best_model_mlflow_run_id = model_runs[0].info.run_id
             return best_model_mlflow_run_id
 
-        # Return best_model_params_flat of best model overall ( any family )
+        # Return best_model_mlflow_run_id of best model overall ( any family )
         model_runs = self.mlflow_client.search_runs(
             experiment_ids=[exp.experiment_id],
             filter_string="tags.is_best_model = 'true'",
@@ -1360,7 +1447,7 @@ class OptunaHparamsTuner:
         if not model_runs:
             raise Error(f"No model optimization has been run yet for family: {model_name}")
 
-        best_model_mlflow_run_id = model_runs[0].data.tags["mlflow_run_id"]
+        best_model_mlflow_run_id = model_runs[0].info.run_id
         return best_model_mlflow_run_id
     
     def get_best_full_params_flat(self, primary_objective_with_direction: Dict[str,str] = {"total_pnl_pct" : "maximize"}, strategy_name: Optional[str] = None, model_name: Optional[str] = None):

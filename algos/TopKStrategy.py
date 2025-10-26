@@ -51,7 +51,7 @@ from nautilus_trader.backtest.models import FillModel, FeeModel
 from nautilus_trader.core.nautilus_pyo3 import CurrencyType
 from nautilus_trader.model.position import Position
 from nautilus_trader.config import ImportableFeeModelConfig
-from nautilus_trader.common.aggregation import BarAggregator
+from nautilus_trader.model.data.aggregation import BarAggregator
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
     OrderDenied, OrderEmulated, OrderEvent, OrderExpired,
@@ -232,8 +232,8 @@ class TopKStrategy(Strategy):
                 self.subscribe_bars(bar_type)
                 
                 # Subscribe to instrument events
-                self.subscribe_mark_prices(instrument.id)
-                self.subscribe_instrument_close(instrument.id)
+                #self.subscribe_mark_prices(instrument.id)
+                #self.subscribe_instrument_close(instrument.id)
 
 
 
@@ -484,6 +484,7 @@ class TopKStrategy(Strategy):
         
         # Check trailing stops in real-time
         self._check_trailing_stop(instrument, current_price)
+        
     def on_instrument(self, instrument: Instrument) -> None:
         """Handle new instrument events."""
         #TODO: should account for insertion and delisting at the same time. insertion needs portfolio selection
