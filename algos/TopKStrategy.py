@@ -59,7 +59,7 @@ from models.interfaces import MarketModel
 from algos.engine.OptimizerFactory import create_optimizer
 from models.utils import freq2pdoffset, freq2barspec
 from algos.order_management import OrderManager
-from models.utils import freq2bartype
+from models.utils import freq2bartype, freq2pdoffset
 #from algos.engine.hparam_tuner import 
 
 
@@ -106,6 +106,7 @@ class TopKStrategy(Strategy):
         self.calendar = market_calendars.get_calendar(cfg["STRATEGY"]["calendar"])
 
         # Core timing parameters
+        self.data_load_start = pd.Timestamp(self.strategy_params["data_load_start"])
         self.train_start = pd.Timestamp(self.strategy_params["train_start"])
         self.train_end = pd.Timestamp(self.strategy_params["train_end"])
         self.valid_start = pd.Timestamp(self.strategy_params["valid_start"])
@@ -114,7 +115,7 @@ class TopKStrategy(Strategy):
         # data load start should be conservative: 
         # if bars within retrain_date - data_load_start < min_bars_required, then on_historical fails to load necessary data.  
         #self.data_load_start = pd.Timestamp(self.strategy_params["data_load_start"])     # NON-CONSERVATIVE
-        self.data_load_start = self.train_start                                           # CONSERVATIVE
+        #self.data_load_start = self.train_start                                           # CONSERVATIVE
 
         # NOT NEEDED
         #self.backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC")
@@ -208,6 +209,9 @@ class TopKStrategy(Strategy):
 
         self.max_balance_total = self._calculate_portfolio_nav()
 
+        #TODO:fix
+        #self.on_historical_data(data=None)
+
         # Subscribe to bars for selected universe
         for iid in self.universe:
             iid = InstrumentId.from_str(iid)
@@ -221,14 +225,14 @@ class TopKStrategy(Strategy):
                                     start=self.train_start.to_pydatetime(),
                                     client_id=DATABENTO_CLIENT_ID)
             # TODO: to fix proper load of historical data during backtest
-            self.request_bars(
-                bar_type=bar_type,
-                start=self.train_start.to_pydatetime(),
-                client_id=DATABENTO_CLIENT_ID,
-                end = None,
-                callback=self.on_historical_data,     # called with the request ID when completed
-                params=None,                          # dict[str, Any], optional
-            )
+            #self.request_bars(
+            #    bar_type=bar_type,
+            #    start=self.train_start.to_pydatetime(),
+            #    client_id=DATABENTO_CLIENT_ID,
+            #    end = None,
+            #    callback=self.on_historical_data,     # called with the request ID when completed
+            #    params=None,                          # dict[str, Any], optional
+            #)
             
             
             
@@ -239,10 +243,6 @@ class TopKStrategy(Strategy):
             # Subscribe to instrument events
             #self.subscribe_mark_prices(instrument.id)
             #self.subscribe_instrument_close(instrument.id)
-
-
-
-
 
         # Build and initialize model
         self.model = self._initialize_model()
@@ -314,6 +314,9 @@ class TopKStrategy(Strategy):
 
     def on_update(self, event: TimeEvent):
         if event.name != "update_timer":
+            return
+        if self.clock.utc_now() <= self.valid_start:
+            logging.debug("This update step is used to load initial data.")
             return
         if self.final_liquidation_happend:
             return
@@ -396,6 +399,10 @@ class TopKStrategy(Strategy):
         if event.name != "retrain_timer":
             return
         
+        if self.clock.utc_now() <= self.valid_start:
+            logging.debug("No retrain before all initial data is loaded.")
+            return
+        
         now = pd.Timestamp(self.clock.utc_now(),)
         
         # Skip if too soon since last retrain
@@ -416,8 +423,8 @@ class TopKStrategy(Strategy):
         rolling_window_size = max(len(timestamps), self.min_bars_required + self.pred_len)
         
         # Log when falling back to minimum (includes overlap with previous training)
-        if rolling_window_size > self.min_bars_required:
-            logger.info(f"[on_retrain] Rolling window ({rolling_window_size} bars) < minimum required ({self.min_bars_required} bars). Overlap: {rolling_window_size - self.min_bars_required} bars from previous training.")
+        if len(timestamps) > self.min_bars_required:
+            logger.info(f"[on_retrain] Rollowing window needed for retrain ({len(timestamps)} bars) > minimum required ({self.min_bars_required} bars). Overlap: {len(timestamps) - self.min_bars_required} bars from previous training.")
         else:
             logger.info(
                 f"[on_retrain] Using rolling window of {rolling_window_size} bars (sufficient for training).")
@@ -453,7 +460,7 @@ class TopKStrategy(Strategy):
     # ================================================================= #
     def on_bar(self, bar: Bar):  
         
-        logging.info(f"Received Bar: {bar}")
+        logging.debug(f"Received Bar: {bar}")
 
         return
     def on_instrument(self, instrument: Instrument) -> None:
@@ -468,26 +475,179 @@ class TopKStrategy(Strategy):
         # TODO: update the model mask and ensure the loader still provides same input shape to the model for prediction
         # remove from cache ??
         pass
-    def on_historical_data(self, data: Data ) -> None: 
-        """Load historical data for model prediction at t=0."""
-        # Historical data is loaded at startup via loader
-        # TODO: to change to use self.cache
 
-        bars = []
-        catalog_path = "C:\\Users\\gianc\\Desktop\\PYTHON\\sapiens\\data\\nautilus_catalog"
-        from nautilus_trader.persistence.catalog import ParquetDataCatalog
-        catalog = ParquetDataCatalog(path=catalog_path)
+    def on_historical_data(self, data: Data) -> None: 
+        """
+        Load historical data for model initialization at t=0.
+        Aggregates trade ticks from catalog into OHLCV bars.
+        Processes each instrument separately.
+        """
+        # Get catalog path from strategy config
+        catalog_path = self.strategy_params.get("catalog_path")
+        if not catalog_path:
+            logger.error("catalog_path not found in strategy config")
+            return
+        
+        try:
+            from nautilus_trader.persistence.catalog import ParquetDataCatalog
+            catalog = ParquetDataCatalog(path=str(catalog_path))
+            
+            # Query trade ticks from catalog for all instruments
+            start_time = self.data_load_start
+            end_time = self.train_end
+            
+            logger.info(f"Loading ticks from {start_time} to {end_time} for {len(self.universe)} instruments")
+            
+            ticks = catalog.trade_ticks(
+                start=start_time,
+                end=end_time
+            )
+            
+            if not ticks or len(ticks) == 0:
+                logger.warning(f"No ticks found")
+                return
+            
+            # Convert ticks to DataFrame
+            tick_data = []
+            for tick in ticks:
+                tick_data.append({
+                    'ts_event': tick.ts_event,
+                    'instrument_id': tick.instrument_id.value,
+                    'price': float(tick.price),
+                    'size': float(tick.size)
+                })
+            
+            df_all = pd.DataFrame(tick_data)
+            df_all['ts_event'] = pd.to_datetime(df_all['ts_event'], unit='ns')
 
-        catalog.bars([])
-        
-        for bar_or_feature in self.loader.bar_iterator(start_time=start, end_time=self.train_end, symbols=[bar_type.instrument_id.symbol.value]):
-            if isinstance(bar_or_feature, Bar):
-                bar_ts = pd.Timestamp(bar_or_feature.ts_event, unit='ns', tz='UTC')
-                assert start <= bar_ts <= self.train_end and bar_or_feature.bar_type == bar_type
-                bars.append(bar_or_feature)
-        
-        self.cache.add_bars(bars)
-        logger.info(f"Added {len(bars)}  bars for {bar_type.instrument_id.value}")
+            # Then localize to Eastern Time
+            df_all['ts_event'] = df_all['ts_event'].dt.tz_localize('US/Eastern', ambiguous='infer')
+            logger.info(f"Tick time range (UTC): {df_all['ts_event'].min()} to {df_all['ts_event'].max()}")
+            
+            # Get market schedule for filtering
+            schedule = self.calendar.schedule(start_date=start_time, end_date=end_time)
+            market_opens = schedule['market_open'].dt.tz_convert('UTC')
+            market_closes = schedule['market_close'].dt.tz_convert('UTC')
+            logger.info(f"Market hours (UTC): {market_opens.iloc[0]} to {market_closes.iloc[0]}")
+
+            # Create unified bar index using market calendar
+            freq = self.strategy_params["freq"]
+            unified_index = market_calendars.date_range(schedule, frequency=freq)
+            
+            # Process each instrument separately
+            total_bars_added = 0
+            for iid in self.universe:
+                try:
+                    # Query trade ticks from catalog
+                    ticks = catalog.trade_ticks(
+                        instrument_ids=[iid],
+                        start=start_time,
+                        end=end_time
+                    )
+                    
+                    if not ticks or len(ticks) == 0:
+                        logger.warning(f"No ticks found for {iid}")
+                        continue
+                    
+                    # Vectorized conversion: pre-allocate arrays
+                    n_ticks = len(ticks)
+                    timestamps = np.empty(n_ticks, dtype='int64')
+                    prices = np.empty(n_ticks, dtype=np.float64)
+                    sizes = np.empty(n_ticks, dtype=np.float64)
+                    
+                    # Batch extract attributes
+                    for i, tick in enumerate(ticks):
+                        timestamps[i] = tick.ts_event
+                        prices[i] = float(tick.price)
+                        sizes[i] = float(tick.size)
+                    
+                    # Create DataFrame with timezone-aware index
+                    df = pd.DataFrame(
+                        {'price': prices, 'size': sizes},
+                        index=pd.to_datetime(timestamps, unit='ns', utc=True)
+                    )
+
+                    # Filter to market hours
+                    mask = pd.Series(False, index=df.index)
+                    for open_time, close_time in zip(market_opens, market_closes):
+                        mask |= (df.index >= open_time) & (df.index <= close_time)
+                    
+                    df_filtered = df[mask]
+                                        
+                    if len(df_filtered) == 0:
+                        logger.warning(f"No ticks in market hours for {iid}")
+                        continue
+                    
+                    df_filtered = df_filtered.copy()
+
+                    # Find which bar each tick belongs to
+                    bar_indices = np.searchsorted(unified_index, df_filtered.index, side='right') - 1
+                    
+                    # Clip to valid range
+                    bar_indices = np.clip(bar_indices, 0, len(unified_index) - 1)
+                    
+                    # Assign bar timestamps
+                    
+                    df_filtered['bar_time'] = unified_index[bar_indices]
+                    
+                    # Group by bar and aggregate
+                    ohlcv_df = df_filtered.groupby('bar_time').agg({
+                        'price': ['first', 'max', 'min', 'last'],
+                        'size': 'sum'
+                    })
+                    
+                    # Flatten columns
+                    ohlcv_df.columns = ['open', 'high', 'low', 'close', 'volume']
+                    
+                    # Reindex to ensure all periods present (even with no trades)
+                    ohlcv_df = ohlcv_df.reindex(unified_index)
+                    
+                    # Forward-fill OHLC, zero-fill volume
+                    ohlcv_df[['open', 'high', 'low', 'close']] = ohlcv_df[['open', 'high', 'low', 'close']].ffill()
+                    ohlcv_df['volume'] = ohlcv_df['volume'].fillna(0)
+                    
+                    if ohlcv_df['close'].isna().all():
+                        logger.warning(f"No valid data for {iid} after aggregation")
+                        continue
+                    
+                    
+                    
+                    # Get instrument and bar_type
+                    instrument = self.cache.instrument(InstrumentId.from_str(iid))
+                    bar_type = freq2bartype(instrument_id=InstrumentId.from_str(iid), frequency=freq)
+                    
+                    # Convert to Nautilus Bar objects
+                    bars = []
+                    for ts, row in ohlcv_df.iterrows():
+                        if pd.isna(row['close']):
+                            continue
+                        
+                        bar = Bar(
+                            bar_type=bar_type,
+                            open=Price(row['open'], precision=instrument.price_precision),
+                            high=Price(row['high'], precision=instrument.price_precision),
+                            low=Price(row['low'], precision=instrument.price_precision),
+                            close=Price(row['close'], precision=instrument.price_precision),
+                            volume=Quantity(row['volume'], precision=0),
+                            ts_event=int(ts.value),  # nanoseconds
+                            ts_init=int(ts.value)
+                        )
+                        bars.append(bar)
+                    
+                    # Add bars to cache for this instrument
+                    if bars:
+                        self.cache.add_bars(bars)
+                        total_bars_added += len(bars)
+                        logger.info(f"✅ Added {len(bars)} bars for {iid}")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {iid}: {e}", exc_info=True)
+                    continue
+            
+            logger.info(f"✅ Total: Added {total_bars_added} bars across {len(self.universe)} instruments")
+            
+        except Exception as e:
+            logger.error(f"Error loading historical data: {e}", exc_info=True)
         
 
     # Unused ATM
@@ -621,7 +781,7 @@ class TopKStrategy(Strategy):
         
         for instrument in self.cache.instruments(venue=self.venue):
             symbol = instrument.id.symbol.value
-            bar_type = BarType(instrument_id=instrument.id, bar_spec=self.bar_spec)
+            bar_type = freq2bartype(instrument_id = symbol, frequency=self.strategy_params["freq"])
             
             bars = self.cache.bars(bar_type)
             if not bars or len(bars) < self.min_bars_required:
@@ -629,7 +789,7 @@ class TopKStrategy(Strategy):
             
             # Check data extends into valid period
             if bars:
-                last_bar_time = pd.Timestamp(bars[0].ts_event, unit='ns', utc=True)
+                last_bar_time = pd.Timestamp(bars[0].ts_event, unit='ns', tz="UTC")
                 if last_bar_time < self.valid_start:
                     continue
             
@@ -699,7 +859,6 @@ class TopKStrategy(Strategy):
         
         if trailing_order:
             self.submit_order(trailing_order)
-            self._position_trailing_orders[position_id] = str(trailing_order.client_order_id)
 
         
     def _cache_to_dict(self, window: Optional[int]) -> Dict[str, pd.DataFrame]:
@@ -714,13 +873,13 @@ class TopKStrategy(Strategy):
         
         for iid in self.universe:
             instrument_id = InstrumentId.from_str(iid)
-            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
+            bar_type = freq2bartype(instrument_id = instrument_id, frequency=self.strategy_params["freq"])
             
             bars = self.cache.bars(bar_type)
             if not bars or len(bars) < self.min_bars_required:
                 continue
             
-            bars_to_use = reversed(bars[:window])
+            bars_to_use =bars[:window]
             
             # Build DataFrame directly - single pass
             df = pd.DataFrame({
@@ -729,8 +888,9 @@ class TopKStrategy(Strategy):
                 'Low': [float(b.low) for b in bars_to_use],
                 'Close': [float(b.close) for b in bars_to_use],
                 'Volume': [float(b.volume) for b in bars_to_use]
-            }, index=[pd.Timestamp(b.ts_event, unit='ns', utc=True) for b in bars_to_use])
+            }, index=[pd.Timestamp(b.ts_event, unit='ns', tz="UTC") for b in bars_to_use])
             
+            df.sort_index(inplace=True)
             data_dict[iid] = df
         
         return data_dict
@@ -742,13 +902,13 @@ class TopKStrategy(Strategy):
             return 0.0
         
         try:
-            rf_instrument_id = InstrumentId(Symbol(rf_ticker), self.venue)
-            bar_type = BarType(rf_instrument_id, self.bar_spec)
-            rf_bars = self.cache.bars(bar_type)
+            rf_instrument_id = InstrumentId.from_str(rf_ticker)
+            bar_type = freq2bartype(instrument_id = rf_instrument_id, frequency=self.strategy_params["freq"])
+            bars = self.cache.bars(bar_type)
             
-            if rf_bars and len(rf_bars) >= 2:
-                latest_close = float(rf_bars[0].close)
-                previous_close = float(rf_bars[1].close)
+            if bars and len(bars) >= 2:
+                latest_close = float(bars[0].close)
+                previous_close = float(bars[1].close)
                 return (latest_close - previous_close) / previous_close
         except Exception as e:
             logger.warning(f"Could not get risk-free return: {e}")
@@ -762,11 +922,11 @@ class TopKStrategy(Strategy):
         mask = ~torch.ones(len(self.universe), dtype=torch.bool)
         
         for bt in self.cache.bar_types():
-            idx = self.universe.index(bt.instrument_id.value())
+            idx = self.universe.index(bt.instrument_id.value)
             # Check if data is recent enough
-            last_time = self.cache.bar(bt).ts_event
+            last_time = pd.to_datetime(self.cache.bar(bt).ts_event, unit='ns', origin='unix', utc=True)
             now = self.clock.utc_now()
-            mask[idx] = last_time >= now
+            mask[idx] = last_time + freq2pdoffset(self.strategy_params["freq"]) >= now
     
         return mask
 
@@ -779,8 +939,8 @@ class TopKStrategy(Strategy):
             return None
         
         try:
-            benchmark_instrument_id = InstrumentId(Symbol(benchmark_ticker), self.venue)
-            bar_type = BarType(benchmark_instrument_id, self.bar_spec)
+            benchmark_instrument_id = InstrumentId.from_str(benchmark_ticker)
+            bar_type = freq2bartype(instrument_id = benchmark_instrument_id, frequency=self.strategy_params["freq"])
             benchmark_bars = self.cache.bars(bar_type)
             
             if not benchmark_bars or len(benchmark_bars) < 2:
@@ -807,7 +967,7 @@ class TopKStrategy(Strategy):
         Behavior controlled by self.enforce_pred_sign (True -> force sign to match preds,
         False -> keep optimizer sign).
         """
-        now = pd.Timestamp(self.clock.utc_now())
+        #now = pd.Timestamp(self.clock.utc_now())
 
         # Compute risk free rate return
         current_rf = self._get_risk_free_return()
@@ -828,14 +988,14 @@ class TopKStrategy(Strategy):
 
         for i, symbol in enumerate(self.universe):
             
-            instrument_id = InstrumentId(Symbol(symbol), self.venue)
-            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
-            bars = self.cache.bars(bar_type)
-            if not bars or len(bars) < 2:
+            instrument_id = InstrumentId.from_str(symbol)
+            #bar_type = freq2bartype(instrument_id = instrument_id, frequency=self.strategy_params["freq"])
+            ticks = self.cache.trade_ticks(instrument_id)
+            if not ticks or len(ticks) < 2:
                 continue
 
             # Get current price
-            current_price = float(bars[0].close)
+            current_price = float(ticks[0].price)
             prices[symbol] = current_price
 
             # Calculate current position weight
@@ -849,24 +1009,23 @@ class TopKStrategy(Strategy):
 
             # returns per single period (same freq as preds' base period)
             lookback_n = max(2, int(self.optimizer_lookback.n) )
-            closes = [float(b.close) for b in bars[-lookback_n:]]
-            returns = pd.Series(closes).pct_change().dropna()
+            returns = pd.Series([float(t.price) for t in ticks[-lookback_n:]]).pct_change().dropna()
             if len(returns) == 0:
                 continue
 
             returns_data.append(returns.values)
             valid_symbols.append(symbol)
-            prices[symbol] = float(bars[0].close)
+            prices[symbol] = float(ticks[0].price)
 
             # compute allowed weight ranges
             # Risk-free rate is the only one who can take up to 100% of portfolio
-            if symbol == risk_free_ticker:
+            if symbol == self.strategy_params.get("risk_free_ticker"):
                 # Risk-free max allocation is 100%
                 allowed_weight_ranges.append([0, 1.0])
                 continue
 
             # ADV constraints
-            volumes = [float(b.volume) for b in bars[-self.adv_lookback:]] if len(bars) >= self.adv_lookback else [float(b.volume) for b in bars]
+            volumes = [float(b.size) for b in ticks[-self.adv_lookback:]] if len(ticks) >= self.adv_lookback else [float(b.size) for b in ticks]
             adv = float(np.mean(volumes)) if volumes else 0.0
             
             max_w_relative = min((adv * self.max_adv_pct * current_price) / nav, self.max_w_abs)
@@ -895,7 +1054,7 @@ class TopKStrategy(Strategy):
         # If all expected returns <= rf_horizon then allocate to risk-free ticker (safe fall-back)
         if np.all(valid_expected_returns <= current_rf):
             w_series = pd.Series(0.0, index=self.universe)
-            w_series[risk_free_ticker] = 1.0
+            w_series[self.strategy_params.get("risk_free_ticker")] = 1.0
             return w_series.to_dict()
 
         # Call optimizer with horizon-scaled cov and risk-free rf
@@ -941,7 +1100,7 @@ class TopKStrategy(Strategy):
         
         for position in self.cache.positions_open(venue = self.venue):
             instrument_id = position.instrument_id
-            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
+            bar_type = freq2bartype(instrument_id = instrument_id, frequency=self.strategy_params["freq"])
             
             # Aggregate positions for each instrument (for HEDGING accounts)
             if instrument_id not in positions_by_instrument:
@@ -950,7 +1109,7 @@ class TopKStrategy(Strategy):
         
         # Calculate market value for net positions
         for instrument_id, net_quantity in positions_by_instrument.items():
-            bar_type = BarType(instrument_id=instrument_id, bar_spec=self.bar_spec)
+            bar_type = freq2bartype(instrument_id = instrument_id, frequency=self.strategy_params["freq"])
             bars = self.cache.bars(bar_type)
             
             if bars:
@@ -1037,7 +1196,7 @@ class TopKStrategy(Strategy):
         for idx, symbol in enumerate(symbols):
             target_weight = adjusted_weights[idx]
             
-            instrument_id = InstrumentId(Symbol(symbol), self.venue)
+            instrument_id = InstrumentId.from_str(symbol)
             instrument = self.cache.instrument(instrument_id)
             
             # Get current position and price

@@ -657,7 +657,7 @@ class UMIModel(nn.Module):
             
             if epoch == 0 or (epoch + 1) % max(1, n_epochs // 10) == 0:
                 if logger:
-                    logger.info(f"Stage1 Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                    logger.debug(f"Stage1 Epoch {global_epoch:>3} | train {train_loss:.5f} | "
                             f"val {validation_loss:.5f} | best {best_validation_loss:.5f} | patience {patience_counter}")
             
             self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
@@ -705,7 +705,7 @@ class UMIModel(nn.Module):
 
             if epoch == 0 or (epoch + 1) % max(1, n_epochs // 10) == 0:
                 if logger:
-                    logger.info(f"Stage2 Epoch {global_epoch:>3} | train {train_loss:.5f} | "
+                    logger.debug(f"Stage2 Epoch {global_epoch:>3} | train {train_loss:.5f} | "
                             f"val {validation_loss:.5f} | best {best_validation_loss:.5f}")
             
             self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)

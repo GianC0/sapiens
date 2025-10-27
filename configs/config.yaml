@@ -139,8 +139,8 @@ STRATEGY:
     account_type: CASH           # "CASH" = spot trading. "MARGIN" can trade derivatives and options as welll. TODO: "MARGIN" not implememted
     oms_type: NETTING            # Order Management System type. NETTING = only long positions. HEDGING = long and short
     venue_name: XNAS             # name of the venue to use for trading
-    risk_free_ticker: SGOV       # Risk-free ETF to include in portfolio
-    benchmark_ticker: SPY        # Benchmark for M2 optimization
+    risk_free_ticker: SGOV.XNAS  # Risk-free ETF to include in portfolio
+    benchmark_ticker: SPY.XNAS   # Benchmark for M2 optimization
 
     # Paths
     data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)

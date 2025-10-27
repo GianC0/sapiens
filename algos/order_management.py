@@ -182,13 +182,6 @@ class OrderManager:
             turnover = abs(target_weight - current_weight)
             total_target_turnover += turnover
         
-        available_nav = nav
-        
-        if available_nav <= 0:
-            logger.error(f"Insufficient NAV after commission reserve: {available_nav:.2f}")
-            return
-        
-        
         # Separate symbols into sells and buys
         sells = []
         buys = []
@@ -196,7 +189,7 @@ class OrderManager:
         
         for symbol in universe:
             target_weight = target_weights.get(symbol, 0.0)
-            instrument_id = InstrumentId(Symbol(symbol), self.strategy.venue)
+            instrument_id = InstrumentId.from_str(symbol)
             
             # Get current position
             net_current_qty = self._get_net_position_qty(instrument_id)
@@ -207,7 +200,7 @@ class OrderManager:
                 continue
             
             # Calculate target quantity (adjusted for available NAV)
-            target_value = target_weight * available_nav
+            target_value = target_weight * nav
             target_qty = float(target_value / current_price) if current_price > 0 else 0.0
             
             # Calculate order quantity needed

@@ -440,7 +440,7 @@ class OptunaHparamsTuner:
                 for metric_name, metric_value in metrics.items():
                     mlflow.log_metric(metric_name, metric_value)
                 for key, ts in time_series.items():
-                    mlflow.log_metric(key, ts)
+                    mlflow.log_table(data = ts, artifact_file=f"key.json")
                 
                 # Use Portfolio return as objective
                 scores = tuple(metrics[obj] for obj in objectives)
@@ -597,6 +597,10 @@ class OptunaHparamsTuner:
 
         # Train model on Train + Valid with best HP
         # (DONE THROUGH THE STRATEGY)
+        # TODO: fix this in live trading as it will be possible to call on_historical_data() from databento client
+        logger.warning(f"Moving Start Date: {start} -> {strategy_params_flat["data_load_start"]} to include also training data ")
+        start = strategy_params_flat["data_load_start"]
+        
         backtest_cfg = self._produce_backtest_config(config, start, end)
 
 
