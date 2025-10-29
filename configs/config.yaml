@@ -226,7 +226,7 @@ STRATEGY:
 
     # Liquidity constraints   
     liquidity:
-      adv_lookback: 30     # Look-back window to compute Average Daily Volume (ADV)
+      adv_lookback: 20D     # Look-back window to compute Average Daily Volume (ADV)
       max_adv_pct:  0.05   # Max trade size = 5% of average daily traded volume for that instrument to use for weights 
 
     # Risk Management
@@ -273,7 +273,7 @@ STRATEGY:
         optuna_type: categorical
         choices: ["m2"] # , "min_variance", "equal_weight", "max_sharpe", "m2"
     
-    optimizer_lookback:
+    optimizer_lookback: # Window used to estimates covariance of volatility, returns and risk related metrics
       default: "60B"
       optuna:
         optuna_type: categorical

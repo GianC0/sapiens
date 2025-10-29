@@ -29,18 +29,16 @@ def create_optimizer(name: str, **kwargs):
 class PortfolioOptimizer:
     """Base class for portfolio optimizers using PyPortfolioOpt."""
     
-    def __init__(self,  adv_lookback: int, max_adv_pct: float, weight_bounds: tuple, solver = None, ):
+    def __init__(self, max_adv_pct: float, weight_bounds: tuple, solver = None, ):
         """
         Args:
             weight_bounds: tuple of (min, max) weights, default allows short selling
             solver: cvxpy solver to use (None for default)
-            adv_lookback: lookback for ADV (stored for reference; ADV series should be provided to optimize())
             max_adv_pct: maximum fraction of ADV allowed per trade (e.g. 0.01 = 1% ADV)
         """
 
         self.weight_bounds = weight_bounds
         self.solver = solver
-        self.adv_lookback = adv_lookback
         self.max_adv_pct = max_adv_pct
         self._last_valid_weights = None
     
@@ -104,15 +102,15 @@ class PortfolioOptimizer:
         # Buy notional <= Sell notional + available cash - buffer
         if current_weights is not None and prices is not None and nav is not None:
             def cash_constraint(w):
-                trades = cp.multiply(w - cp.Constant(current_weights), cp.Constant(nav))
-                buys = cp.sum(cp.pos(trades))
-                sells = cp.sum(cp.neg(trades))
-                return sells + cp.Constant(cash_available) - buys >= 0
+                #trade_values = (w - current_weights) * nav
+                #buys = cp.sum(cp.pos(trade_values))
+                #sells = cp.sum(cp.neg(trade_values))
+                return nav * cp.sum(w - current_weights) <= cash_available
             
             ef.add_constraint(cash_constraint)
         
     
-    def _apply_constraints_and_top_k(
+    def _apply_constraints_with_top_k(
         self,
         ef: EfficientFrontier,
         stage1_weights: np.ndarray,
@@ -183,8 +181,8 @@ class PortfolioOptimizer:
 class MaxSharpeOptimizer(PortfolioOptimizer):
     """Maximum Sharpe ratio optimizer using PyPortfolioOpt."""
     
-    def __init__(self, adv_lookback: int, max_adv_pct: float, weight_bounds=(-1, 1), solver=None, risk_free_rate=None,):
-        super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
+    def __init__(self, max_adv_pct: float, weight_bounds=(-1, 1), solver=None, risk_free_rate=None,):
+        super().__init__(max_adv_pct, weight_bounds, solver)
         self.risk_free_rate = risk_free_rate
     
     def optimize(self, er: pd.Series, cov: pd.DataFrame, rf: float, 
@@ -242,7 +240,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
                 # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available )
+                self._apply_constraints_with_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available )
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_sharpe(risk_free_rate=rf)
@@ -319,7 +317,7 @@ class MinVarianceOptimizer(PortfolioOptimizer):
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
                 # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
+                self._apply_constraints_with_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_sharpe(risk_free_rate=rf)
@@ -349,14 +347,14 @@ class M2Optimizer(PortfolioOptimizer):
     M² adjusts portfolio returns to match benchmark volatility for comparison.
     """
     
-    def __init__(self, adv_lookback: int, max_adv_pct: float, weight_bounds=(-1, 1), solver=None):
+    def __init__(self, max_adv_pct: float, weight_bounds=(-1, 1), solver=None):
         """
         Args:
             benchmark_vol: Annualized benchmark volatility (default 15%)
             weight_bounds: Weight constraints
             solver: cvxpy solver
         """
-        super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
+        super().__init__(max_adv_pct, weight_bounds, solver)
     
     def optimize(self, er: pd.Series, cov: pd.DataFrame, rf: float, benchmark_vol: float, 
                 allowed_weight_ranges: np.ndarray,
@@ -406,7 +404,7 @@ class M2Optimizer(PortfolioOptimizer):
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
                 # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
+                self._apply_constraints_with_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_sharpe(risk_free_rate=rf)
@@ -457,14 +455,14 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
     Good for risk-averse investors.
     """
     
-    def __init__(self, adv_lookback: int, max_adv_pct: float, risk_aversion: int = 1, weight_bounds=(-1, 1), solver=None):
+    def __init__(self, max_adv_pct: float, risk_aversion: int = 1, weight_bounds=(-1, 1), solver=None):
         """
         Args:
             risk_aversion: Risk aversion parameter (higher = more risk averse)
             weight_bounds: Weight constraints
             solver: cvxpy solver
         """
-        super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
+        super().__init__(max_adv_pct, weight_bounds, solver)
         self.risk_aversion = risk_aversion
     
     def optimize(self, er: pd.Series, cov: pd.DataFrame,
@@ -512,7 +510,7 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
                 # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
+                self._apply_constraints_with_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_quadratic_utility(risk_aversion=self.risk_aversion)
@@ -542,14 +540,14 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
     Useful for risk-targeted strategies.
     """
     
-    def __init__(self, adv_lookback: int, max_adv_pct: float, weight_bounds=(-1, 1), solver=None):
+    def __init__(self, max_adv_pct: float, weight_bounds=(-1, 1), solver=None):
         """
         Args:
             target_volatility: Target portfolio volatility
             weight_bounds: Weight constraints
             solver: cvxpy solver
         """
-        super().__init__(adv_lookback, max_adv_pct, weight_bounds, solver)
+        super().__init__( max_adv_pct, weight_bounds, solver)
     
     def optimize(self, er: pd.Series, cov: pd.DataFrame,
                 allowed_weight_ranges: np.ndarray,
@@ -594,7 +592,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
                 # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_and_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
+                self._apply_constraints_with_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.efficient_risk(target_volatility=target_volatility)

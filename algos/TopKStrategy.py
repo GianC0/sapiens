@@ -166,9 +166,7 @@ class TopKStrategy(Strategy):
         self.max_balance_total = None
         
         # Extract execution parameters from config
-        self.selector_k = self.strategy_params["top_k"]
-
-        self.adv_lookback = self.strategy_params["liquidity"]["adv_lookback"]
+        self.adv_lookback = pd.Timedelta(self.strategy_params["liquidity"]["adv_lookback"])
         self.max_adv_pct = self.strategy_params["liquidity"]["max_adv_pct"]
         self.twap_slices = self.strategy_params["execution"]["twap"]["slices"]
         self.twap_interval_secs = self.strategy_params["execution"]["twap"]["interval_secs"]
@@ -178,12 +176,12 @@ class TopKStrategy(Strategy):
         # Portfolio optimizer
         # TODO: add risk_aversion config parameter for MaxQuadraticUtilityOptimizer
         # TODO: make sure to pass proper params to create_optimizer depending on the optimizer all __init__ needed by any optimizer
+
+        self.weight_bounds = (0, 1)  # long-only positions
+        if self.can_short:
+            self.weight_bounds = (-1, 1)   # (-) = short position ,  (+) = long position 
         optimizer_name = self.strategy_params.get("optimizer_name", "max_sharpe")
-        weight_bounds = (-1, 1)   # (-) = short position ,  (+) = long position 
-        if not self.can_short:
-            weight_bounds = (0, 1)  # long-only positions
-        self.weight_bounds = weight_bounds
-        self.optimizer = create_optimizer(name = optimizer_name, adv_lookback = self.adv_lookback, max_adv_pct = self.max_adv_pct, weight_bounds = weight_bounds)
+        self.optimizer = create_optimizer(name = optimizer_name, max_adv_pct = self.max_adv_pct, weight_bounds = self.weight_bounds)
         self.rebalance_only = self.strategy_params.get("rebalance_only", False)  # Rebalance mode
         self.top_k = self.strategy_params.get("top_k", 50)  # Portfolio size
         
@@ -962,100 +960,115 @@ class TopKStrategy(Strategy):
             return None
 
     def _compute_target_weights(self, preds: Dict[str, float]) -> Dict[str, float]:
-        """Compute target portfolio weights using M2 optimizer and optional sign enforcement.
+        """Compute target portfolio weights using optimizer with vectorized operations."""
 
-        Behavior controlled by self.enforce_pred_sign (True -> force sign to match preds,
-        False -> keep optimizer sign).
-        """
-        #now = pd.Timestamp(self.clock.utc_now())
 
-        # Compute risk free rate return
         current_rf = self._get_risk_free_return()
-
-        # gather return series and allowed ranges for valid symbols
-        returns_data = []
-        valid_symbols = []
-        prices = {}
-        allowed_weight_ranges = []
-        current_weights = [] # Calculate current weights for fallback
-        total_current_exposure = 0.0
-
-        # Current portfolio net asset value
         nav = self._calculate_portfolio_nav()
+        cash_available = float(self.portfolio.account(self.venue).balance_free(self.strategy_params["currency"])) - self.cash_buffer
+        now = pd.Timestamp(self.clock.utc_now())
 
-        for i, symbol in enumerate(self.universe):
-            
+        # Pre-fetch all data once
+        all_ticks = {iid: self.cache.trade_ticks(InstrumentId.from_str(iid)) for iid in self.universe}
+        all_positions = {}
+        for p in self.cache.positions_open(venue=self.venue):
+            all_positions[p.instrument_id] += float(p.signed_qty)
+        
+        # Data collection (Pre-allocate arrays with max possible size)
+        valid_symbols = []
+        returns_list = []
+        valid_expected_returns = np.zeros(len(self.universe))
+        current_weights = np.zeros(len(self.universe))
+        prices = np.zeros(len(self.universe))
+        allowed_weight_ranges = np.zeros((len(self.universe), 2))
+        valid_symb_count = 0
+
+        for symbol in self.universe:
             instrument_id = InstrumentId.from_str(symbol)
-            #bar_type = freq2bartype(instrument_id = instrument_id, frequency=self.strategy_params["freq"])
-            ticks = self.cache.trade_ticks(instrument_id)
+            ticks = all_ticks.get(symbol)
             if not ticks or len(ticks) < 2:
                 continue
 
-            # Get current price
             current_price = float(ticks[0].price)
-            prices[symbol] = current_price
-
-            # Calculate current position weight
-            net_position = 0.0
-            for position in self.cache.positions_open():
-                if position.instrument_id == instrument_id:
-                    net_position += float(position.signed_qty)
+            net_position = all_positions.get(instrument_id, 0.0)
             current_w = (net_position * current_price / nav) if (net_position and nav > 0) else 0.0
-            current_weights.append(current_w)
-            total_current_exposure += abs(current_w) 
-
-            # returns per single period (same freq as preds' base period)
-            lookback_n = max(2, int(self.optimizer_lookback.n) )
+            
+            # Returns calculation
+            lookback_n = max(2, int(self.optimizer_lookback.n))
             returns = pd.Series([float(t.price) for t in ticks[-lookback_n:]]).pct_change().dropna()
             if len(returns) == 0:
                 continue
-
-            returns_data.append(returns.values)
-            valid_symbols.append(symbol)
-            prices[symbol] = float(ticks[0].price)
-
-            # compute allowed weight ranges
-            # Risk-free rate is the only one who can take up to 100% of portfolio
-            if symbol == self.strategy_params.get("risk_free_ticker"):
-                # Risk-free max allocation is 100%
-                allowed_weight_ranges.append([0, 1.0])
-                continue
-
-            # ADV constraints
-            volumes = [float(b.size) for b in ticks[-self.adv_lookback:]] if len(ticks) >= self.adv_lookback else [float(b.size) for b in ticks]
-            adv = float(np.mean(volumes)) if volumes else 0.0
+        
+            # ADV dollar volume with EMA (with half-life 5 days)
+            trading_hours = self.calendar.schedule(start_date=now, end_date=now).pipe(lambda s: (s["market_close"] - s["market_open"]).dt.total_seconds() / 3600.0).iloc[0]
+            n_ticks = int(pd.Timedelta(f'{trading_hours}h') / pd.Timedelta(self.strategy_params["freq"])) * self.adv_lookback.days
+            recent_ticks = ticks[-n_ticks:] if n_ticks < len(ticks) else ticks
             
-            max_w_relative = min((adv * self.max_adv_pct * current_price) / nav, self.max_w_abs)
+            timestamps = np.empty(n_ticks, dtype='datetime64[ns]')
+            currency_volumes = np.empty(n_ticks, dtype=np.float64)
+            for i, t in enumerate(recent_ticks):
+                timestamps[i] = t.ts_event
+                currency_volumes[i] = float(t.price) * float(t.size)
+            df_ticks_daily = pd.DataFrame({
+                'timestamp': pd.to_datetime(timestamps, utc=True),
+                'currency_volume': currency_volumes
+            }).set_index('timestamp').resample('1D').sum()
+            # NOTE: this is average daily share volume (already accounts for price)
+            adv_in_currency = float(df_ticks_daily['currency_volume'].ewm(halflife=5).mean().iloc[-1])
 
-            # compute min or min/max weight for instrument
-            if self.can_short:
-                w_min = max(current_w - max_w_relative, -self.max_w_abs, self.weight_bounds[0])
-                w_max = min(current_w + max_w_relative, self.max_w_abs, self.weight_bounds[1])
+
+            # Weight bounds: constrain instrument by ADV liquidity and max allocation fraction within portfolio:
+            # - keep risk-free unconstrained
+            # - enforce constraints on any other type of asset
+            if symbol == self.strategy_params.get("risk_free_ticker"):
+                w_min = self.weight_bounds[0]
+                w_max = self.weight_bounds[1]
             else:
-                w_min = 0.0
-                w_max = min(current_w + max_w_relative, self.max_w_abs) if current_w > 0 else min(max_w_relative, self.max_w_abs)
+                max_w_constrained = min((adv_in_currency * self.max_adv_pct) / nav, self.max_w_abs)
+                w_min = max(-max_w_constrained, self.weight_bounds[0])
+                w_max = min(max_w_constrained, self.weight_bounds[1])
+            
+            # Store for weight optimization
+            valid_symbols.append(symbol)
+            returns_list.append(returns.values)
+            valid_expected_returns[valid_symb_count] = preds.get(symbol, 0.0)
+            current_weights[valid_symb_count] = current_w
+            prices[valid_symb_count] = current_price
+            allowed_weight_ranges[valid_symb_count] = [w_min, w_max]
+            valid_symb_count += 1
 
-            allowed_weight_ranges.append([w_min, w_max])
-
-        if len(returns_data) <= 1:
+        if valid_symb_count <= 1:
             return {}
+        
+        # Trim arrays to actual size
+        valid_expected_returns = valid_expected_returns[:valid_symb_count]
+        current_weights = current_weights[:valid_symb_count]
+        prices = prices[:valid_symb_count]
+        allowed_weight_ranges = allowed_weight_ranges[:valid_symb_count]
 
-        # Build covariance per single period and scale to pred_horizon
-        returns_df = pd.DataFrame(returns_data).T  # rows = times, cols = assets
-        cov_per_period = returns_df.cov().values
-        cov_horizon = cov_per_period * float(self.pred_len)  # scale to pred_len horizon
+        # Covariance from returns
+        returns_df = pd.DataFrame(returns_list).T
+        cov_horizon = returns_df.cov().values * float(self.pred_len) # scaled to pred_len horizon
 
-        # Prepare expected returns
-        valid_expected_returns = np.array([preds.get(s, 0.0) for s in valid_symbols])
-        # Prepare cash available for the optimization
-        cash_available = float(self.portfolio.account(self.venue).balance_free(self.strategy_params["currency"])) - self.cash_buffer
-
-
-        # If all expected returns <= rf_horizon then allocate to risk-free ticker (safe fall-back)
+        # Fallback to risk-free if all returns <= rf
         if np.all(valid_expected_returns <= current_rf):
+            rf_instrument_id = InstrumentId.from_str(self.strategy_params.get("risk_free_ticker"))
+            # Get current position value
+            current_rf_qty = self.order_manager._get_net_position_qty(rf_instrument_id)
+            rf_price = self.order_manager._get_current_price(rf_instrument_id)
+            if rf_price and rf_price > 0 and nav > 0:
+                # Max allocation = current position + available cash
+                max_affordable_value = current_rf_qty * rf_price + cash_available
+                target_weight = min(max_affordable_value / nav, 1.0)
+            else:
+                target_weight = 0.0
             w_series = pd.Series(0.0, index=self.universe)
-            w_series[self.strategy_params.get("risk_free_ticker")] = 1.0
+            w_series[self.strategy_params.get("risk_free_ticker")] = target_weight
             return w_series.to_dict()
+
+
+        # NOTE: Controls on cash flow enforced inside the optimizer _add_constraints():
+        # sells + active balance < buys + commission + (buffer)
 
         # Call optimizer with horizon-scaled cov and risk-free rf
         w_opt = self.optimizer.optimize(
@@ -1063,24 +1076,24 @@ class TopKStrategy(Strategy):
             cov=pd.DataFrame(cov_horizon, index=valid_symbols, columns=valid_symbols),
             rf=current_rf,
             benchmark_vol=self._get_benchmark_volatility(),
-            allowed_weight_ranges=np.array(allowed_weight_ranges),
-            current_weights=np.array(current_weights),
-            prices=np.array([prices[s] for s in valid_symbols]),
+            allowed_weight_ranges=allowed_weight_ranges,
+            current_weights=current_weights,
+            prices=prices,
             nav=nav,
             cash_available=cash_available,
-            selector_k = self.selector_k,
+            selector_k = self.strategy_params["top_k"],
             target_volatility = self.target_volatility
         )
 
         # Clipping (if optimizer constraints failed) and log if clipping occurred
-        w_clipped = np.clip(w_opt, np.array(allowed_weight_ranges)[:, 0], np.array(allowed_weight_ranges)[:, 1])  # max bounds
+        w_clipped = np.clip(w_opt, allowed_weight_ranges[:, 0], allowed_weight_ranges[:, 1])  # max bounds
 
         # Account for commissions:
-        w_final = self._adjust_weights_for_commissions(symbols = valid_symbols, expected_returns_array = valid_expected_returns, weights_array = w_clipped, nav = nav)
-
-        # Controls Conditions:
-        # sells + active balance < buys + commission + (buffer)
-        # start with sells then buys
+        w_final = self._adjust_weights_for_commissions(
+            symbols = np.array(valid_symbols),
+            expected_returns_array = valid_expected_returns,
+            weights_array = w_clipped,
+            nav = nav)
 
         # Map to universe
         w_series = pd.Series(0.0, index=self.universe)
