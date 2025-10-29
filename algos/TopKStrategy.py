@@ -972,9 +972,6 @@ class TopKStrategy(Strategy):
         # Compute risk free rate return
         current_rf = self._get_risk_free_return()
 
-        # build candidate list excluding risk free ticker
-        
-
         # gather return series and allowed ranges for valid symbols
         returns_data = []
         valid_symbols = []
@@ -1048,8 +1045,11 @@ class TopKStrategy(Strategy):
         cov_per_period = returns_df.cov().values
         cov_horizon = cov_per_period * float(self.pred_len)  # scale to pred_len horizon
 
-        # prepare expected returns
+        # Prepare expected returns
         valid_expected_returns = np.array([preds.get(s, 0.0) for s in valid_symbols])
+        # Prepare cash available for the optimization
+        cash_available = float(self.portfolio.account(self.venue).balance_free(self.strategy_params["currency"])) - self.cash_buffer
+
 
         # If all expected returns <= rf_horizon then allocate to risk-free ticker (safe fall-back)
         if np.all(valid_expected_returns <= current_rf):
@@ -1064,7 +1064,10 @@ class TopKStrategy(Strategy):
             rf=current_rf,
             benchmark_vol=self._get_benchmark_volatility(),
             allowed_weight_ranges=np.array(allowed_weight_ranges),
-            current_weights = np.array(current_weights),
+            current_weights=np.array(current_weights),
+            prices=np.array([prices[s] for s in valid_symbols]),
+            nav=nav,
+            cash_available=cash_available,
             selector_k = self.selector_k,
             target_volatility = self.target_volatility
         )

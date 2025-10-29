@@ -677,9 +677,8 @@ class OptunaHparamsTuner:
                     if not positions_report.empty:
                         mlflow.log_table(positions_report, "positions_report.json")
                         time_series['positions'] = positions_report
-                        positions_report.to_csv("positions_report.csv")
-                        mlflow.log_artifact("positions_report.csv")
-                        
+                        #positions_report.to_csv("positions_report.csv")
+                        #mlflow.log_artifact("positions_report.csv")
                         logger.info(f"Logged positions report: {len(positions_report)} positions")
                 except Exception as e:
                     logger.warning(f"Could not generate positions report: {e}")
@@ -690,8 +689,8 @@ class OptunaHparamsTuner:
                     if not account_report.empty:
                         mlflow.log_table(account_report, "account_report.json")
                         time_series['account'] = account_report
-                        account_report.to_csv("account_report.csv")
-                        mlflow.log_artifact("account_report.csv")
+                        #account_report.to_csv("account_report.csv")
+                        #mlflow.log_artifact("account_report.csv")
                         logger.info(f"Logged account report: {len(account_report)} snapshots")
                 except Exception as e:
                     logger.warning(f"Could not generate account report: {e}")
@@ -1006,7 +1005,7 @@ class OptunaHparamsTuner:
             strategy_ret = pd.to_numeric(portfolio_values).pct_change().fillna(0)
             
             # Get benchmark and risk-free data
-            data_dict = self.get_ohlcv_data(strategy_params_flat.get('freq', '1D'))
+            data_dict = self.get_ohlcv_data_from_catalog(strategy_params_flat.get('freq', '1D'))
             benchmark_returns = data_dict[strategy_params_flat["benchmark_ticker"]].pct_change()["close"]
             risk_free_returns = data_dict[strategy_params_flat["risk_free_ticker"]].pct_change()["close"]
             
@@ -1294,7 +1293,7 @@ class OptunaHparamsTuner:
         # Get all instruments if not specified
         if instrument_ids is None:
             instruments = self.catalog.instruments(instrument_type=TradeTick)
-            instrument_ids = [inst.id.value for inst in instruments]
+            instrument_ids = [inst.instrument_id.value for inst in instruments]
         
         # Create unified date range using market calendar
         calendar = market_calendars.get_calendar(self.model_params["calendar"])

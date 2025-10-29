@@ -9,6 +9,8 @@ import numpy as np
 from datetime import datetime, timedelta
 from nautilus_trader.model import ExecAlgorithmId
 from nautilus_trader.model.objects import Price, Quantity, Money
+from nautilus_trader.model.orders import Order, OrderList
+from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
@@ -160,132 +162,87 @@ class OrderManager:
     # =========================================================================
 
     def rebalance_portfolio(self, target_weights: Dict[str, float], universe: List[str]) -> None:
-        """
-        Rebalance entire portfolio to target weights with commission awareness.
-        
-        Args:
-            target_weights: Dict[symbol, weight] where weight is fraction of NAV
-            universe: List of all symbols in the universe
-        """
+        """Rebalance using order lists to ensure sells complete before buys."""
         nav = self.strategy._calculate_portfolio_nav()
+        cash_free = float(self.strategy.portfolio.account(self.strategy.venue).balance_free(self.strategy.strategy_params["currency"]))
         if nav <= 0:
-            logger.error(f"Invalid NAV: {nav}. Skipping rebalance.")
+            logger.error(f"Invalid NAV: {nav}")
             return
         
-        logger.info(f"Rebalancing portfolio with NAV: {nav:.2f}")
-
-        # Calculate commission buffer (reserve for worst-case scenario)
-        total_target_turnover = 0.0
-        for symbol in universe:
-            target_weight = target_weights.get(symbol, 0.0)
-            current_weight = self._get_current_weight(symbol)
-            turnover = abs(target_weight - current_weight)
-            total_target_turnover += turnover
-        
-        # Separate symbols into sells and buys
+        # Group by cash flow direction
         sells = []
-        buys = []
-        holds = []
+        buys_dict = {}
         
         for symbol in universe:
             target_weight = target_weights.get(symbol, 0.0)
-            instrument_id = InstrumentId.from_str(symbol)
-            
-            # Get current position
-            net_current_qty = self._get_net_position_qty(instrument_id)
-            
-            # Get current price
-            current_price = self._get_current_price(instrument_id)
-            if current_price is None:
+            instrument_id = InstrumentId.from_str(symbol)            
+            net_qty = self._get_net_position_qty(instrument_id)
+            price = self._get_current_price(instrument_id)
+            if not price:
                 continue
             
-            # Calculate target quantity (adjusted for available NAV)
-            target_value = target_weight * nav
-            target_qty = float(target_value / current_price) if current_price > 0 else 0.0
+            target_qty = int((target_weight * nav) / price)
+            order_qty = target_qty - net_qty
             
-            # Calculate order quantity needed
-            order_qty = target_qty - net_current_qty
+            if abs(order_qty) < 1:
+                continue
             
-            # Categorize orders
-            if order_qty < -0.5:  # Selling (threshold to avoid tiny trades)
-                sells.append((symbol, instrument_id, order_qty, current_price))
-            elif order_qty > 0.5:  # Buying
-                buys.append((symbol, instrument_id, order_qty, current_price))
-            else:  # Holding (no significant change)
-                holds.append(symbol)
-        
-        # Execute sells first to free up capital
-        available_cash = self._get_available_cash()
-        
-        for symbol, instrument_id, order_qty, current_price in sells:
-            logger.info(f"SELL {symbol}: qty={abs(order_qty):.2f}")
-            self._execute_order(
-                instrument_id, 
-                int(order_qty), 
-                current_price,
-                available_cash
-            )
-            # Update available cash estimate (add proceeds minus commission)
-            proceeds = abs(order_qty) * current_price
-            available_cash += proceeds
-        
-        # Then execute buys with available cash
-        for symbol, instrument_id, order_qty, current_price in buys:
-            # Check if we have enough cash for this buy + commission
-            required_cash = abs(order_qty) * current_price 
+            if order_qty < 0:  # Sell
+                sell_order = self.strategy.order_factory.market(
+                    instrument_id=instrument_id,
+                    order_side= OrderSide.SELL,
+                    quantity=Quantity.from_int(int(abs(order_qty))),
+                    time_in_force=self.timing_force,
+                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
+                    exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
+                    )
+                
+                # Submit sell order and keep tracking order with id
+                self.strategy.submit_order_list(sell_order)
+                sells.append(sell_order)
+                
             
-            if required_cash > available_cash:
-                # Reduce order size to fit available cash
-                max_qty = (available_cash) / (current_price)
-                if max_qty > 0.5:  # Only execute if meaningful size
-                    adjusted_qty = int(max_qty)
-                    logger.warning(f"BUY {symbol}: Reduced qty from {order_qty:.2f} to {adjusted_qty} due to cash constraint")
-                    order_qty = adjusted_qty
-                else:
-                    logger.warning(f"BUY {symbol}: Skipped due to insufficient cash")
-                    continue
-            
-            logger.info(f"BUY {symbol}: qty={order_qty:.2f}")
-            self._execute_order(
-                instrument_id, 
-                int(order_qty), 
-                current_price,
-                available_cash
-            )
-            # Update available cash estimate
-            available_cash -= abs(order_qty) * current_price 
-        
-        # Log holds for completeness
-        if holds:
-            logger.info(f"HOLD positions: {', '.join(holds)}")
+            else:  # Create Buy orders but do not submit yet
 
-    def execute_position_change(
-        self, 
-        instrument_id: InstrumentId, 
-        target_quantity: int,
-        reason: str = "position_change"
-    ) -> None:
-        """
-        Execute a position change for a specific instrument.
-        
-        Args:
-            instrument_id: Instrument to trade
-            target_quantity: Target position size (absolute)
-            reason: Reason for the trade (for logging/tracking)
-        """
-        # Get current position
-        position = self.strategy.portfolio.position(instrument_id)
-        current_qty = position.quantity if position else 0
-        
-        # Calculate order quantity
-        order_qty = target_quantity - current_qty
-        
-        if order_qty != 0:
-            current_price = self._get_current_price(instrument_id)
-            if current_price:
-                available_cash = self._get_available_cash()
-                logger.info(f"Position change for {instrument_id}: {current_qty} -> {target_quantity} ({reason})")
-                self._execute_order(instrument_id, order_qty, current_price, available_cash)
+                buy_order = self.strategy.order_factory.market(
+                    instrument_id=instrument_id,
+                    order_side= OrderSide.BUY,
+                    quantity=Quantity.from_int(int(abs(order_qty))),
+                    time_in_force=self.timing_force,
+                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
+                    exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
+                    )
+                buys_dict[instrument_id] = int(abs(order_qty)) 
+
+
+        # Ensure proper contigency on buy orders if sells are needed first
+        for bo_id, qty in buys_dict.items():
+            # Ensure to submit buy orders list after all sell orders are filled
+            if sells: 
+                buy_order = self.strategy.order_factory.market(
+                    instrument_id=bo_id,
+                    order_side= OrderSide.BUY,
+                    quantity=Quantity.from_int(int(abs(qty))),
+                    time_in_force=self.timing_force,
+                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
+                    exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
+                    contingency_type=ContingencyType.OTO,
+                    linked_order_ids=[so.client_order_id for so in sells]
+                    )
+                
+            # Just submit buy orders asap   
+            else:
+                buy_order = self.strategy.order_factory.market(
+                    instrument_id=bo_id,
+                    order_side= OrderSide.BUY,
+                    quantity=Quantity.from_int(int(abs(qty))),
+                    time_in_force=self.timing_force,
+                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
+                    exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
+                    )
+            
+            self.strategy.submit_order(buy_order)
+
     
     def close_all_positions(self, instrument_id: InstrumentId, reason: str = "close") -> None:
         """
@@ -528,67 +485,6 @@ class OrderManager:
                 self.strategy.cancel_order(order)
                 logger.info(f"Canceling order: {order.client_order_id}")
 
-    def _execute_order(
-        self,
-        instrument_id: InstrumentId,
-        quantity: int,
-        current_price: float,
-        available_cash: float
-    ) -> bool:
-        """
-        Execute order with cash validation.
-        
-        Returns:
-            bool: True if order was submitted, False otherwise
-        """
-        if quantity == 0:
-            return False
-        
-        # For buy orders, validate sufficient cash
-        if quantity > 0:
-            required_cash = abs(quantity) * current_price
-            if required_cash > available_cash:
-                logger.error(f"Insufficient cash for order: required={required_cash:.2f}, available={available_cash:.2f}")
-                return False
-        
-        # Determine order side
-        order_side = OrderSide.BUY if quantity > 0 else OrderSide.SELL
-        abs_quantity = abs(quantity)
-        
-        # Create and submit order
-        order = self._create_market_order(
-            instrument_id=instrument_id,
-            quantity=abs_quantity,
-            order_side=order_side
-        )
-        
-        if order:
-            self.strategy.submit_order(order)
-            logger.info(
-                f"Submitted MARKET {order_side.name} order for {instrument_id}: "
-                f"{abs_quantity} units at ~{current_price:.2f}"
-            )
-            return True
-        else:
-            logger.error(f"Failed to create order for {instrument_id}")
-            return False
-
-    def _create_market_order(
-        self,
-        instrument_id: InstrumentId,
-        quantity: int,
-        order_side: OrderSide
-    ) -> MarketOrder:
-        """Create a market order."""
-        return self.strategy.order_factory.market(
-            instrument_id=instrument_id,
-            order_side=order_side,
-            quantity=Quantity.from_int(quantity),
-            time_in_force=self.timing_force,
-            exec_algorithm_id=ExecAlgorithmId("TWAP"),
-            exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
-
-        )
 
     def _create_limit_order(
         self,
@@ -612,25 +508,6 @@ class OrderManager:
     # =========================================================================
     # Helper Methods
     # =========================================================================
-    
-    def _get_current_weight(self, symbol: str) -> float:
-        """Calculate current weight of a symbol in the portfolio."""
-        nav = self.strategy._calculate_portfolio_nav()
-        if nav <= 0:
-            return 0.0
-        
-        instrument_id = InstrumentId(Symbol(symbol), self.strategy.venue)
-        net_qty = self._get_net_position_qty(instrument_id)
-        
-        if abs(net_qty) < 1e-2:
-            return 0.0
-        
-        current_price = self._get_current_price(instrument_id)
-        if current_price is None:
-            return 0.0
-        
-        position_value = net_qty * current_price
-        return position_value / nav
 
     def _get_net_position_qty(self, instrument_id: InstrumentId) -> float:
         """Get net position quantity for an instrument."""
@@ -638,6 +515,15 @@ class OrderManager:
         for pos in self.strategy.cache.positions_open():
             if pos.instrument_id == instrument_id:
                 net_qty += float(pos.signed_qty)
+
+        # Pending orders (submitted but not filled yet)
+        for order in self.strategy.cache.orders_open(instrument_id=instrument_id, venue = self.strategy.venue):
+            remaining_qty = float(order.quantity - order.filled_qty)
+            if order.order_type != OrderType.TRAILING_STOP_MARKET and order.order_type != OrderType.TRAILING_STOP_LIMIT:
+                if order.side == OrderSide.BUY :
+                    net_qty += remaining_qty
+                else:  # SELL
+                    net_qty -= remaining_qty
         return net_qty
     
     def _get_current_price(self, instrument_id: InstrumentId) -> Optional[float]:
@@ -658,14 +544,6 @@ class OrderManager:
         logger.warning(f"No price data available for {instrument_id}")
         return None
     
-    def _get_available_cash(self) -> float:
-        """Get available cash in the account."""
-        account = self.strategy.portfolio.account(self.strategy.venue)
-        if account:
-            return float(account.balance_total(self.strategy.strategy_params["currency"]))
-        else:
-            return float(self.strategy.strategy_params.get("initial_cash", 0))
-
     def _handle_order_failure(self, event: Any) -> None:
         """
         Handle order failure with retry logic.
@@ -708,66 +586,3 @@ class OrderManager:
         # In production, you'd compare fill price to mid-price at submission
         pass
     
-    def get_order_metrics(self) -> Dict[str, Any]:
-        """
-        Get current order execution metrics.
-        
-        Returns:
-            Dictionary of performance metrics
-        """
-        metrics = self.order_metrics.copy()
-        
-        # Calculate fill rate
-        if metrics['total_submitted'] > 0:
-            metrics['fill_rate'] = metrics['total_filled'] / metrics['total_submitted']
-            metrics['reject_rate'] = metrics['total_rejected'] / metrics['total_submitted']
-        else:
-            metrics['fill_rate'] = 0
-            metrics['reject_rate'] = 0
-        
-        # Calculate average slippage
-        if len(metrics['slippage_bps']) > 0:
-            metrics['avg_slippage_bps'] = np.mean(metrics['slippage_bps'])
-            metrics['max_slippage_bps'] = np.max(metrics['slippage_bps'])
-        else:
-            metrics['avg_slippage_bps'] = 0
-            metrics['max_slippage_bps'] = 0
-        
-        return metrics
-    
-    def _handle_hedging_positions(
-        self, 
-        instrument_id: InstrumentId, 
-        positions_list: list, 
-        order_qty: float,
-        target_qty: float
-    ) -> None:
-        """
-        Handle position changes for HEDGING accounts.
-        Close opposite positions before opening new ones.
-        
-        Args:
-            instrument_id: Instrument to trade
-            positions_list: List of existing positions
-            order_qty: Desired order quantity
-            target_qty: Target position
-        """
-        # Separate LONG and SHORT positions
-        long_positions = [p for p in positions_list if p.is_long]
-        short_positions = [p for p in positions_list if p.is_short]
-        
-        # If target is LONG and we have SHORTs, close shorts first
-        if target_qty > 0 and short_positions:
-            for pos in short_positions:
-                logger.info(f"Closing SHORT position {pos.id} before going LONG")
-                self.close_position(pos)
-        
-        # If target is SHORT and we have LONGs, close longs first
-        elif target_qty < 0 and long_positions:
-            for pos in long_positions:
-                logger.info(f"Closing LONG position {pos.id} before going SHORT")
-                self.close_position(pos)
-
-        # Execute the main order
-        if order_qty != 0:
-            self.execute_order(instrument_id, int(order_qty))
