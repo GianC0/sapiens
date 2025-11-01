@@ -236,9 +236,11 @@ class OptunaHparamsTuner:
             # setting train_offset and model_dir to model flatten config dictionary
             # adding train_offset here to avoid type overwite later  (pandas.offset -> str)
             train_offset = trial_hparams["train_offset"]
+            retrain_offset = trial_hparams["retrain_offset"]
+            n_retrains_on_valid = trial_hparams["n_retrains_on_valid"]
             model_dir = study_path /  f"trial_{trial.number}"
             model_dir.mkdir(parents=True, exist_ok=True)
-            model_params_flat  = self._add_dates(self.model_params, train_offset, to_strategy=False) # merged dictionary
+            model_params_flat  = self._add_dates(self.model_params, train_offset, retrain_offset, n_retrains_on_valid, to_strategy=False) # merged dictionary
             model_params_flat["model_dir"] = model_dir
             model_params_flat = trial_hparams | model_params_flat
 
@@ -386,9 +388,13 @@ class OptunaHparamsTuner:
         def strategy_objective(trial: optuna.Trial) -> Tuple:
             trial_hparams = self._suggest_params(trial, self.strategy_defaults, self.strategy_search)
 
-            offset = best_model_params_flat["train_offset"]
-            model_name = best_model_params_flat["model_name"]
-            strategy_params_flat = self._add_dates(self.strategy_params.copy(), offset, to_strategy=True, model_name=model_name ) | trial_hparams
+            strategy_params_flat = self._add_dates(
+                self.strategy_params.copy(), 
+                best_model_params_flat["train_offset"], 
+                best_model_params_flat["retrain_offset"],
+                best_model_params_flat["n_retrains_on_valid"],
+                to_strategy=True, 
+                model_name = best_model_params_flat["model_name"] ) | trial_hparams
             
             # Start MLflow run for this trial
             mlflow.set_tracking_uri("file:logs/mlflow")
@@ -801,26 +807,29 @@ class OptunaHparamsTuner:
         return metrics, time_series
 
     
-    def _add_dates(self, cfg, offset, to_strategy = False, model_name: Optional[str] = None) -> Dict:
+    def _add_dates(self, cfg, train_ofst, retrain_ofst, retrains_on_valid, to_strategy = False, model_name: Optional[str] = None) -> Dict:
         
         # trial HPARAMS -> model PARAMS 
         # Calculate proper date ranges
         backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC").normalize()
         backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC").normalize()
-        train_offset = freq2pdoffset(offset)
-        valid_split =  self.model_params["valid_split"]
-
+        train_offset = freq2pdoffset(train_ofst)
+        retrain_offset = freq2pdoffset(retrain_ofst)
+        n_retrains_on_valid = int(retrains_on_valid)
         
         calendar = market_calendars.get_calendar(self.model_params["calendar"])
-        days_range = calendar.schedule(start_date= ( backtest_start - train_offset ), end_date=backtest_start)
-        timestamps = market_calendars.date_range(days_range, frequency=self.model_params["freq"])
+        window_len = 0
+
         
         # compute traing and validation dates
-        valid_offset = (timestamps[-1] - timestamps[0]) / (1 - valid_split) * valid_split
-        train_start = backtest_start - train_offset - valid_offset
+        valid_offset = retrain_offset * n_retrains_on_valid
+        valid_end = backtest_start - pd.Timedelta("1ns")
+        valid_start = valid_end - valid_offset
+
+        train_start = backtest_start - valid_offset - train_offset
         train_end = train_start + train_offset
         valid_start = train_end + pd.Timedelta("1ns")
-        valid_end = backtest_start - pd.Timedelta("1ns")
+        
         
         
 
@@ -831,8 +840,15 @@ class OptunaHparamsTuner:
         cfg["train_start"] = train_start
         cfg["train_offset"] = train_offset
         cfg["train_end"] = train_end
+        
         cfg["valid_start"] = valid_start
+        cfg["valid_offset"] = valid_offset
         cfg["valid_end"] = valid_end
+        
+        cfg["retrain_offset"] = retrain_offset
+        cfg["valid_split"] = float( (valid_end - valid_start) / ( valid_end - train_start) )  # = valid / (valid + train) 
+        cfg["window_len"] = 
+
         cfg["backtest_start"] = backtest_start
         cfg["backtest_end"] = backtest_end
 

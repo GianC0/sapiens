@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import time
 from typing import Dict, Optional, Any
+from click import Option
 import pandas as pd
 from pandas.tseries.offsets import BaseOffset
 import torch
@@ -52,6 +53,8 @@ class UMIModel(nn.Module):
         valid_start: pd.Timestamp,
         valid_end: pd.Timestamp,
         valid_split: float,
+        warm_start: bool,
+        warm_training_epochs: Optional[int] = None,
         n_epochs: int = 20,
         batch_size: int = 64,
         patience:int=10,
@@ -82,7 +85,7 @@ class UMIModel(nn.Module):
         self.train_end      = pd.Timestamp(train_end)                                               # end of training date
         self.train_offset   = train_offset                                                          # time window for training
         self.valid_end      = pd.Timestamp(valid_end)                                               # end of validation date
-        self.valid_split = valid_split                                                              # meaning train/valid split of full training dataset.
+        self.valid_split = valid_split                                                              # train/valid split of full training dataset.
         assert self.valid_end >= self.train_end, "Validation end date must be after training end date."
 
         self.save_backups   = save_backups                                                          # whether to save backups during walk-forward
@@ -91,7 +94,7 @@ class UMIModel(nn.Module):
 
         # model parameters
         self.F              = feature_dim                                                          # number of features per stock
-        self.L              = window_len                                                           # length of the sliding window (L+1 bars)
+        self.L              = window_len                                                           # length of the inference window
         self.I              = None                                                                 # number of stocks/instruments. here it is just initialized
         self.n_epochs       = n_epochs                                                             # number of epochs for training
         self.pretrain_epochs = pretrain_epochs                                                     # epochs for Stage-1 pre-training (hybrid mode)
@@ -111,8 +114,8 @@ class UMIModel(nn.Module):
         self.patience = patience                                                                    # early stopping patience epochs for any training stage
         self.hp = self._default_hparams()                                                           # hyper-parameters
         self.hp.update(hparams)                                                                     # updated with those defined in the yaml config
-        #self.warm_start          = warm_start                                                      # warm start when stock is deleted or retrain delta elapsed
-        #self.warm_training_epochs = warm_training_epochs if warm_start is not None else self.n_epochs
+        self.warm_start          = warm_start                                                      # warm start when stock is deleted or retrain delta elapsed
+        self.warm_training_epochs = warm_training_epochs if warm_start is not None else self.n_epochs
         self._global_epoch = 0                                                                      # global epoch counter for stats
         self._epoch_logs = []                                                                       # useful during full strategy run to track updates() and reinitializations
 
@@ -166,21 +169,21 @@ class UMIModel(nn.Module):
 
         return best_val
 
-    def update(self, data: Dict[str, DataFrame], current_time: Timestamp, retrain_start_date: Timestamp, active_mask: torch.Tensor,  total_bars: int, warm_start: Optional[bool] = False, warm_training_epochs: Optional[int] = None,):
+    def update(self, data: Dict[str, DataFrame], current_time: Timestamp, retrain_start_date: Timestamp, active_mask: torch.Tensor,  total_bars: int):
         """
         One-off training (train + valid).
         """
         
         assert torch.numel(active_mask) == self.I, f"Active mask size must match the number of trained instruments ({self.I})"
 
-        epochs = warm_training_epochs if warm_training_epochs is not None else self.n_epochs
+        epochs = self.warm_training_epochs if self.warm_training_epochs is not None else self.n_epochs
 
         # set current time for end of training (no validation)
         # the model assumes that input cutoff of old data is done by strategy at current_time - training_offset
         self.train_end = current_time
         self.valid_end = current_time
 
-        if not warm_start:
+        if not self.warm_start:
             if logger:
                 logger.info(f"[update] Warm-start disabled. Initialization on most updated window up until: {current_time}")
     

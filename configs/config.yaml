@@ -18,9 +18,9 @@ MODEL:
     # Training
     target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
     n_epochs:        10          # Epochs on train+valid after hp tuning and rolling initialization
-    valid_split:     0.3         # meaning 70/30 train/valid split of full training dataset.
     batch_size:      32          # Mini-batch size for AdamW                 
     training_mode: "sequential"  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) -> Stage-1 + Stage-2
+    warm_start:      true        # Enable warm-start  
     pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
     patience:        3           # Early-stop patience 
     save_backups: false          # whether to save backups during walk-forward
@@ -32,21 +32,42 @@ MODEL:
   # Default hyper-parameters defined by model are overwritten by this Optuna configuration
   HPARAMS:  # optuna_type: "categorical", low-high (assumed float), int_low-high, log_low-high
     
-    #  Training window.
+    # Full Training Window.
     train_offset:
       default: "12BME"           # BME = business months end
       optuna:
         optuna_type: "categorical"
-        #choices: ["3BME", "6BME", "12BME"]
         choices: ["5B", "10B", "15B"] #, "2BME", "3BME"]
 
-    # L : look-back window length
-    window_len:  
-      default: 10
+    # Window Length used only for inference 
+    inference_window: 
+      default: "6h"
       optuna:
         optuna_type: "categorical"
-        choices: [10,15]
-        #choices: [7, 30, 60, 150, 365]
+        choices: ["6h", "12h", "24h"]
+
+    # Light fine-tune epochs
+    warm_training_epochs:      
+      default: 5
+      optuna:
+        optuna_type: int_low-high
+        low: 5
+        high: 20
+
+    # Retrain - fine-tuning window: used to compute validation set 
+    # and by Strategy to retrain the model after a while 
+    retrain_offset:
+      default: "2B"
+      optuna:
+        optuna_type: "categorical"
+        choices: ["4h", "2B"] 
+
+    # How many retrains to be run for Validation
+    n_retrains_on_valid:
+      default: 0
+      optuna:
+        optuna_type: "categorical"
+        choices: [1, 2, 3] 
 
     # λ_IC   : independence loss weight
     lambda_ic:        
@@ -132,8 +153,7 @@ STRATEGY:
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     cash_buffer: 50              # cash buffer to always keep in portfolio to cover rounding errors
-    currency: USD
-    warm_start:      true        # Enable warm-start                   
+    currency: USD                 
     rebalance_only: false        # false = all universe instruments are considered for top_k. true = portoflio instruments stay the same, with dynamic reallocation 
     account_type: CASH           # "CASH" = spot trading. "MARGIN" can trade derivatives and options as welll. TODO: "MARGIN" not implememted
     oms_type: NETTING            # Order Management System type. NETTING = only long positions. HEDGING = long and short
@@ -226,7 +246,7 @@ STRATEGY:
     # Liquidity constraints   
     liquidity:
       adv_lookback: 20D     # Look-back window to compute Average Daily Volume (ADV)
-      max_adv_pct:  0.05   # Max trade size = 5% of average daily traded volume for that instrument to use for weights 
+      max_adv_pct:  0.10    # Max trade size = 5% of average daily traded volume for that instrument to use for weights 
 
     # Risk Management
     risk:
@@ -248,23 +268,8 @@ STRATEGY:
       optuna:
         optuna_type: int_low-high
         low: 2
-        high: 2
+        high: 3
 
-    # Retrain fine-tuning
-    retrain_offset:
-      default: "30D"                    # D = Day
-      optuna:
-        optuna_type: "categorical"
-        choices: ["60min", "90min"]
-    
-    # Light fine-tune epochs
-    warm_training_epochs:      
-      default: 5
-      optuna:
-        optuna_type: int_low-high
-        low: 5
-        high: 20
-    
     # Optimizer settings
     optimizer_name:
       default: "max_sharpe"          # maximize sharpe ratio

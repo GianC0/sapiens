@@ -112,6 +112,10 @@ class TopKStrategy(Strategy):
         self.train_end = pd.Timestamp(self.strategy_params["train_end"])
         self.valid_start = pd.Timestamp(self.strategy_params["valid_start"])
         self.valid_end = pd.Timestamp(self.strategy_params["valid_end"])
+        self.inference_window_offset = freq2pdoffset(self.model_params["inference_window"])
+        self.retrain_offset = to_offset(self.model_params["retrain_offset"])
+        self.train_offset = to_offset(self.model_params["train_offset"])
+        self.pred_len = int(self.model_params["pred_len"])
 
         # data load start should be conservative: 
         # if bars within retrain_date - data_load_start < min_bars_required, then on_historical fails to load necessary data.  
@@ -121,18 +125,16 @@ class TopKStrategy(Strategy):
         # NOT NEEDED
         #self.backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC")
         #self.backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC")
-    
-        self.retrain_offset = to_offset(self.strategy_params["retrain_offset"])
-        self.train_offset = to_offset(self.strategy_params["train_offset"])
-        self.pred_len = int(self.model_params["pred_len"])
+        
 
 
         # Model and data parameters
         self.model: Optional[MarketModel] = None
         self.model_name = self.model_params["model_name"]
         self.bar_spec = freq2barspec( self.strategy_params["freq"])
-        self.min_bars_required = self.model_params["window_len"]
         self.optimizer_lookback = freq2pdoffset( self.strategy_params["optimizer_lookback"])
+        scl = self.calendar.schedule(start_date=self.train_start - self.inference_window_offset, end_date=self.train_start)
+        self.min_bars_required = len(market_calendars.date_range(scl, frequency=self.strategy_params["freq"]))
         
         # Commissions Fee Model
         self.fee_model = self._import_fee_model()
@@ -445,7 +447,7 @@ class TopKStrategy(Strategy):
             retrain_start_date = self._last_retrain_time,
             active_mask=self.active_mask,
             total_bars = total_bars,
-            warm_start=self.strategy_params["warm_start"],
+            warm_start=self.model_params["warm_start"],
             warm_training_epochs=self.strategy_params["warm_training_epochs"],
         )
         
