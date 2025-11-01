@@ -120,11 +120,11 @@ logger.info("\n" + "="*70)
 logger.info("🔬 STAGE 2: MODEL HYPERPARAMETER OPTIMIZATION")
 logger.info("="*70 + "\n")
 
-#model_results = tuner.optimize_model(instrument_ids=instrument_ids)
+model_results = tuner.optimize_model()
 
-#print("\n✅ Model optimization complete!")
-#print(f"Best model path: {model_results['model_path']}")
-#print(f"MLflow run ID: {model_results['mlflow_run_id']}")
+print("\n✅ Model optimization complete!")
+print(f"Best model path: {model_results['model_path']}")
+print(f"MLflow run ID: {model_results['mlflow_run_id']}")
 
 
 

@@ -100,7 +100,8 @@ class PortfolioOptimizer:
                     ef.add_constraint(lambda w, idx=i, wmax=w_max: w[idx] <= wmax)
         
         # Buy notional <= Sell notional + available cash - buffer
-        if current_weights is not None and prices is not None and nav is not None:
+        # Only add cash constraint if we have existing positions
+        if current_weights is not None and np.sum(np.abs(current_weights)) > 1e-8:
             def cash_constraint(w):
                 #trade_values = (w - current_weights) * nav
                 #buys = cp.sum(cp.pos(trade_values))

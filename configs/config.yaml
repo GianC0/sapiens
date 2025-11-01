@@ -11,16 +11,15 @@ MODEL:
 
     # Model architecture & Data Augmentation
     pred_len:   1                     # H : prediction horizon (next bar)         (one-step forecast)
-    dynamic_universe_mult: 0.2        # Capacity multiplier when extenting universe: 1+univers_mult (in this case +20%)       
     feature_dim: 5                    # OHLCV + extra features for L1 market data. To be changed if higher level data is avail
     features_to_load: "candles"       # candles = OHLCV
     adjust: true                      # wheter to adjust OHLC based on stock splits and dividends
 
     # Training
     target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
-    n_epochs:        20          # Epochs on train+valid after hp tuning and rolling initialization
+    n_epochs:        10          # Epochs on train+valid after hp tuning and rolling initialization
     valid_split:     0.3         # meaning 70/30 train/valid split of full training dataset.
-    batch_size:      64          # Mini-batch size for AdamW                 
+    batch_size:      32          # Mini-batch size for AdamW                 
     training_mode: "sequential"  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) -> Stage-1 + Stage-2
     pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
     patience:        3           # Early-stop patience 
@@ -28,7 +27,7 @@ MODEL:
 
     # Hyperparameter tuning settings
     tune_hparams:    true        # Use Optuna Bayesian search.            
-    n_trials:        2          # Optuna trials for each run. Used only if tune_hparams is true
+    n_trials:        10          # Optuna trials for each run. Used only if tune_hparams is true
 
   # Default hyper-parameters defined by model are overwritten by this Optuna configuration
   HPARAMS:  # optuna_type: "categorical", low-high (assumed float), int_low-high, log_low-high
@@ -39,7 +38,7 @@ MODEL:
       optuna:
         optuna_type: "categorical"
         #choices: ["3BME", "6BME", "12BME"]
-        choices: ["5B"] #, "2BME", "3BME"]
+        choices: ["5B", "10B", "15B"] #, "2BME", "3BME"]
 
     # L : look-back window length
     window_len:  

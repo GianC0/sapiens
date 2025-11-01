@@ -20,6 +20,7 @@ from pandas.tseries.frequencies import to_offset
 import numpy as np
 import pandas as pd
 from sympy import total_degree
+from collections import defaultdict
 import yaml
 import pandas_market_calendars as market_calendars
 import torch
@@ -907,11 +908,14 @@ class TopKStrategy(Strategy):
             if bars and len(bars) >= 2:
                 latest_close = float(bars[0].close)
                 previous_close = float(bars[1].close)
-                return (latest_close - previous_close) / previous_close
+                rf = (latest_close - previous_close) / previous_close
+                if rf > 0:
+                    return rf
+                return 1e-6
         except Exception as e:
             logger.warning(f"Could not get risk-free return: {e}")
         
-        return 0.0
+        return 1e-6
 
 
     # TODO: superflous. consider removing
@@ -970,9 +974,10 @@ class TopKStrategy(Strategy):
 
         # Pre-fetch all data once
         all_ticks = {iid: self.cache.trade_ticks(InstrumentId.from_str(iid)) for iid in self.universe}
-        all_positions = {}
+        all_positions = defaultdict(float)
+
         for p in self.cache.positions_open(venue=self.venue):
-            all_positions[p.instrument_id] += float(p.signed_qty)
+            all_positions[p.instrument_id.value] += float(p.signed_qty)
         
         # Data collection (Pre-allocate arrays with max possible size)
         valid_symbols = []
@@ -984,13 +989,12 @@ class TopKStrategy(Strategy):
         valid_symb_count = 0
 
         for symbol in self.universe:
-            instrument_id = InstrumentId.from_str(symbol)
             ticks = all_ticks.get(symbol)
             if not ticks or len(ticks) < 2:
                 continue
 
             current_price = float(ticks[0].price)
-            net_position = all_positions.get(instrument_id, 0.0)
+            net_position = all_positions.get(symbol, 0.0)
             current_w = (net_position * current_price / nav) if (net_position and nav > 0) else 0.0
             
             # Returns calculation
@@ -1050,20 +1054,87 @@ class TopKStrategy(Strategy):
         returns_df = pd.DataFrame(returns_list).T
         cov_horizon = returns_df.cov().values * float(self.pred_len) # scaled to pred_len horizon
 
-        # Fallback to risk-free if all returns <= rf
+        # Just Keep cash and sell only if expected loss > commissions
         if np.all(valid_expected_returns <= current_rf):
-            rf_instrument_id = InstrumentId.from_str(self.strategy_params.get("risk_free_ticker"))
-            # Get current position value
-            current_rf_qty = self.order_manager._get_net_position_qty(rf_instrument_id)
-            rf_price = self.order_manager._get_current_price(rf_instrument_id)
-            if rf_price and rf_price > 0 and nav > 0:
-                # Max allocation = current position + available cash
-                max_affordable_value = current_rf_qty * rf_price + cash_available
-                target_weight = min(max_affordable_value / nav, 1.0)
-            else:
-                target_weight = 0.0
+            logger.info("All expected returns <= risk-free rate. Minimizing losses..")
+            
+            # Start with current weights (default: keep everything)
+            defensive_weights = current_weights.copy()
+            
+            # Identify positions with negative expected returns
+            has_position_mask = np.abs(current_weights) > 1e-8
+            negative_return_mask = valid_expected_returns < 0
+            evaluate_mask = has_position_mask & negative_return_mask
+            
+            if not np.any(evaluate_mask):
+                # No losing positions to evaluate - keep everything
+                w_series = pd.Series(0.0, index=self.universe)
+                w_series[valid_symbols] = defensive_weights
+                logger.info("No losing positions found. Keeping all current positions and holding cash.")
+                return w_series.to_dict()
+            
+            # Batch calculate expected losses
+            position_values = np.abs(current_weights) * nav
+            expected_losses = position_values * np.abs(valid_expected_returns)
+            
+            # Batch commission calculation for positions to evaluate
+            evaluate_indices = np.where(evaluate_mask)[0]
+            commissions = np.zeros(len(valid_symbols))
+            
+            for idx in evaluate_indices:
+                symbol = valid_symbols[idx]
+                try:
+                    instrument_id = InstrumentId.from_str(symbol)
+                    instrument = self.cache.instrument(instrument_id)
+                    current_qty = self.order_manager._get_net_position_qty(instrument_id)
+                    
+                    if current_qty == 0:
+                        continue
+                    
+                    price_for_commission = instrument.make_price(prices[idx])
+                    qty_for_commission = instrument.make_qty(abs(current_qty))
+                    
+                    commission = self.fee_model.get_commission(
+                        Order_order=None,
+                        Quantity_fill_qty=qty_for_commission,
+                        Price_fill_px=price_for_commission,
+                        Instrument_instrument=instrument
+                    )
+                    commissions[idx] = float(commission)
+                except Exception as e:
+                    # On error, set commission to infinity so we keep the position
+                    commissions[idx] = np.inf
+                    logger.warning(f"Error calculating commission for {symbol}: {e}. Keeping position.")
+            
+            # Vectorized decision: liquidate where expected_loss > commission
+            should_liquidate = (expected_losses > commissions) & evaluate_mask
+            defensive_weights[should_liquidate] = 0.0
+            
+            # Batch logging (single log message)
+            if np.any(should_liquidate):
+                liquidated_symbols = [valid_symbols[i] for i in np.where(should_liquidate)[0]]
+                total_saved = np.sum(expected_losses[should_liquidate] - commissions[should_liquidate])
+                logger.info(
+                    f"Liquidating {len(liquidated_symbols)} positions: {liquidated_symbols}. "
+                    f"Total net benefit: ${total_saved:.2f}"
+                )
+            
+            kept_mask = evaluate_mask & ~should_liquidate
+            if np.any(kept_mask):
+                kept_symbols = [valid_symbols[i] for i in np.where(kept_mask)[0]]
+                logger.info(
+                    f"Keeping {len(kept_symbols)} losing positions (commissions exceed expected losses): {kept_symbols}"
+                )
+            
+            # Map to full universe
             w_series = pd.Series(0.0, index=self.universe)
-            w_series[self.strategy_params.get("risk_free_ticker")] = target_weight
+            w_series[valid_symbols] = defensive_weights
+            
+            logger.info(
+                f"Portfolio Loss Minimization: {np.sum(should_liquidate)} liquidated, "
+                f"{np.sum(~should_liquidate & has_position_mask)} kept, remaining in cash"
+            )
+            
             return w_series.to_dict()
 
 
@@ -1212,7 +1283,7 @@ class TopKStrategy(Strategy):
         for idx, symbol in enumerate(symbols):
             target_weight = adjusted_weights[idx]
             
-            instrument_id = InstrumentId.from_str(symbol)
+            instrument_id = InstrumentId.from_str(str(symbol))
             instrument = self.cache.instrument(instrument_id)
             
             # Get current position and price
