@@ -238,9 +238,16 @@ class OptunaHparamsTuner:
             train_offset = trial_hparams["train_offset"]
             retrain_offset = trial_hparams["retrain_offset"]
             n_retrains_on_valid = trial_hparams["n_retrains_on_valid"]
+            inference_window = trial_hparams["inference_window"]
             model_dir = study_path /  f"trial_{trial.number}"
             model_dir.mkdir(parents=True, exist_ok=True)
-            model_params_flat  = self._add_dates(self.model_params, train_offset, retrain_offset, n_retrains_on_valid, to_strategy=False) # merged dictionary
+            model_params_flat  = self._add_dates(
+                                        self.model_params,
+                                        train_offset, 
+                                        retrain_offset, 
+                                        n_retrains_on_valid, 
+                                        inference_window, 
+                                        to_strategy=False) 
             model_params_flat["model_dir"] = model_dir
             model_params_flat = trial_hparams | model_params_flat
 
@@ -393,6 +400,7 @@ class OptunaHparamsTuner:
                 best_model_params_flat["train_offset"], 
                 best_model_params_flat["retrain_offset"],
                 best_model_params_flat["n_retrains_on_valid"],
+                best_model_params_flat["inference_window"],
                 to_strategy=True, 
                 model_name = best_model_params_flat["model_name"] ) | trial_hparams
             
@@ -807,7 +815,7 @@ class OptunaHparamsTuner:
         return metrics, time_series
 
     
-    def _add_dates(self, cfg, train_ofst, retrain_ofst, retrains_on_valid, to_strategy = False, model_name: Optional[str] = None) -> Dict:
+    def _add_dates(self, cfg, train_ofst, retrain_ofst, retrains_on_valid, inference_window, to_strategy = False, model_name: Optional[str] = None) -> Dict:
         
         # trial HPARAMS -> model PARAMS 
         # Calculate proper date ranges
@@ -818,19 +826,17 @@ class OptunaHparamsTuner:
         n_retrains_on_valid = int(retrains_on_valid)
         
         calendar = market_calendars.get_calendar(self.model_params["calendar"])
-        window_len = 0
 
-        
         # compute traing and validation dates
-        valid_offset = retrain_offset * n_retrains_on_valid
+        valid_offset = retrain_offset * (1 + n_retrains_on_valid)
         valid_end = backtest_start - pd.Timedelta("1ns")
         valid_start = valid_end - valid_offset
 
         train_start = backtest_start - valid_offset - train_offset
-        train_end = train_start + train_offset
-        valid_start = train_end + pd.Timedelta("1ns")
+        train_end = valid_start - pd.Timedelta("1ns")
         
-        
+        # Calculate number of bars in inference window
+        window_len = int(pd.Timedelta(inference_window) / pd.Timedelta(self.model_params["freq"]) ) 
         
 
         # This should always be true even if validation is not run
@@ -847,7 +853,7 @@ class OptunaHparamsTuner:
         
         cfg["retrain_offset"] = retrain_offset
         cfg["valid_split"] = float( (valid_end - valid_start) / ( valid_end - train_start) )  # = valid / (valid + train) 
-        cfg["window_len"] = 
+        cfg["window_len"] = window_len  # Store computed value for reference 
 
         cfg["backtest_start"] = backtest_start
         cfg["backtest_end"] = backtest_end
@@ -855,7 +861,7 @@ class OptunaHparamsTuner:
         if to_strategy:
             # Compute data load start for initial window
             # Need window_len bars before valid_start
-            window_len = self.get_best_model_params_flat(model_name=model_name)["window_len"]
+            #window_len = self.get_best_model_params_flat(model_name=model_name)["window_len"]
             
             # Calculate using period count, not time offset
             pre_valid_range = calendar.schedule(start_date=train_start, end_date=valid_start)

@@ -78,7 +78,7 @@ class UMIModel(nn.Module):
         self._device        = torch.device("cuda" if torch.cuda.is_available() else "cpu")         # device for training
         
         # time parameters
-        self.market_calendar = market_calendars.get_calendar(calendar)
+        #self.market_calendar = market_calendars.get_calendar(calendar)
         self.freq           = freq                                                                  # e.g. "1d", "15m", "1h"  
         self.pred_len    = pred_len                                                                 # number of bars to predict
         self.train_start =   train_start                                                            # train start date
@@ -94,7 +94,7 @@ class UMIModel(nn.Module):
 
         # model parameters
         self.F              = feature_dim                                                          # number of features per stock
-        self.L              = window_len                                                           # length of the inference window
+        self.L              = window_len                                                           # length of the sliding window used for inference
         self.I              = None                                                                 # number of stocks/instruments. here it is just initialized
         self.n_epochs       = n_epochs                                                             # number of epochs for training
         self.pretrain_epochs = pretrain_epochs                                                     # epochs for Stage-1 pre-training (hybrid mode)

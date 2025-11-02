@@ -57,10 +57,10 @@ MODEL:
     # Retrain - fine-tuning window: used to compute validation set 
     # and by Strategy to retrain the model after a while 
     retrain_offset:
-      default: "2B"
+      default: "48h"
       optuna:
         optuna_type: "categorical"
-        choices: ["4h", "2B"] 
+        choices: ["4h", "13h"] 
 
     # How many retrains to be run for Validation
     n_retrains_on_valid:
@@ -149,7 +149,7 @@ STRATEGY:
     freq: 30min                  # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
     #train_offset:               # Optimized during model hp tuning
     backtest_start: "2024-06-01" # Start of walk-forward evaluation.
-    backtest_end:   "2024-07-01" # End of walk-forward evaluation.
+    backtest_end:   "2024-12-01" # End of walk-forward evaluation.
     calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     cash_buffer: 50              # cash buffer to always keep in portfolio to cover rounding errors
@@ -169,7 +169,6 @@ STRATEGY:
       cache:
         bar_capacity: 4096       # ≥ L + pred_len + some safety margin
         tick_capacity: 50000     # used for TradeTicks Data
-
 
     # Hyperparameter tuning Settings and Objectives
     # Objectives: sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown, total_return, annual_return, daily_vol
