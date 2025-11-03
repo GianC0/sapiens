@@ -1,20 +1,22 @@
+strategy : _adjust_weights_for_commissions TO WORK also when expected profit > 0
+
+"".n in here strategy
+        self.clock.set_timer(
+            name="retrain_timer",
+            interval=pd.Timedelta(days=self.retrain_offset.n),
+            callback=self.on_retrain,
+        )    
 
 
-Ensure that new portfolio weights computation is based also on preds[] and not only historical returns
-fill_model issue in hparams to add in venue: TypeError: Unexpected keyword argument 'fill_model'
-fee model for venue
-latency_model to add as well
-strategy full implementation -> double check order_mngt and position_mngt
-NEW: Strategy → Calculates Weights → OrderManager → Creates/Submits/Manages Orders
-check TODOs wherever they are
-model: remove hparams from __init__ -> no hparams awarenes
+contingency in order manager
 
-
-add pyportfolio opt and stock selection
-- move hp optimizer to top of workflow (to manage hps of model, strategy and MLflow logging)
-- research notebook to identify scope and write only relevant code
-- run backtest
-
-- genai pdf2model
-verify tests for models
-verify autogen workflow
+                buy_order = self.strategy.order_factory.market(
+                    instrument_id=bo_id,
+                    order_side= OrderSide.BUY,
+                    quantity=Quantity.from_int(int(abs(qty))),
+                    time_in_force=self.timing_force,
+                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
+                    exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
+                    contingency_type=ContingencyType.OTO,
+                    linked_order_ids=[so.client_order_id for so in sells]
+                    )

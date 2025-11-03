@@ -113,8 +113,8 @@ class TopKStrategy(Strategy):
         self.valid_start = pd.Timestamp(self.strategy_params["valid_start"])
         self.valid_end = pd.Timestamp(self.strategy_params["valid_end"])
         self.inference_window_offset = freq2pdoffset(self.model_params["inference_window"])
-        self.retrain_offset = to_offset(self.model_params["retrain_offset"])
-        self.train_offset = to_offset(self.model_params["train_offset"])
+        self.retrain_offset = freq2pdoffset(self.model_params["retrain_offset"])
+        self.train_offset = freq2pdoffset(self.model_params["train_offset"])
         self.pred_len = int(self.model_params["pred_len"])
 
         # data load start should be conservative: 
@@ -133,8 +133,7 @@ class TopKStrategy(Strategy):
         self.model_name = self.model_params["model_name"]
         self.bar_spec = freq2barspec( self.strategy_params["freq"])
         self.optimizer_lookback = freq2pdoffset( self.strategy_params["optimizer_lookback"])
-        scl = self.calendar.schedule(start_date=self.train_start - self.inference_window_offset, end_date=self.train_start)
-        self.min_bars_required = len(market_calendars.date_range(scl, frequency=self.strategy_params["freq"]))
+        self.min_bars_required = self.model_params["window_len"]
         
         # Commissions Fee Model
         self.fee_model = self._import_fee_model()
@@ -263,7 +262,7 @@ class TopKStrategy(Strategy):
         
         self.clock.set_timer(
             name="retrain_timer",
-            interval=pd.Timedelta(self.retrain_offset),
+            interval=pd.Timedelta(days=self.retrain_offset.n),
             callback=self.on_retrain,
         )    
 
@@ -329,7 +328,7 @@ class TopKStrategy(Strategy):
 
         event_time = pd.to_datetime(event.ts_event, unit="ns", utc=True)
         if event_time <= self._last_update_time:
-            logger.info(f"Event time {event_time} not after last update {self._last_update_time}")
+            logger.debug(f"Event time {event_time} not after last update {self._last_update_time}")
             return
 
         now = pd.Timestamp(self.clock.utc_now()) #.tz_convert(self.calendar.tz)
@@ -339,7 +338,7 @@ class TopKStrategy(Strategy):
         # check if "now" falls outside market trading hours
         schedule = self.calendar.schedule(start_date=str(now), end_date=str(now))
         if schedule.empty:
-            logger.info(f"Non-trading day at {now}")
+            logger.debug(f"Non-trading day at {now}")
             return
 
         # Skip if no update needed
@@ -347,7 +346,7 @@ class TopKStrategy(Strategy):
             logger.warning("Update called too soon, skipping")
             return
         
-        logger.info(f"Update timer fired at {now}")
+        logger.debug(f"Update timer fired at {now}")
         
 
         if not self.model.is_initialized:
@@ -384,7 +383,7 @@ class TopKStrategy(Strategy):
 
         # Check if we have valid weights
         if not weights or all(abs(w) < 1e-6 for w in weights.values()) or len(weights) == 0:
-            logger.warning("No valid weights computed, skipping rebalance")
+            logger.warning(f"Time: ### {self.clock.utc_now()} ###. No valid weights computed, skipping rebalance")
             self._last_update_time = now
             return
 
@@ -407,10 +406,10 @@ class TopKStrategy(Strategy):
         now = pd.Timestamp(self.clock.utc_now(),)
         
         # Skip if too soon since last retrain
-        if self._last_retrain_time and (now - self._last_retrain_time) < self.retrain_offset:
+        if self._last_retrain_time and now < self._last_retrain_time - self.retrain_offset:
             return
         
-        logger.info(f"Starting model retrain at {now}")
+        logger.debug(f"Starting model retrain at {now}")
 
         # comput how much data to load
         days_range = self.calendar.schedule(start_date= self._last_retrain_time, end_date=now)
@@ -425,9 +424,9 @@ class TopKStrategy(Strategy):
         
         # Log when falling back to minimum (includes overlap with previous training)
         if len(timestamps) > self.min_bars_required:
-            logger.info(f"[on_retrain] Rollowing window needed for retrain ({len(timestamps)} bars) > minimum required ({self.min_bars_required} bars). Overlap: {len(timestamps) - self.min_bars_required} bars from previous training.")
+            logger.debug(f"[on_retrain] Rollowing window needed for retrain ({len(timestamps)} bars) > minimum required ({self.min_bars_required} bars). Overlap: {len(timestamps) - self.min_bars_required} bars from previous training.")
         else:
-            logger.info(
+            logger.debug(
                 f"[on_retrain] Using rolling window of {rolling_window_size} bars (sufficient for training).")
         
         # Get updated data window
@@ -452,7 +451,7 @@ class TopKStrategy(Strategy):
         )
         
         self._last_retrain_time = now
-        logger.info(f"Model retrain completed at {now}")
+        logger.debug(f"Model retrain completed at {now}")
             
             
 
@@ -853,7 +852,8 @@ class TopKStrategy(Strategy):
             instrument_id=instrument_id,
             order_side=order_side,
             quantity=Quantity.from_int(abs(int(position.quantity))),
-            trigger_type=TriggerType.LAST_PRICE,
+            #trigger_type=TriggerType.LAST_PRICE,
+            #trigger_price = ,
             trailing_offset=Decimal(self.trailing_stop_max * 10000),
             trailing_offset_type=TrailingOffsetType.BASIS_POINTS,
         )
@@ -1058,7 +1058,7 @@ class TopKStrategy(Strategy):
 
         # Just Keep cash and sell only if expected loss > commissions
         if np.all(valid_expected_returns <= current_rf):
-            logger.info("All expected returns <= risk-free rate. Minimizing losses..")
+            logger.debug("All expected returns <= risk-free rate. Minimizing losses..")
             
             # Start with current weights (default: keep everything)
             defensive_weights = current_weights.copy()
@@ -1072,7 +1072,7 @@ class TopKStrategy(Strategy):
                 # No losing positions to evaluate - keep everything
                 w_series = pd.Series(0.0, index=self.universe)
                 w_series[valid_symbols] = defensive_weights
-                logger.info("No losing positions found. Keeping all current positions and holding cash.")
+                logger.debug("No losing positions found. Keeping all current positions and holding cash.")
                 return w_series.to_dict()
             
             # Batch calculate expected losses
@@ -1116,7 +1116,7 @@ class TopKStrategy(Strategy):
             if np.any(should_liquidate):
                 liquidated_symbols = [valid_symbols[i] for i in np.where(should_liquidate)[0]]
                 total_saved = np.sum(expected_losses[should_liquidate] - commissions[should_liquidate])
-                logger.info(
+                logger.debug(
                     f"Liquidating {len(liquidated_symbols)} positions: {liquidated_symbols}. "
                     f"Total net benefit: ${total_saved:.2f}"
                 )
@@ -1124,7 +1124,7 @@ class TopKStrategy(Strategy):
             kept_mask = evaluate_mask & ~should_liquidate
             if np.any(kept_mask):
                 kept_symbols = [valid_symbols[i] for i in np.where(kept_mask)[0]]
-                logger.info(
+                logger.debug(
                     f"Keeping {len(kept_symbols)} losing positions (commissions exceed expected losses): {kept_symbols}"
                 )
             
@@ -1132,7 +1132,7 @@ class TopKStrategy(Strategy):
             w_series = pd.Series(0.0, index=self.universe)
             w_series[valid_symbols] = defensive_weights
             
-            logger.info(
+            logger.debug(
                 f"Portfolio Loss Minimization: {np.sum(should_liquidate)} liquidated, "
                 f"{np.sum(~should_liquidate & has_position_mask)} kept, remaining in cash"
             )
@@ -1213,7 +1213,7 @@ class TopKStrategy(Strategy):
             logger.warning(f"NAV calculation may be incorrect: cash={cash_balance:.2f}, positions={total_positions_value:.2f}")
             nav = cash_balance - self.cash_buffer  # Use cash as fallback
         
-        logger.info(f"NAV Calculation: Cash={cash_balance:.2f}, Positions={total_positions_value:.2f}, Total={nav:.2f}")
+        logger.debug(f"NAV Calculation: Cash={cash_balance:.2f}, Positions={total_positions_value:.2f}, Total={nav:.2f}")
 
         return nav
 
@@ -1386,7 +1386,7 @@ class TopKStrategy(Strategy):
         # ═══════════════════════════════════════════════════════════════
         # REQUIREMENT 1: Decide if portfolio-wide rebalancing is profitable
         # ═══════════════════════════════════════════════════════════════
-        if total_expected_profit <= total_commission_needed:
+        if abs(total_expected_profit) <= total_commission_needed:
             logger.warning(
                 f"Rebalancing NOT profitable: expected profit ({total_expected_profit:.2f}) "
                 f"<= commissions ({total_commission_needed:.2f}). "
@@ -1395,8 +1395,8 @@ class TopKStrategy(Strategy):
             return np.zeros(len(weights_array))
         
         net_expected_profit = total_expected_profit - total_commission_needed
-        logger.info(
-            f"Rebalancing IS profitable: expected profit ({total_expected_profit:.2f}) "
+        logger.debug(
+            f"Rebalancing IS convenient: expected profit ({total_expected_profit:.2f}) "
             f"> commissions ({total_commission_needed:.2f}). "
             f"Net profit: {net_expected_profit:.2f}"
         )
@@ -1446,7 +1446,7 @@ class TopKStrategy(Strategy):
             
             remaining_commission_pct -= reduction
             
-            logger.info(
+            logger.debug(
                 f"Reduced {trade['symbol']} (position_profit={trade['position_profit']:.2f}, "
                 f"return={trade['expected_return']:.4f}): "
                 f"weight {current_weight:.6f} → {adjusted_weights[idx]:.6f} "
@@ -1464,7 +1464,7 @@ class TopKStrategy(Strategy):
             )
             return np.zeros(len(weights_array))
         
-        logger.info(f"Successfully reserved ${total_commission_needed:.2f} for commissions")
+        logger.debug(f"Successfully reserved ${total_commission_needed:.2f} for commissions")
         
         return adjusted_weights
     

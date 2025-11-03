@@ -75,9 +75,6 @@ loader = DatabentoTickLoader(
 # Determine catalog path
 catalog_path = Path(CATALOG_PATH) if CATALOG_PATH else loader.catalog_path
 
-
-
-
 # Load or create catalog
 if not FORCE_RELOAD_CATALOG and loader.catalog_exists(catalog_path):
     logger.info(f"📂 Reusing existing catalog at: {catalog_path}")
@@ -114,7 +111,7 @@ print("Hyperparameter tuner initialized")
 print(f"Model trials: {cfg['MODEL']['PARAMS']['n_trials']}")
 print(f"Strategy trials: {cfg['STRATEGY']['PARAMS']['n_trials']}")
 
-
+"""
 # Run model hyperparameter optimization
 logger.info("\n" + "="*70)
 logger.info("🔬 STAGE 2: MODEL HYPERPARAMETER OPTIMIZATION")
@@ -126,7 +123,7 @@ print("\n✅ Model optimization complete!")
 print(f"Best model path: {model_results['model_path']}")
 print(f"MLflow run ID: {model_results['mlflow_run_id']}")
 
-
+"""
 
 
 # Run strategy hyperparameter optimization

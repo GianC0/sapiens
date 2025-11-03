@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from nautilus_trader.model import ExecAlgorithmId
 from nautilus_trader.model.objects import Price, Quantity, Money
 from nautilus_trader.model.orders import Order, OrderList
-from nautilus_trader.model.enums import ContingencyType
+from nautilus_trader.model.enums import ContingencyType, AggregationSource
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.events import (
     OrderAccepted, OrderCanceled, OrderCancelRejected,
@@ -30,7 +30,6 @@ from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.objects import Quantity, Price
 from nautilus_trader.model import Position
 from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.model.orders import MarketOrder, LimitOrder
 import logging
 
 logger = logging.getLogger(__name__)
@@ -198,20 +197,11 @@ class OrderManager:
                     )
                 
                 # Submit sell order and keep tracking order with id
-                self.strategy.submit_order_list(sell_order)
+                self.strategy.submit_order(sell_order)
                 sells.append(sell_order)
                 
             
             else:  # Create Buy orders but do not submit yet
-
-                buy_order = self.strategy.order_factory.market(
-                    instrument_id=instrument_id,
-                    order_side= OrderSide.BUY,
-                    quantity=Quantity.from_int(int(abs(order_qty))),
-                    time_in_force=self.timing_force,
-                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
-                    exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
-                    )
                 buys_dict[instrument_id] = int(abs(order_qty)) 
 
 
@@ -219,7 +209,10 @@ class OrderManager:
         for bo_id, qty in buys_dict.items():
             # Ensure to submit buy orders list after all sell orders are filled
             if sells: 
-                buy_order = self.strategy.order_factory.market(
+                buy_order = MO(
+                    trader_id=self.strategy.trader_id,
+                    strategy_id=self.strategy.strategy_id,
+                    client_order_id = self.strategy.client_order_id,
                     instrument_id=bo_id,
                     order_side= OrderSide.BUY,
                     quantity=Quantity.from_int(int(abs(qty))),
@@ -227,9 +220,9 @@ class OrderManager:
                     exec_algorithm_id=ExecAlgorithmId("TWAP"),
                     exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
                     contingency_type=ContingencyType.OTO,
-                    linked_order_ids=[so.client_order_id for so in sells]
+                    linked_order_ids=[so.client_order_id for so in sells],
                     )
-                
+
             # Just submit buy orders asap   
             else:
                 buy_order = self.strategy.order_factory.market(
@@ -512,9 +505,8 @@ class OrderManager:
     def _get_net_position_qty(self, instrument_id: InstrumentId) -> float:
         """Get net position quantity for an instrument."""
         net_qty = 0.0
-        for pos in self.strategy.cache.positions_open():
-            if pos.instrument_id == instrument_id:
-                net_qty += float(pos.signed_qty)
+        for pos in self.strategy.cache.positions_open(instrument_id = instrument_id):
+            net_qty += float(pos.signed_qty)
 
         # Pending orders (submitted but not filled yet)
         for order in self.strategy.cache.orders_open(instrument_id=instrument_id, venue = self.strategy.venue):
@@ -536,7 +528,7 @@ class OrderManager:
             return float(ticks[0].price)  # Index 0 is most recent
         
         # Fallback to bars if no ticks available
-        bar_type = BarType(instrument_id=instrument_id, bar_spec=self.strategy.bar_spec)
+        bar_type = BarType(instrument_id=instrument_id, bar_spec=self.strategy.bar_spec, aggregation_source = AggregationSource.INTERNAL)
         bars = self.strategy.cache.bars(bar_type)
         if bars and len(bars) > 0:
             return float(bars[0].close)

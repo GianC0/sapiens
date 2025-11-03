@@ -38,7 +38,6 @@ class PortfolioOptimizer:
         """
 
         self.weight_bounds = weight_bounds
-        self.solver = solver
         self.max_adv_pct = max_adv_pct
         self._last_valid_weights = None
     
@@ -90,6 +89,7 @@ class PortfolioOptimizer:
             nav: net asset valuatione i.e., current portfolio value ( - cash buffer )
             cash_available: cash_available i.e., portfolio balance_free
         """
+        """
         # 1. ADV/Liquidity constraints
         if allowed_weight_ranges is not None:
             for i, (w_min, w_max) in enumerate(allowed_weight_ranges):
@@ -98,9 +98,10 @@ class PortfolioOptimizer:
                     ef.add_constraint(lambda w, idx=i, wmin=w_min: w[idx] >= wmin)
                 if bool(w_max <= self.weight_bounds[1]):
                     ef.add_constraint(lambda w, idx=i, wmax=w_max: w[idx] <= wmax)
-        
+        """
         # Buy notional <= Sell notional + available cash - buffer
         # Only add cash constraint if we have existing positions
+        """
         if current_weights is not None and np.sum(np.abs(current_weights)) > 1e-8:
             def cash_constraint(w):
                 #trade_values = (w - current_weights) * nav
@@ -109,6 +110,7 @@ class PortfolioOptimizer:
                 return nav * cp.sum(w - current_weights) <= cash_available
             
             ef.add_constraint(cash_constraint)
+        """
         
     
     def _apply_constraints_with_top_k(
@@ -214,8 +216,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
             ef = EfficientFrontier(
                 expected_returns=er,
                 cov_matrix=cov,
-                weight_bounds=self.weight_bounds,
-                solver=self.solver
+                weight_bounds=allowed_weight_ranges,
             )
             # Apply all constraints (without top-k)
             self._apply_constraints(ef, allowed_weight_ranges, current_weights, prices, nav, cash_available)
@@ -235,8 +236,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
                 ef2 = EfficientFrontier(
                     expected_returns=er,
                     cov_matrix=cov,
-                    weight_bounds=self.weight_bounds,
-                    solver=self.solver
+                    weight_bounds=allowed_weight_ranges,
                 )
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
@@ -290,8 +290,7 @@ class MinVarianceOptimizer(PortfolioOptimizer):
             ef = EfficientFrontier(
                 expected_returns=er,
                 cov_matrix=cov,
-                weight_bounds=self.weight_bounds,
-                solver=self.solver
+                weight_bounds=allowed_weight_ranges,
             )
 
             # Add all constraints
@@ -312,8 +311,7 @@ class MinVarianceOptimizer(PortfolioOptimizer):
                 ef2 = EfficientFrontier(
                     expected_returns=er,
                     cov_matrix=cov,
-                    weight_bounds=self.weight_bounds,
-                    solver=self.solver
+                    weight_bounds=allowed_weight_ranges,
                 )
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
@@ -375,8 +373,7 @@ class M2Optimizer(PortfolioOptimizer):
             ef = EfficientFrontier(
                 expected_returns=er,
                 cov_matrix=cov,
-                weight_bounds=self.weight_bounds,
-                solver=self.solver
+                weight_bounds=allowed_weight_ranges,
             )
             
             # Define custom M² objective
@@ -399,8 +396,7 @@ class M2Optimizer(PortfolioOptimizer):
                 ef2 = EfficientFrontier(
                     expected_returns=er,
                     cov_matrix=cov,
-                    weight_bounds=self.weight_bounds,
-                    solver=self.solver
+                    weight_bounds=allowed_weight_ranges,
                 )
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
@@ -483,8 +479,7 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
             ef = EfficientFrontier(
                 expected_returns=er,
                 cov_matrix=cov,
-                weight_bounds=self.weight_bounds,
-                solver=self.solver
+                weight_bounds=allowed_weight_ranges,
             )
 
             # Add all constraints
@@ -505,8 +500,7 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
                 ef2 = EfficientFrontier(
                     expected_returns=er,
                     cov_matrix=cov,
-                    weight_bounds=self.weight_bounds,
-                    solver=self.solver
+                    weight_bounds=allowed_weight_ranges,
                 )
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
@@ -565,8 +559,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
             ef = EfficientFrontier(
                 expected_returns=er,
                 cov_matrix=cov,
-                weight_bounds=self.weight_bounds,
-                solver=self.solver
+                weight_bounds=allowed_weight_ranges,
             )
             
             # Add all constraints
@@ -587,8 +580,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
                 ef2 = EfficientFrontier(
                     expected_returns=er,
                     cov_matrix=cov,
-                    weight_bounds=self.weight_bounds,
-                    solver=self.solver
+                    weight_bounds=allowed_weight_ranges,
                 )
 
                 # Force w[i] == 0 for assets not in top-k AND enforce all other constraints

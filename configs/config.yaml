@@ -26,7 +26,7 @@ MODEL:
     save_backups: false          # whether to save backups during walk-forward
 
     # Hyperparameter tuning settings
-    tune_hparams:    true        # Use Optuna Bayesian search.            
+    tune_hparams:    false        # Use Optuna Bayesian search.            
     n_trials:        10          # Optuna trials for each run. Used only if tune_hparams is true
 
   # Default hyper-parameters defined by model are overwritten by this Optuna configuration
@@ -37,22 +37,22 @@ MODEL:
       default: "12BME"           # BME = business months end
       optuna:
         optuna_type: "categorical"
-        choices: ["5B", "10B", "15B"] #, "2BME", "3BME"]
+        choices: ["10B", "15B", "20B"] #, "2BME", "3BME"]
 
     # Window Length used only for inference 
     inference_window: 
       default: "6h"
       optuna:
         optuna_type: "categorical"
-        choices: ["6h", "12h", "24h"]
+        choices: ["1h","3h", "6h"]
 
     # Light fine-tune epochs
     warm_training_epochs:      
       default: 5
       optuna:
         optuna_type: int_low-high
-        low: 5
-        high: 20
+        low: 1
+        high: 10
 
     # Retrain - fine-tuning window: used to compute validation set 
     # and by Strategy to retrain the model after a while 
@@ -60,14 +60,15 @@ MODEL:
       default: "48h"
       optuna:
         optuna_type: "categorical"
-        choices: ["4h", "13h"] 
+        choices: ["10B","20B"] 
 
-    # How many retrains to be run for Validation
+    # How many Rolling Retrains on Validation. 0 if no rolling validation
+    # 
     n_retrains_on_valid:
       default: 0
       optuna:
         optuna_type: "categorical"
-        choices: [1, 2, 3] 
+        choices: [0, 1, 2, 3] 
 
     # λ_IC   : independence loss weight
     lambda_ic:        
@@ -146,7 +147,7 @@ STRATEGY:
 
     # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
-    freq: 30min                  # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
+    freq: 10min                  # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
     #train_offset:               # Optimized during model hp tuning
     backtest_start: "2024-06-01" # Start of walk-forward evaluation.
     backtest_end:   "2024-12-01" # End of walk-forward evaluation.
@@ -173,7 +174,7 @@ STRATEGY:
     # Hyperparameter tuning Settings and Objectives
     # Objectives: sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown, total_return, annual_return, daily_vol
     tune_hparams: true
-    n_trials: 2 
+    n_trials: 1 
     primary_objective:  "total_pnl_pct"     # used to determine the overall single best hp tuning trial in multi-objective optimization       
     objectives:                             # use only nautilus_trader portfolio_analyzer statistics
       ## Performance / Returns ##
@@ -236,8 +237,8 @@ STRATEGY:
       timing_force: "GTC"      # Specifies how long the order will remain open or active before any remaining quantity is canceled.
       #exec_algo: twap         # Specifies to use TWAP execution algorithm, Default: whole
       twap:                    # Split parent order into 4 TWAP child orders, each after 2.5 seconds 
-        slices: 1              # 4 separate orders
-        interval_secs: 5       # 2.5 seconds between orders
+        slices: 1              # number of separate orders
+        interval_secs: 5       # seconds between orders
       use_limit_orders: false  # whether to use LIMIT orders or MARKET-only
       limit_offset_bps: 0.005  # +-5% LIMIT order placed
       max_retries: 3           # n of retries if order is unsuccessfull before cancelling the remaining portion
@@ -245,13 +246,13 @@ STRATEGY:
     # Liquidity constraints   
     liquidity:
       adv_lookback: 20D     # Look-back window to compute Average Daily Volume (ADV)
-      max_adv_pct:  0.10    # Max trade size = 5% of average daily traded volume for that instrument to use for weights 
+      max_adv_pct:  0.20    # Max trade size = 20% of average daily traded volume for that instrument to use for weights 
 
     # Risk Management
     risk:
-      max_weight_abs:            0.5                # Max x% NAV per single position        (concentration limit)
-      drawdown_max:              0.15               # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
-      trailing_stop_max:         0.05               # % trailing stop from HWM/LWM 5% for single instrument
+      max_weight_abs:     0.5                # Max x% NAV per single position        (concentration limit)
+      drawdown_max:       0.15               # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
+      trailing_stop_max:  0.05               # % trailing stop from HWM/LWM 5% for single instrument
       target_volatility:  0.05               # 15% tarket volatility for efficient risk optimizer             
         
       #max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
@@ -280,7 +281,7 @@ STRATEGY:
       default: "60B"
       optuna:
         optuna_type: categorical
-        choices: ["30B", "60B"]
+        choices: ["10B", "20B"]
     
     
     #risk_target_volatility_annual:           # Volatility target (Hull, risk parity) 15 % only for "efficient_risk" optimizer 

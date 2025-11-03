@@ -16,7 +16,7 @@ import os, math, json, shutil, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import time
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Tuple
 from click import Option
 import pandas as pd
 from pandas.tseries.offsets import BaseOffset
@@ -65,6 +65,7 @@ class UMIModel(nn.Module):
         target_idx: int = 3,  # usually "close" is at index 3
         save_backups: bool = False,         # Flag for saving backups during walk-forward
         model_dir: Path = Path("logs/UMIModel"),
+        n_retrains_on_valid: int = 0,
         calendar: str = 'NYSE',
 
         **hparams,
@@ -86,6 +87,7 @@ class UMIModel(nn.Module):
         self.train_offset   = train_offset                                                          # time window for training
         self.valid_end      = pd.Timestamp(valid_end)                                               # end of validation date
         self.valid_split = valid_split                                                              # train/valid split of full training dataset.
+        self.n_retrains_on_valid = n_retrains_on_valid                                              # number of rollowing retrains and validations on the whole validation period
         assert self.valid_end >= self.train_end, "Validation end date must be after training end date."
 
         self.save_backups   = save_backups                                                          # whether to save backups during walk-forward
@@ -115,7 +117,7 @@ class UMIModel(nn.Module):
         self.hp = self._default_hparams()                                                           # hyper-parameters
         self.hp.update(hparams)                                                                     # updated with those defined in the yaml config
         self.warm_start          = warm_start                                                      # warm start when stock is deleted or retrain delta elapsed
-        self.warm_training_epochs = warm_training_epochs if warm_start is not None else self.n_epochs
+        self.warm_training_epochs = warm_training_epochs if warm_start and warm_training_epochs else self.n_epochs
         self._global_epoch = 0                                                                      # global epoch counter for stats
         self._epoch_logs = []                                                                       # useful during full strategy run to track updates() and reinitializations
 
@@ -150,9 +152,16 @@ class UMIModel(nn.Module):
         # Train from scratch
         if logger:
             logger.info(f"[initialize] Training for {self.n_epochs} epochs...")
-        start = self.train_start + freq2pdoffset(self.freq)
-        end = self.valid_end
-        best_val = self._train(data, self.n_epochs, active_mask, total_bars = total_bars, start=start, end=end, )
+
+        # Use rolling validation if configured
+        if self.n_retrains_on_valid > 0:
+            best_val = self._train_with_rolling_validation(data, self.n_epochs, active_mask, total_bars)
+        else:
+            # Single train/valid split
+            full_tensor, _ = build_tensor(data, total_bars, self.F, self._device)
+            train_bars = int(total_bars * (1 - self.valid_split))
+            train_loader, valid_loader = self._create_loaders(full_tensor, train_bars, total_bars)
+            best_val, _ = self._train(train_loader, valid_loader, self.n_epochs)
         
         # Save initial state
         torch.save(self.state_dict(), self.model_dir / "init.pt")
@@ -185,7 +194,7 @@ class UMIModel(nn.Module):
 
         if not self.warm_start:
             if logger:
-                logger.info(f"[update] Warm-start disabled. Initialization on most updated window up until: {current_time}")
+                logger.info(f"[update] Reinitializing (warm_start=False)")
     
             # Reinitialize with new windows
             self._is_initialized = False
@@ -207,13 +216,15 @@ class UMIModel(nn.Module):
                 if logger:
                     logger.info(f"[update] Failed to load weights: {e}, training from scratch")
                 self._is_initialized = False
-                self.initialize(data)
+                self.initialize(data, total_bars)
                 return
         else:
             raise ImportError("Could not find latest.pt warmed-up model in ", self.model_dir)
         
-        # Train
-        _ = self._train(data, epochs, active_mask, start=retrain_start_date, end=current_time, total_bars = total_bars)
+        # Train without validation
+        full_tensor, _ = build_tensor(data, total_bars, self.F, self._device)
+        train_loader, _ = self._create_loaders(full_tensor, total_bars, None)
+        _, _ = self._train(train_loader, None, epochs)
         
         # Save backup if requested
         if self.save_backups:
@@ -395,7 +406,28 @@ class UMIModel(nn.Module):
     # ----------------------------------------------------------------- #
     # ---------------- training utilities ----------------------------- #
     # ----------------------------------------------------------------- #
-    def _train(self, data: Dict[str, DataFrame], n_epochs: int, active_mask: torch.Tensor, start: Timestamp, end: Timestamp, total_bars: int) -> float:
+    
+    def _create_loaders(self, tensor: torch.Tensor, train_end: int, 
+                        valid_end: Optional[int] = None) -> Tuple[DataLoader, Optional[DataLoader]]:
+        """Create train/valid loaders from tensor slices."""
+        train_ds = SlidingWindowDataset(tensor[:train_end], self.L, self.pred_len, self.target_idx)
+        train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True)
+        
+        valid_loader = None
+        if valid_end and valid_end > train_end:
+            valid_tensor = tensor[train_end:valid_end]
+            assert len(valid_tensor) >= self.L + self.pred_len, f"Need to extend validation period: missing {self.L + self.pred_len - len(valid_tensor)} bars"
+            valid_ds = SlidingWindowDataset(valid_tensor, self.L, self.pred_len, self.target_idx)
+            valid_loader = DataLoader(valid_ds, batch_size=self.batch_size, shuffle=False)
+        
+        return train_loader, valid_loader
+    
+    def _train(self,     
+                train_loader: DataLoader,
+                valid_loader: Optional[DataLoader],
+                n_epochs: int,
+                global_epoch: int = 0,
+                ) -> Tuple[float, int]:
         """
         Unified training function that handles all three training modes:
         - "joint": Train all components together
@@ -406,39 +438,12 @@ class UMIModel(nn.Module):
         """
         if logger:
             logger.info(f"[_train] Starting training with mode: {self.training_mode.capitalize()}")
-        
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # 1. DATA PREPARATION
-        # ═══════════════════════════════════════════════════════════════════════════════
 
         if self.valid_end < self.train_end:
             raise ValueError(f"Validation end date: {self.valid_end} is earlier that end train end date {self.train_end}")
-        
-        full_tensor, data_mask = build_tensor(data, total_bars, self.F, self._device)
-
-        assert len(data) > 0
-        # Calculate split point by bar count
-        has_validation = self.train_end < end
-        valid_loader = None
-        if has_validation:
-            train_bars = int(total_bars * (1 - self.valid_split)) 
-            train_tensor, train_mask = full_tensor[:train_bars], data_mask
-            valid_tensor, valid_mask = full_tensor[train_bars:], data_mask
-            assert torch.equal(valid_mask, active_mask), "Active mask mismatch"
-            # Build validation dataset
-            valid_dataset = SlidingWindowDataset(valid_tensor, self.L, self.pred_len, target_idx=self.target_idx)
-            valid_loader = DataLoader(valid_dataset, batch_size=self.batch_size, shuffle=False)
-        else:
-            train_tensor, train_mask = full_tensor, data_mask
-            valid_tensor = torch.tensor(0)
-            assert torch.equal(train_mask, active_mask), "Active mask mismatch" 
-        
-        # Build training dataset
-        train_dataset = SlidingWindowDataset(train_tensor, self.L, self.pred_len, target_idx=self.target_idx)
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
 
         # ═══════════════════════════════════════════════════════════════════════════════
-        # 2. OPTIMIZERS SETUP
+        # 1. OPTIMIZERS SETUP
         # ═══════════════════════════════════════════════════════════════════════════════
         
         optimizer_stock = torch.optim.AdamW(
@@ -460,32 +465,32 @@ class UMIModel(nn.Module):
         )
         
         # ═══════════════════════════════════════════════════════════════════════════════
-        # 3. TRAINING STATE INITIALIZATION
+        # 2. TRAINING STATE INITIALIZATION
         # ═══════════════════════════════════════════════════════════════════════════════
         
         best_validation_loss = float('inf')
-        global_epoch = 0
+        has_validation = valid_loader is not None
         
         # ═══════════════════════════════════════════════════════════════════════════════
-        # 4. TRAINING MODE DISPATCH
+        # 3. TRAINING MODE DISPATCH
         # ═══════════════════════════════════════════════════════════════════════════════
         
         if self.training_mode == "hybrid":
-            best_validation_loss = self._train_hybrid_mode(
+            best_validation_loss, global_epoch = self._train_hybrid_mode(
                 train_loader, valid_loader, has_validation,
                 optimizer_stock, optimizer_market, optimizer_forecaster,
                 n_epochs, best_validation_loss, global_epoch
             )
             
         elif self.training_mode == "sequential":
-            best_validation_loss = self._train_sequential_mode(
+            best_validation_loss, global_epoch = self._train_sequential_mode(
                 train_loader, valid_loader, has_validation,
                 optimizer_stock, optimizer_market, optimizer_forecaster,
                 n_epochs, best_validation_loss, global_epoch
             )
             
         else:  # "joint" mode (default) - safe fallback
-            best_validation_loss = self._train_joint_mode(
+            best_validation_loss, global_epoch = self._train_joint_mode(
                 train_loader, valid_loader, has_validation,
                 optimizer_stock, optimizer_market, optimizer_forecaster,
                 n_epochs, best_validation_loss, global_epoch
@@ -493,12 +498,56 @@ class UMIModel(nn.Module):
         
         if logger:
             logger.info(f"[_train] Training completed. Best validation loss: {best_validation_loss:.6f}")
-        return best_validation_loss
+        return best_validation_loss, global_epoch
 
+    def _train_with_rolling_validation(
+        self,
+        data: Dict[str, DataFrame],
+        n_epochs: int,
+        active_mask: torch.Tensor,
+        total_bars: int,
+    ) -> float:
+        """Train with rolling validation across n_retrains_on_valid folds."""
+        
+        full_tensor, data_mask = build_tensor(data, total_bars, self.F, self._device)
+        assert torch.equal(data_mask, active_mask), "Active mask mismatch"
+        
+        # Calculate fold boundaries
+        n_folds = 1 + self.n_retrains_on_valid
+        train_bars = int(total_bars * (1 - self.valid_split))
+        fold_size = (total_bars - train_bars) // n_folds
+        
+        if fold_size < self.L + self.pred_len:
+            logger.warning(f"Validation data too small ({fold_size} bars) to train with rolling validation. Using Single Validation")
+            train_loader, valid_loader = self._create_loaders(full_tensor, train_bars, total_bars)
+            best_val, _ = self._train(train_loader, valid_loader, n_epochs, global_epoch=0)
+            return best_val
+
+        best_overall = float('inf')
+        global_epoch = 0  # Cumulative across all folds
+        
+        # Rolling validation: expanding train window, sequential validation folds
+        for fold_idx in range(n_folds):
+            train_end = train_bars + fold_idx * fold_size
+            valid_end = train_end + fold_size if fold_idx < n_folds - 1 else total_bars
+            
+            # First fold: full training, subsequent: warm-up only
+            fold_epochs = n_epochs if fold_idx == 0 else self.warm_training_epochs
+
+            logger.info(f"Train rolling on validation {fold_idx+1}/{n_folds}: train[:{train_end}] valid[{train_end}:{valid_end}]")
+            
+            train_loader, valid_loader = self._create_loaders(full_tensor, train_end, valid_end)
+            fold_best, global_epoch = self._train(train_loader, valid_loader, fold_epochs, global_epoch)
+            
+            best_overall = min(best_overall, fold_best)
+        
+
+        logger.info(f"Rolling validation complete: {global_epoch} total epochs, best loss: {best_overall:.6f}")
+        return best_overall
 
     def _train_joint_mode(self, train_loader, valid_loader, has_validation,
                         optimizer_stock, optimizer_market, optimizer_forecaster,
-                        n_epochs, best_validation_loss, global_epoch):
+                        n_epochs, best_validation_loss, global_epoch) -> Tuple[float, int]:
         """Train all components jointly for n_epochs."""
         
         if logger:
@@ -530,12 +579,11 @@ class UMIModel(nn.Module):
             self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
             global_epoch += 1
         
-        return best_validation_loss
-
+        return best_validation_loss, global_epoch
 
     def _train_hybrid_mode(self, train_loader, valid_loader, has_validation,
                         optimizer_stock, optimizer_market, optimizer_forecaster,
-                        n_epochs, best_validation_loss, global_epoch):
+                        n_epochs, best_validation_loss, global_epoch) -> Tuple[float, int]:
         """Hybrid training: Stage-1 pretraining + joint fine-tuning."""
         
         # ═══════════════════════════════════════════════════════════════════════════════
@@ -602,12 +650,12 @@ class UMIModel(nn.Module):
             self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
             global_epoch += 1
         
-        return best_validation_loss
+        return best_validation_loss, global_epoch
 
 
     def _train_sequential_mode(self, train_loader, valid_loader, has_validation,
                             optimizer_stock, optimizer_market, optimizer_forecaster,
-                            n_epochs, best_validation_loss, global_epoch):
+                            n_epochs, best_validation_loss, global_epoch) -> Tuple[float, int]:
         """Sequential training: Stage-1 with early stopping + Stage-2 only."""
         
         # ═══════════════════════════════════════════════════════════════════════════════
@@ -714,7 +762,7 @@ class UMIModel(nn.Module):
             self._log_training_metrics(global_epoch, loss_stock, loss_market, loss_pred, validation_loss)
             global_epoch += 1
         
-        return best_validation_loss
+        return best_validation_loss, global_epoch
 
 
     def _execute_training_epoch(self, train_loader, optimizer_stock, optimizer_market, optimizer_forecaster):
