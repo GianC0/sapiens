@@ -51,9 +51,9 @@ from nautilus_trader.model.events import (
     OrderDenied, OrderEmulated, OrderEvent, OrderExpired,
     OrderFilled, OrderInitialized, OrderModifyRejected,
     OrderPendingCancel, OrderPendingUpdate, OrderRejected,
-    OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated
+    OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
+    PositionChanged, PositionClosed, PositionEvent, PositionOpened
 )
-
 logger = logging.getLogger(__name__)
 # ----- project imports -----------------------------------------------------
 from models.interfaces import MarketModel
@@ -301,10 +301,11 @@ class TopKStrategy(Strategy):
         
         logger.info("Final liquidation: closing all positions")
         
-        for position in self.cache.positions_open(venue=self.venue):
-            self.order_manager.close_position(position)
+        for instrument in self.cache.instruments(venue=self.venue):
+            self.close_all_positions(instrument.id)
+            self.cancel_all_orders(instrument.id)
+            self.unsubscribe_instrument(instrument_id = instrument.id)
         
-        self.order_manager.cancel_all_orders()
         self.final_liquidation_happend = True
 
     def on_dispose(self) -> None:
@@ -744,7 +745,16 @@ class TopKStrategy(Strategy):
         """Auto-submit risk orders on fills."""
         if self.order_manager:
             self.order_manager.on_order_filled(event)
-        
+   
+    def on_order_event(self, event: OrderEvent) -> None:
+        """Catch-all for any unhandled order events."""
+        pass
+
+    # ================================================================= #
+    # POSITION MANAGEMENT
+    # ================================================================= #
+
+    def on_position_opened(self, event: PositionOpened) -> None:
         # Submit risk orders for new positions
         instrument_id = event.instrument_id
         positions = self.cache.positions(instrument_id=instrument_id)
@@ -752,19 +762,44 @@ class TopKStrategy(Strategy):
         if positions:
             for position in positions:
                 if position.quantity != 0:
-                    self._submit_risk_orders_for_position(position, float(event.last_px))
-   
-#    def on_order_event(self, event: OrderEvent) -> None:
-#        """Catch-all for any unhandled order events."""
-#        if self.order_manager:
-#            self.order_manager.handle_order_event(event)
+                     # Calculate stop prices
+                    if float(position.signed_qty) < 0:
+                        order_side = OrderSide.SELL
+                    else:
+                        order_side = OrderSide.BUY
+                    
+                    # Submit trailing stop order
+                    trailing_order = self.order_factory.trailing_stop_market(
+                        instrument_id=instrument_id,
+                        order_side=order_side,
+                        quantity=Quantity.from_int(abs(int(position.quantity))),
+                        trigger_type=TriggerType.LAST_PRICE,
+                        trigger_price = None,
+                        trailing_offset=Decimal(self.trailing_stop_max * 10000),
+                        trailing_offset_type=TrailingOffsetType.BASIS_POINTS,
+                    )
+                    
+                    self.submit_order(trailing_order)
 
-    # ================================================================= #
-    # POSITION MANAGEMENT
-    # ================================================================= #
+    def on_position_changed(self, event: PositionChanged) -> None:
+        pass
 
-    # TODO: use the position_management.py file
+    def on_position_closed(self, event: PositionClosed) -> None:
+        
+        # Cancel STOP LOSS risk orders closed position
+        instrument_id = event.instrument_id
+        positions = self.cache.positions(instrument_id=instrument_id)
+        
+        if positions:
+            for position in positions:
+                if position.is_closed :
+                    # Cancel all pending orders
+                    self.cancel_all_orders(instrument_id = instrument_id )
 
+    def on_position_event(self, event: PositionEvent) -> None:  # All position event messages are eventually passed to this handler
+        pass
+    
+    
     # ================================================================= #
     # ACCOUNT & PORTFOLIO 
     # ================================================================= #
@@ -841,25 +876,7 @@ class TopKStrategy(Strategy):
         position_id = str(position.id)
     
         
-        # Calculate stop prices
-        if position.is_long:
-            order_side = OrderSide.SELL
-        else:
-            order_side = OrderSide.BUY
-        
-        # Submit trailing stop order
-        trailing_order = self.order_factory.trailing_stop_market(
-            instrument_id=instrument_id,
-            order_side=order_side,
-            quantity=Quantity.from_int(abs(int(position.quantity))),
-            #trigger_type=TriggerType.LAST_PRICE,
-            #trigger_price = ,
-            trailing_offset=Decimal(self.trailing_stop_max * 10000),
-            trailing_offset_type=TrailingOffsetType.BASIS_POINTS,
-        )
-        
-        if trailing_order:
-            self.submit_order(trailing_order)
+
 
         
     def _cache_to_dict(self, window: Optional[int]) -> Dict[str, pd.DataFrame]:

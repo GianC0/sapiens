@@ -9,6 +9,7 @@ mlruns/
 data/
 .env
 .vscode
+.README.md
 
 # C extensions
 *.so

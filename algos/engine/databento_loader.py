@@ -8,8 +8,6 @@ from typing import Dict, List, Optional, Iterator
 import databento as db
 import logging
 from tqdm import tqdm
-import gc
-import psutil
 
 import pandas as pd
 import pandas_market_calendars as market_calendars

@@ -162,22 +162,19 @@ class OrderManager:
     # =========================================================================
 
     def rebalance_portfolio(self, target_weights: Dict[str, float], universe: List[str]) -> None:
-        """Rebalance using order lists to ensure sells complete before buys."""
+        """Rebalance using sequential execution: sells complete before buys."""
         nav = self.strategy._calculate_portfolio_nav()
-        cash_free = float(self.strategy.portfolio.account(self.strategy.venue).balance_free(self.strategy.strategy_params["currency"]))
         if nav <= 0:
             logger.error(f"Invalid NAV: {nav}")
             return
         
-        # Group by cash flow direction
         sells = []
-        buys_dict = {}
+        buys = []
         
         for symbol in universe:
             target_weight = target_weights.get(symbol, 0.0)
             instrument_id = InstrumentId.from_str(symbol)
-            # only one position as only LONG is supported
-                       
+            
             net_qty = self._get_net_position_qty(instrument_id)
             price = self._get_current_price(instrument_id)
             if not price:
@@ -190,95 +187,46 @@ class OrderManager:
                 continue
             
             if order_qty < 0:  # Sell
-                # NOTE: assuming only one position since SHORTING is not supported yet
-                pos_id = self.strategy.cache.positions(instrument_id = instrument_id)[0].id
                 sell_order = self.strategy.order_factory.market(
                     instrument_id=instrument_id,
-                    order_side= OrderSide.SELL,
-                    quantity=Quantity.from_int(int(abs(order_qty))),
+                    order_side=OrderSide.SELL,
+                    quantity=Quantity.from_int(abs(int(order_qty))),
                     time_in_force=self.timing_force,
                     exec_algorithm_id=ExecAlgorithmId("TWAP"),
-                    exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
-                    reduce_only=True,
-                    )
-                
-                # Submit sell order and keep tracking order with id
-                self.strategy.submit_order(order = sell_order, position_id = pos_id )
+                    exec_algorithm_params={
+                        "horizon_secs": self.twap_slices * self.twap_interval,
+                        "interval_secs": self.twap_interval
+                    },
+                    reduce_only=True,)
                 sells.append(sell_order)
-                
+
+                # Submit sells first (no position_id needed for NETTING)
+                self.strategy.submit_order(sell_order)
             
-            else:  # Create Buy orders but do not submit yet
-                buys_dict[instrument_id] = int(abs(order_qty)) 
-
-
-        # Ensure proper contigency on buy orders if sells are needed first
-        for bo_id, qty in buys_dict.items():
-            # Ensure to submit buy orders list after all sell orders are filled
-            if sells: 
-                buy_order = MO(
-                    trader_id=self.strategy.trader_id,
-                    strategy_id=self.strategy.id,
-                    #client_order_id = self.strategy.client_order_id,
-                    instrument_id=bo_id,
-                    order_side= OrderSide.BUY,
-                    quantity=Quantity.from_int(int(abs(qty))),
-                    time_in_force=self.timing_force,
-                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
-                    exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
-                    contingency_type=ContingencyType.OTO,
-                    linked_order_ids=[so.client_order_id for so in sells],
-                    )
-
-            # Just submit buy orders asap   
-            else:
+            else:  # Buy   
                 buy_order = self.strategy.order_factory.market(
-                    instrument_id=bo_id,
-                    order_side= OrderSide.BUY,
-                    quantity=Quantity.from_int(int(abs(qty))),
+                    instrument_id=instrument_id,
+                    order_side=OrderSide.BUY,
+                    quantity=Quantity.from_int(abs(int(order_qty))),
                     time_in_force=self.timing_force,
                     exec_algorithm_id=ExecAlgorithmId("TWAP"),
-                    exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
-                    )
-            
+                    exec_algorithm_params={
+                        "horizon_secs": self.twap_slices * self.twap_interval,
+                        "interval_secs": self.twap_interval
+                    },
+                )
+                buys.append(buy_order)
+        
+        # Submit buys as contingent order list if sells exist
+        # TODO: current Nautilus implementation of buy orders linked to seels is incomplete.
+        # the current implementation will: try submit buys asap and retry config.max_retries times.
+        # in future consider using the following to ensure buys are executed after sells:
+        # contingency_type=ContingencyType.OTO,
+        # linked_order_ids=[s.client_order_id for s in sells]
+
+        for buy_order in buys:
             self.strategy.submit_order(buy_order)
 
-    
-    def close_all_positions(self, instrument_id: InstrumentId, reason: str = "close") -> None:
-        """
-        Close all positions for an instrument (handles LONG and SHORT positions).
-        
-        Args:
-            instrument: Instrument to close
-            reason: Reason for closing (stop_loss, trailing_stop, etc.)
-        """
-        positions_closed = False
-
-         # Close all positions for this instrument (handles HEDGING)
-        for position in self.strategy.cache.positions_open():
-            if position.instrument_id == instrument_id:
-                logger.info(f"Closing position {position.id}: {position.signed_qty} units ({reason})")
-                
-                # Determine order side to close position
-                if position.is_long:
-                    order_side = OrderSide.SELL
-                else:
-                    order_side = OrderSide.BUY
-                
-                # create order
-                close_order = self.strategy.order_factory.market(
-                    instrument_id=position.instrument_id,
-                    order_side=order_side,
-                    quantity=Quantity.from_int(abs(int(position.quantity))),
-                    time_in_force=self.timing_force,
-                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
-                    exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
-                    reduce_only = True
-                )
-                if close_order:
-                    self.strategy.submit_order(close_order)
-                    positions_closed = True
-        if not positions_closed:
-            logger.info(f"No positions to close for {instrument_id}")
     
     def close_position(self, position: Position):
         """Close a specific position."""
@@ -302,24 +250,6 @@ class OrderManager:
         if order:
             self.strategy.submit_order(order)
 
-    def liquidate_all(self, symbols: List[str]) -> None:
-        """
-        Emergency liquidation of all positions.
-        
-        Args:
-            symbols: List of symbols to liquidate
-        """
-        logger.warning("Emergency liquidation triggered")
-        
-        # Close all positions abd  Unsubscribe from all data
-        for symbol in symbols:
-            instrument_id = InstrumentId(Symbol(symbol), self.strategy.venue)
-            self.close_all_positions(instrument_id, reason="emergency_liquidation")
-            self.strategy.unsubscribe_instrument(instrument_id = instrument_id)
-        
-        # Cancel all pending orders
-        self.cancel_all_orders()
-        return
         
 
 
@@ -407,7 +337,8 @@ class OrderManager:
     def on_order_expired(self, event: OrderExpired) -> None:
         """Handle order expiration."""
         logger.info(f"Order expired: {event.client_order_id}")
-        self._handle_order_failure(event)
+        #self._handle_order_failure(event)
+        pass
     
     def on_order_triggered(self, event: OrderTriggered) -> None:
         """Handle stop/limit order trigger."""
@@ -471,19 +402,6 @@ class OrderManager:
     # Order Execution Methods (Internal)
     # =========================================================================
     
-    def cancel_all_orders(self, instrument_id: Optional[InstrumentId] = None) -> None:
-        """
-        Cancel all pending orders, optionally for a specific instrument.
-        
-        Args:
-            instrument_id: Optional instrument filter
-        """
-        orders = self.strategy.cache.orders_open()
-        
-        for order in orders:
-            if instrument_id is None or order.instrument_id == instrument_id:
-                self.strategy.cancel_order(order)
-                logger.info(f"Canceling order: {order.client_order_id}")
 
 
     def _create_limit_order(
@@ -551,26 +469,57 @@ class OrderManager:
             event: Order failure event
         """
         order_id = str(event.client_order_id)
+
+        # Retrieve original order from cache
+        original_order = self.strategy.cache.order(event.client_order_id)
+        if not original_order:
+            logger.error(f"Cannot retry {order_id}: order not found in cache")
+            return
         
         # Check retry count
         self.order_retries[order_id] += 1
         
         if self.order_retries[order_id] < self.max_order_retries:
-            logger.info(
-                f"Retrying order {order_id} "
-                f"(attempt {self.order_retries[order_id] + 1}/{self.max_order_retries})"
-            )
-            # Re-submit logic would go here based on original order parameters
-            # This would need to be stored when order is first created
+            
+            # Resubmit same order
+            if original_order.order_type == OrderType.MARKET:
+                retry_order = self.strategy.order_factory.market(
+                    instrument_id=original_order.instrument_id,
+                    order_side=original_order.side,
+                    quantity=original_order.quantity,
+                    time_in_force=original_order.time_in_force,
+                    exec_algorithm_id=original_order.exec_algorithm_id,
+                    exec_algorithm_params=original_order.exec_algorithm_params,
+                    reduce_only=original_order.is_reduce_only,
+                )
+            elif original_order.order_type == OrderType.LIMIT:
+                retry_order = self.strategy.order_factory.limit(
+                    instrument_id=original_order.instrument_id,
+                    order_side=original_order.side,
+                    quantity=original_order.quantity,
+                    price=original_order.price,
+                    time_in_force=original_order.time_in_force,
+                    exec_algorithm_id=original_order.exec_algorithm_id,
+                    exec_algorithm_params=original_order.exec_algorithm_params,
+                    reduce_only=original_order.is_reduce_only,
+                )
+            else:
+                logger.warning(f"Order type {original_order.order_type} not supported for retry")
+                return
+            
+            logger.info(f"Resubmission attempt for order {order_id} as {retry_order.client_order_id} ({self.order_retries[order_id] + 1}/{self.max_order_retries})")
+            self.order_retries[str(retry_order.client_order_id)] = self.order_retries[order_id]
+            self.strategy.submit_order(retry_order)
+            
         else:
             logger.error(f"Max retries exceeded for order {order_id}")
             self.rejected_orders[str(event.instrument_id)].append(event)
             
-            # Clean up
-            if order_id in self.pending_orders:
-                del self.pending_orders[order_id]
-            if order_id in self.order_retries:
-                del self.order_retries[order_id]
+        # Clean up
+        if order_id in self.pending_orders:
+            del self.pending_orders[order_id]
+        if order_id in self.order_retries:
+            del self.order_retries[order_id]
     
     def _calculate_slippage(self, fill_event: OrderFilled) -> None:
         """
