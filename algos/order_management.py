@@ -3,6 +3,7 @@ Order Management Module for Backtest Strategies.
 Handles all order-related events and execution logic.
 """
 from __future__ import annotations
+from re import I
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
 import numpy as np
@@ -174,7 +175,9 @@ class OrderManager:
         
         for symbol in universe:
             target_weight = target_weights.get(symbol, 0.0)
-            instrument_id = InstrumentId.from_str(symbol)            
+            instrument_id = InstrumentId.from_str(symbol)
+            # only one position as only LONG is supported
+                       
             net_qty = self._get_net_position_qty(instrument_id)
             price = self._get_current_price(instrument_id)
             if not price:
@@ -187,6 +190,8 @@ class OrderManager:
                 continue
             
             if order_qty < 0:  # Sell
+                # NOTE: assuming only one position since SHORTING is not supported yet
+                pos_id = self.strategy.cache.positions(instrument_id = instrument_id)[0].id
                 sell_order = self.strategy.order_factory.market(
                     instrument_id=instrument_id,
                     order_side= OrderSide.SELL,
@@ -194,10 +199,11 @@ class OrderManager:
                     time_in_force=self.timing_force,
                     exec_algorithm_id=ExecAlgorithmId("TWAP"),
                     exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
+                    reduce_only=True,
                     )
                 
                 # Submit sell order and keep tracking order with id
-                self.strategy.submit_order(sell_order)
+                self.strategy.submit_order(order = sell_order, position_id = pos_id )
                 sells.append(sell_order)
                 
             
@@ -211,8 +217,8 @@ class OrderManager:
             if sells: 
                 buy_order = MO(
                     trader_id=self.strategy.trader_id,
-                    strategy_id=self.strategy.strategy_id,
-                    client_order_id = self.strategy.client_order_id,
+                    strategy_id=self.strategy.id,
+                    #client_order_id = self.strategy.client_order_id,
                     instrument_id=bo_id,
                     order_side= OrderSide.BUY,
                     quantity=Quantity.from_int(int(abs(qty))),
@@ -266,7 +272,7 @@ class OrderManager:
                     time_in_force=self.timing_force,
                     exec_algorithm_id=ExecAlgorithmId("TWAP"),
                     exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
-
+                    reduce_only = True
                 )
                 if close_order:
                     self.strategy.submit_order(close_order)
@@ -289,6 +295,7 @@ class OrderManager:
             time_in_force=self.timing_force,
             exec_algorithm_id=ExecAlgorithmId("TWAP"),
             exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
+            reduce_only = True
         )
         
         # Submit order
