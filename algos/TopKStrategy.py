@@ -38,7 +38,7 @@ from nautilus_trader.model.data import Bar, BarType, InstrumentStatus, Instrumen
 from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.orders import MarketOrder
-from nautilus_trader.model.enums import OrderSide, TriggerType, TrailingOffsetType
+from nautilus_trader.model.enums import OrderSide, TriggerType, TrailingOffsetType, OrderType
 from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Currency
@@ -742,7 +742,7 @@ class TopKStrategy(Strategy):
             self.order_manager.handle_order_event(event)
     
     def on_order_filled(self, event: OrderFilled) -> None:
-        """Auto-submit risk orders on fills."""
+        """Register fill order stats."""
         if self.order_manager:
             self.order_manager.on_order_filled(event)
    
@@ -755,46 +755,46 @@ class TopKStrategy(Strategy):
     # ================================================================= #
 
     def on_position_opened(self, event: PositionOpened) -> None:
-        # Submit risk orders for new positions
-        instrument_id = event.instrument_id
-        positions = self.cache.positions(instrument_id=instrument_id)
-        
-        if positions:
-            for position in positions:
-                if position.quantity != 0:
-                     # Calculate stop prices
-                    if float(position.signed_qty) < 0:
-                        order_side = OrderSide.SELL
-                    else:
-                        order_side = OrderSide.BUY
-                    
-                    # Submit trailing stop order
-                    trailing_order = self.order_factory.trailing_stop_market(
-                        instrument_id=instrument_id,
-                        order_side=order_side,
-                        quantity=Quantity.from_int(abs(int(position.quantity))),
-                        trigger_type=TriggerType.LAST_PRICE,
-                        trigger_price = None,
-                        trailing_offset=Decimal(self.trailing_stop_max * 10000),
-                        trailing_offset_type=TrailingOffsetType.BASIS_POINTS,
-                    )
-                    
-                    self.submit_order(trailing_order)
+
+        # Submit initial trailing stop order
+        trailing_order = self.order_factory.trailing_stop_market(
+            instrument_id=event.instrument_id,
+            order_side=OrderSide.SELL,
+            quantity=event.quantity,
+            trigger_type=TriggerType.LAST_PRICE,
+            trigger_price = None,
+            trailing_offset=Decimal(self.trailing_stop_max * 10000),
+            trailing_offset_type=TrailingOffsetType.BASIS_POINTS,
+        )
+        self.submit_order(trailing_order)
 
     def on_position_changed(self, event: PositionChanged) -> None:
-        pass
+        
+        instrument_id = event.instrument_id
+
+        # cancel last trailing order to update the order quantity
+        for order in self.cache.orders(instrument_id = instrument_id, side = OrderSide.SELL):
+            if order.order_type == OrderType.TRAILING_STOP_MARKET:
+                self.cancel_order(order)
+                break
+
+        # Submit another trailing stop order with updated quantity to liquidate
+        trailing_order = self.order_factory.trailing_stop_market(
+            instrument_id=instrument_id,
+            order_side=OrderSide.SELL,
+            quantity=event.quantity,
+            trigger_type=TriggerType.LAST_PRICE,
+            trigger_price = None,
+            trailing_offset=Decimal(self.trailing_stop_max * 10000),
+            trailing_offset_type=TrailingOffsetType.BASIS_POINTS,
+        )
+        self.submit_order(trailing_order)
 
     def on_position_closed(self, event: PositionClosed) -> None:
         
-        # Cancel STOP LOSS risk orders closed position
+        # Cancel all risk orders when position is closed ( mainly for TRAILING STOP MARKET)
         instrument_id = event.instrument_id
-        positions = self.cache.positions(instrument_id=instrument_id)
-        
-        if positions:
-            for position in positions:
-                if position.is_closed :
-                    # Cancel all pending orders
-                    self.cancel_all_orders(instrument_id = instrument_id )
+        self.cancel_all_orders( instrument_id = instrument_id )
 
     def on_position_event(self, event: PositionEvent) -> None:  # All position event messages are eventually passed to this handler
         pass

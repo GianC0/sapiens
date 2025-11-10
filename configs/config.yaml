@@ -241,7 +241,7 @@ STRATEGY:
         interval_secs: 5       # seconds between orders
       use_limit_orders: false  # whether to use LIMIT orders or MARKET-only
       limit_offset_bps: 0.005  # +-5% LIMIT order placed
-      max_retries: 5           # n of retries if order is unsuccessfull before cancelling the remaining portion
+      max_retries: 3           # n of retries if order is unsuccessfull before cancelling the remaining portion
 
     # Liquidity constraints   
     liquidity:

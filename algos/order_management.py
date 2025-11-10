@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from nautilus_trader.model import ExecAlgorithmId
 from nautilus_trader.model.objects import Price, Quantity, Money
 from nautilus_trader.model.orders import Order, OrderList
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.enums import ContingencyType, AggregationSource
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.events import (
@@ -21,9 +22,8 @@ from nautilus_trader.model.events import (
     OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated
 )
 from nautilus_trader.model.orders import (
-    Order,
-    MarketOrder as MO, StopMarketOrder as SM, MarketToLimitOrder as MTL, MarketIfTouchedOrder as MIT, TrailingStopMarketOrder as TSM,
-    LimitOrder as LO, StopLimitOrder as SL, LimitIfTouchedOrder as LIT, TrailingStopLimitOrder as TSL
+    Order, MarketOrder, StopMarketOrder , MarketToLimitOrder, MarketIfTouchedOrder, TrailingStopMarketOrder,
+    LimitOrder, StopLimitOrder, LimitIfTouchedOrder , TrailingStopLimitOrder
 )
 from nautilus_trader.model.enums import OrderSide, TimeInForce, OrderStatus, OrderType
 from nautilus_trader.trading.strategy import Strategy
@@ -34,80 +34,6 @@ from nautilus_trader.model.data import Bar, BarType
 import logging
 
 logger = logging.getLogger(__name__)
-
-# =========================================================================
-# Definition of ORDER paramters by order type
-# =========================================================================
-LIMIT_BASE_REQUIRED = {
-    "trader_id", "strategy_id", "instrument_id", "client_order_id",
-    "order_side", "quantity", "price", "init_id", "ts_init"
-}
-LIMIT_BASE_OPTIONAL = {
-    "time_in_force", "expire_time_ns", "post_only", "reduce_only",
-    "quote_quantity", "display_qty", "emulation_trigger", "trigger_instrument_id",
-    "contingency_type", "order_list_id", "linked_order_ids", "parent_order_id",
-    "exec_algorithm_id", "exec_algorithm_params", "exec_spawn_id", "tags",
-    # activation_price is sometimes present for trailing orders
-    "activation_price"
-}
-MARKET_BASE_REQUIRED = {
-    "trader_id", "strategy_id", "instrument_id", "client_order_id",
-    "order_side", "quantity", "init_id", "ts_init"
-}
-MARKET_BASE_OPTIONAL = {
-    "time_in_force", "expire_time_ns", "reduce_only", "quote_quantity",
-    "contingency_type", "order_list_id", "linked_order_ids", "parent_order_id",
-    "exec_algorithm_id", "exec_algorithm_params", "exec_spawn_id", "tags",
-    # display_qty can be used in MarketToLimit resulting limit
-    "display_qty", "emulation_trigger", "trigger_instrument_id"
-}
-
-# --- Per-order-type incremental requirements ---
-ORDER_SPECS = {
-    # Market-based
-    MO: {
-        "required": set(MARKET_BASE_REQUIRED),
-        "optional": set(MARKET_BASE_OPTIONAL),
-    },
-    SM: {
-        "required": set(MARKET_BASE_REQUIRED) | {"trigger_price", "trigger_type"},
-        "optional": set(MARKET_BASE_OPTIONAL),
-    },
-    MTL: {
-        "required": set(MARKET_BASE_REQUIRED),
-        "optional": set(MARKET_BASE_OPTIONAL) | {"expire_time_ns", "display_qty"},
-    },
-    MIT: {
-        "required": set(MARKET_BASE_REQUIRED) | {"trigger_price", "trigger_type"},
-        "optional": set(MARKET_BASE_OPTIONAL) | {"expire_time_ns", "emulation_trigger", "trigger_instrument_id"},
-    },
-    TSM: {
-        # trigger_price may be nullable/optional per docs; trailing params are required
-        "required": set(MARKET_BASE_REQUIRED) | {"trigger_type", "trailing_offset", "trailing_offset_type"},
-        "optional": set(MARKET_BASE_OPTIONAL) | {"activation_price", "trigger_price"},
-    },
-
-    # Limit-based
-    LO: {
-        "required": set(LIMIT_BASE_REQUIRED),
-        "optional": set(LIMIT_BASE_OPTIONAL),
-    },
-    SL: {
-        "required": set(LIMIT_BASE_REQUIRED) | {"trigger_price", "trigger_type"},
-        "optional": set(LIMIT_BASE_OPTIONAL),
-    },
-    LIT: {
-        "required": set(LIMIT_BASE_REQUIRED) | {"trigger_price", "trigger_type"},
-        "optional": set(LIMIT_BASE_OPTIONAL),
-    },
-    TSL: {
-        # trailing_limit typically requires trailing offsets and limit_offset
-        "required": set(LIMIT_BASE_REQUIRED) | {"trigger_type", "limit_offset", "trailing_offset", "trailing_offset_type"},
-        "optional": set(LIMIT_BASE_OPTIONAL) | {"activation_price", "trigger_price", "price"},
-    },
-}
-    
-
 
 
 class OrderManager:
@@ -169,7 +95,7 @@ class OrderManager:
             return
         
         sells = []
-        buys = []
+        buys = {}
         
         for symbol in universe:
             target_weight = target_weights.get(symbol, 0.0)
@@ -203,19 +129,8 @@ class OrderManager:
                 # Submit sells first (no position_id needed for NETTING)
                 self.strategy.submit_order(sell_order)
             
-            else:  # Buy   
-                buy_order = self.strategy.order_factory.market(
-                    instrument_id=instrument_id,
-                    order_side=OrderSide.BUY,
-                    quantity=Quantity.from_int(abs(int(order_qty))),
-                    time_in_force=self.timing_force,
-                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
-                    exec_algorithm_params={
-                        "horizon_secs": self.twap_slices * self.twap_interval,
-                        "interval_secs": self.twap_interval
-                    },
-                )
-                buys.append(buy_order)
+            else:  # Create Buy but do not submit now   
+                buys[instrument_id] = abs(int(order_qty))
         
         # Submit buys as contingent order list if sells exist
         # TODO: current Nautilus implementation of buy orders linked to seels is incomplete.
@@ -224,8 +139,52 @@ class OrderManager:
         # contingency_type=ContingencyType.OTO,
         # linked_order_ids=[s.client_order_id for s in sells]
 
-        for buy_order in buys:
+        for bo_id, qty in buys.items():
+            # Submit buys directly if no sells were needed to free cash
+            if not sells:
+                buy_order = self.strategy.order_factory.market(
+                    instrument_id=bo_id,
+                    order_side=OrderSide.BUY,
+                    quantity=Quantity.from_int(qty),
+                    time_in_force=self.timing_force,
+                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
+                    exec_algorithm_params={
+                        "horizon_secs": self.twap_slices * self.twap_interval,
+                        "interval_secs": self.twap_interval
+                    },
+                )
+            
+            else:
+                client_order_id = self.strategy.order_factory.generate_client_order_id()
+                buy_order = MarketOrder(
+                    trader_id = self.strategy.order_factory.trader_id,
+                    strategy_id = self.strategy.order_factory.strategy_id,
+                    instrument_id=bo_id,
+                    client_order_id = client_order_id,
+                    order_side=OrderSide.BUY,
+                    quantity=Quantity.from_int(qty),
+                    init_id=UUID4(),
+                    ts_init=self.strategy.clock.timestamp_ns(),
+                    time_in_force=self.timing_force,
+                    reduce_only = False,
+                    contingency_type = ContingencyType.OTO,
+                    linked_order_ids = [so.client_order_id for so in sells],
+                    exec_algorithm_id=ExecAlgorithmId("TWAP"),
+                    exec_algorithm_params={
+                        "horizon_secs": self.twap_slices * self.twap_interval,
+                        "interval_secs": self.twap_interval
+                    },
+                    exec_spawn_id = client_order_id,
+                )
+            
+
             self.strategy.submit_order(buy_order)
+            return
+            # Contingency on sells orders is enforced
+
+
+            
+        
 
     
     def close_position(self, position: Position):
@@ -397,30 +356,6 @@ class OrderManager:
     def on_order_event(self, event: OrderEvent) -> None:
         """Handle any order event not specifically handled above."""
         logger.debug(f"Order event WITHOUT HANDLER: {type(event).__name__} - {event.client_order_id}")
-    
-    # =========================================================================
-    # Order Execution Methods (Internal)
-    # =========================================================================
-    
-
-
-    def _create_limit_order(
-        self,
-        instrument_id: InstrumentId,
-        quantity: int,
-        order_side: OrderSide,
-        price: float
-    ) -> LimitOrder:
-        """Create a limit order."""
-        return self.strategy.order_factory.limit(
-            instrument_id=instrument_id,
-            order_side=order_side,
-            quantity=Quantity.from_int(quantity),
-            price=Price.from_str(str(price)),
-            time_in_force=self.timing_force,
-            exec_algorithm_id=ExecAlgorithmId("TWAP"),
-            exec_algorithm_params={"horizon_secs": self.twap_slices * self.twap_interval , "interval_secs": self.twap_interval},
-        )
         
     
     # =========================================================================
