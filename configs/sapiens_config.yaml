@@ -1,0 +1,76 @@
+#####################################
+## SAPIENS FRAMEWORK CONFIGURATION ##
+#####################################
+
+# Logs
+logs_dir: "logs/"
+# Backtest Period
+backtest_start: "2024-06-01"
+backtest_end: "2024-12-01"
+# Reproducibility
+seed: 2025
+
+# Environment
+# Requires: ANTHROPIC_API_KEY in .env for model generation
+
+# Model Configuration
+SAPIENS_MODEL:
+  model_name: "UMIModel"  # Model to use/generate
+  generate_model: false     # DeepCode Generation (when generate_model=true)
+  
+  generation:
+    source_type: "github"  # "github", "pdf", or "arxiv"
+    source_path: ""        # URL or file path
+    claude_model: "claude-sonnet-4-20250514"
+
+  optimization:
+    tune_hparams: true      # Use Optuna Bayesian search.   
+    n_trials: 2             # Optuna trials of hyper-parameters optimization
+
+# Strategy Configuration  
+SAPIENS_STRATEGY:
+  strategy_name: "TopKStrategy" # Strategy to use
+  tune_hparams:    true         # Use Optuna Bayesian search.   
+  n_trials: 2                   # Optuna trials of hyper-parameters optimization
+
+  # Hyperparameter Optimization
+  optimization:
+    tune_hparams: true
+    n_trials: 2
+    primary_objective:  "total_pnl_pct"     # used to determine the overall single best hp tuning trial in multi-objective optimization       
+    objectives:                             # use only nautilus_trader portfolio_analyzer statistics
+      ## Performance / Returns ##
+      #returns_volatility: minimize      
+      #avg_return: maximize
+      #avg_loss_pct: minimize              
+      #avg_win_pct: maximize
+
+      ## Risk-Adjusted Ratios ##
+      #sharpe_ratio: maximize
+      #sortino_ratio: maximize
+      #profit_factor: maximize
+      #risk_return_ratio: maximize
+
+      ## PnL & Drawdown ##
+      #total_pnl: maximize
+      total_pnl_pct: maximize
+      #max_drawdown: minimize              # reduce max drawdown
+
+      ## Trade-Level Stats ##
+      #max_winner: maximize                # larger best trade is usually good
+      #avg_winner: maximize
+      #min_winner: maximize                # increase the worst winning trade
+      num_trades: minimize
+
+      ## loser/loss metrics — negative sign convention                      ##
+      ## (maximize direction of negatives => tries to bring losses to zero) ##
+      #min_loser: maximize                 # see note above re: sign convention
+      #avg_loser: maximize                 # see note above
+      #max_loser: minimize                 # typically want to reduce the worst loss magnitude
+
+      ## Expectancy & Win Rate ##
+      #expectancy: maximize
+      #win_rate: maximize
+
+  
+

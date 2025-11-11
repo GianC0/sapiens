@@ -1,0 +1,133 @@
+# ---------------------------------------------------------------------------
+#  MODEL CONFIGURATION
+# ---------------------------------------------------------------------------
+MODEL:
+  # Fixed parameters (not optimized)
+  PARAMS:
+    model_name: "UMIModel"
+
+    #  Model Paths
+    logs_dir: "logs/models/"      # Where checkpoints / logs are stored       (general)
+
+    # Model architecture & Data Augmentation
+    pred_len:   1                     # H : prediction horizon (next bar)         (one-step forecast)
+    feature_dim: 5                    # OHLCV + extra features for L1 market data. To be changed if higher level data is avail
+    features_to_load: "candles"       # candles = OHLCV
+    adjust: true                      # wheter to adjust OHLC based on stock splits and dividends
+
+    # Training
+    target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
+    n_epochs:        10          # Epochs on train+valid after hp tuning and rolling initialization
+    batch_size:      32          # Mini-batch size for AdamW                 
+    training_mode: "sequential"  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) -> Stage-1 + Stage-2
+    warm_start:      true        # Enable warm-start  
+    pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
+    patience:        3           # Early-stop patience 
+    save_backups: false          # whether to save backups during walk-forward
+
+
+  # Default hyper-parameters defined by model are overwritten by this Optuna configuration
+  HPARAMS:  # optuna_type: "categorical", low-high (assumed float), int_low-high, log_low-high
+    
+    # Full Training Window.
+    train_offset:
+      default: "12BME"           # BME = business months end
+      optuna:
+        optuna_type: "categorical"
+        choices: ["10B", "15B", "20B"] #, "2BME", "3BME"]
+
+    # Window Length used only for inference 
+    inference_window: 
+      default: "6h"
+      optuna:
+        optuna_type: "categorical"
+        choices: ["1h","3h", "6h"]
+
+    # Light fine-tune epochs
+    warm_training_epochs:      
+      default: 5
+      optuna:
+        optuna_type: int_low-high
+        low: 1
+        high: 10
+
+    # Retrain - fine-tuning window: used to compute validation set 
+    # and by Strategy to retrain the model after a while 
+    retrain_offset:
+      default: "48h"
+      optuna:
+        optuna_type: "categorical"
+        choices: ["10B","20B"] 
+
+    # How many Rolling Retrains on Validation. 0 if no rolling validation
+    # 
+    n_retrains_on_valid:
+      default: 0
+      optuna:
+        optuna_type: "categorical"
+        choices: [0, 1, 2, 3] 
+
+    # λ_IC   : independence loss weight
+    lambda_ic:        
+      default: 0.5
+      optuna:            
+        optuna_type: "categorical"
+        choices: [0, 0.25, 0.5, 0.75, 1]
+
+    # λ_sync : synchronous factor loss 
+    lambda_sync:
+      default: 1.0
+      optuna:
+        optuna_type: "categorical"
+        choices: [0, 0.5, 1, 1.5, 2]
+
+    # λ_rank : rank-IC regulariser
+    lambda_rankic:     
+      default: 0.1
+      optuna:
+        optuna_type: "categorical"
+        choices: [0, 0.05, 0.1, 0.15, 0.2]
+
+    # τ : attention temperature
+    temperature:
+      default: 0.07
+      optuna:
+        optuna_type: low-high
+        low: 0.03
+        high: 0.1
+    
+    # θ_sync : threshold for stock synchrony
+    sync_thr:
+      default: 0.6
+      optuna:
+        optuna_type: low-high
+        low: 0.5
+        high: 0.8
+
+    # α₁: learning-rate Stage-1 (AdamW)
+    lr_stage1:
+      default: 0.001
+      optuna:
+        optuna_type: log_low-high
+        low: 0.0001
+        high: 0.005
+
+    # α₁^ft  : LR when fine-tuning Stage-1 in hybrid mode
+    lr_stage1_ft:
+      default: 0.0001
+      optuna:
+        optuna_type: log_low-high
+        low: 0.0001
+        high: 0.005
+
+    # α₂: learning-rate Forecasting head
+    lr_stage2:
+      default: 0.0001
+      optuna:
+        optuna_type: log_low-high
+        low: 0.00001
+        high: 0.001
+
+    # stays frozen withouyt specifying the optuna values for hp optimization
+    weight_decay: 
+      default: 0.0       

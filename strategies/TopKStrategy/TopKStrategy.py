@@ -1,7 +1,7 @@
 """
 Generic long/short strategy for Nautilus Trader.
 
-* Consumes ANY model that follows interfaces.MarketModel
+* Consumes ANY model that follows SapiensModel
 * Data feed provided by CsvBarLoader (Bar, FeatureBar)
 * Risk controls: draw-down, trailing stops, ADV cap, fee/slippage models
 
@@ -30,7 +30,7 @@ import logging
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.currencies import USD,EUR
 from nautilus_trader.model.objects import Price, Quantity, Money
-from nautilus_trader.common.component import init_logging, Clock, TimeEvent, Logger
+from nautilus_trader.common.component import TimeEvent, Logger
 from nautilus_trader.core.data import Data
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.objects import Price, Quantity
@@ -54,57 +54,43 @@ from nautilus_trader.model.events import (
     OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
     PositionChanged, PositionClosed, PositionEvent, PositionOpened
 )
+
+from models import SapiensModel
 logger = logging.getLogger(__name__)
 # ----- project imports -----------------------------------------------------
-from models.interfaces import MarketModel
-from algos.engine.OptimizerFactory import create_optimizer
+
+from engine.OptimizerFactory import create_optimizer
 from models.utils import freq2pdoffset, freq2barspec
-from algos.order_management import OrderManager
+from engine.OrderManager import OrderManager
 from models.utils import freq2bartype, freq2pdoffset
-#from algos.engine.hparam_tuner import 
-
-
-# ========================================================================== #
-# Strategy Config
-# ========================================================================== #
-
-class TopKStrategyConfig(StrategyConfig, frozen=True):
-    config : Dict[str, Any] = field(default_factory=dict) 
+from strategies.SapiensStrategy import SapiensStrategy, SapiensStrategyConfig
 
 
 # ========================================================================== #
 # Strategy
 # ========================================================================== #
-class TopKStrategy(Strategy):
+class TopKStrategy(SapiensStrategy):
     """
     Long/short TopK equity strategy, model-agnostic & frequency-agnostic.
     """
 
 
     # ------------------------------------------------------------------ #
-    def __init__(self, config: TopKStrategyConfig):  
-        super().__init__()  
-
-        # TODO: quick dirty fix. implement proper typing
-        cfg = config.config
-
+    def __init__(self, config: SapiensStrategyConfig):  
+        super().__init__(config)  
 
         # safe handling of variable
-        currency = cfg["STRATEGY"]["currency"]
+        currency =self.strategy_params["currency"]
         if currency == "USD":
-            cfg["STRATEGY"]["currency"] = Currency(code='USD', precision=3, iso4217=840, name='United States dollar', currency_type = CurrencyType.FIAT ) #
+            self.strategy_params["currency"] = Currency(code='USD', precision=3, iso4217=840, name='United States dollar', currency_type = CurrencyType.FIAT ) #
         elif currency == "EUR":
-            cfg["STRATEGY"]["currency"] = Currency(code='EUR', precision=3, iso4217=978, name='Euro', currency_type=CurrencyType.FIAT)
+            self.strategy_params["currency"] = Currency(code='EUR', precision=3, iso4217=978, name='Euro', currency_type=CurrencyType.FIAT)
         else: # currency is already in nautilus format
             raise Error("Currency not implemented correctly") 
-
-        # create params dictionaries
-        self.strategy_params = cfg["STRATEGY"]
-        self.model_params = cfg["MODEL"]
         
         self.model_params["model_dir"] = Path(self.model_params["model_dir"])
 
-        self.calendar = market_calendars.get_calendar(cfg["STRATEGY"]["calendar"])
+        self.calendar = market_calendars.get_calendar(self.strategy_params["calendar"])
 
         # Core timing parameters
         self.data_load_start = pd.Timestamp(self.strategy_params["data_load_start"])
@@ -129,7 +115,7 @@ class TopKStrategy(Strategy):
 
 
         # Model and data parameters
-        self.model: Optional[MarketModel] = None
+        self.model: Optional[SapiensModel] = None
         self.model_name = self.model_params["model_name"]
         self.bar_spec = freq2barspec( self.strategy_params["freq"])
         self.optimizer_lookback = freq2pdoffset( self.strategy_params["optimizer_lookback"])
@@ -317,7 +303,7 @@ class TopKStrategy(Strategy):
         if event.name != "update_timer":
             return
         if self.clock.utc_now() <= self.valid_start:
-            logging.debug("This update step is used to load initial data.")
+            logger.debug("This update step is used to load initial data.")
             return
         if self.final_liquidation_happend:
             return
@@ -401,7 +387,7 @@ class TopKStrategy(Strategy):
             return
         
         if self.clock.utc_now() <= self.valid_start:
-            logging.debug("No retrain before all initial data is loaded.")
+            logger.debug("No retrain before all initial data is loaded.")
             return
         
         now = pd.Timestamp(self.clock.utc_now(),)
@@ -448,7 +434,7 @@ class TopKStrategy(Strategy):
             active_mask=self.active_mask,
             total_bars = total_bars,
             warm_start=self.model_params["warm_start"],
-            warm_training_epochs=self.strategy_params["warm_training_epochs"],
+            warm_training_epochs=self.model_params["warm_training_epochs"],
         )
         
         self._last_retrain_time = now
@@ -461,7 +447,7 @@ class TopKStrategy(Strategy):
     # ================================================================= #
     def on_bar(self, bar: Bar):  
         
-        logging.debug(f"Received Bar: {bar}")
+        logger.debug(f"Received Bar: {bar}")
 
         return
     def on_instrument(self, instrument: Instrument) -> None:
@@ -659,7 +645,7 @@ class TopKStrategy(Strategy):
         return
     
     # ================================================================= #
-    # ORDER MANAGEMENT  -> OrderManager from order_management.py
+    # ORDER MANAGEMENT  -> OrderManager from OrderManager.py
     # ================================================================= #
 
     def on_order(self, order: OrderEvent) -> None:
@@ -832,7 +818,7 @@ class TopKStrategy(Strategy):
 
         logger.info(f"Selected {len(selected)} from {len(self.cache.instruments(venue=self.venue))} candidates (including benchmark and risk-free) ")
         self.universe = sorted(selected)
-    def _initialize_model(self) -> MarketModel:
+    def _initialize_model(self) -> SapiensMode:
         """Build and initialize the model."""
         # Import model class dynamically
         mod = importlib.import_module(f"models.{self.model_name}.{self.model_name}")
@@ -1240,7 +1226,7 @@ class TopKStrategy(Strategy):
 
         try:
             # Try to import from algos module
-            fee_module = importlib.import_module(f"algos.fees.{self.strategy_params["fee_model"]["name"]}")
+            fee_module = importlib.import_module(f"engine.fees.{self.strategy_params["fee_model"]["name"]}")
             FeeModelClass = getattr(fee_module, name, None)
             FeeModelConfig = getattr(fee_module, f"{name}Config", None)
             
@@ -1248,7 +1234,7 @@ class TopKStrategy(Strategy):
                 FeeModelClass = getattr(fee_module, "Strategy", None)
             
             if FeeModelClass is None:
-                raise ImportError(f"Could not find FeeModel class in algos.{self.strategy_params["fee_model"]["name"]}")
+                raise ImportError(f"Could not find FeeModel class in engine.{self.strategy_params["fee_model"]["name"]}")
             
         except ImportError as e:
             logger.error(f"Failed to import fee model {self.strategy_params["fee_model"]["name"]}: {e}")

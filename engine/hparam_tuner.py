@@ -54,8 +54,7 @@ import importlib
 import logging
 logger = logging.getLogger(__name__)
 
-from algos.engine.data_loader import CsvBarLoader
-from algos.engine.performance_plots import (
+from engine.performance_plots import (
     get_frequency_params,
     align_series,
     plot_balance_breakdown,
@@ -71,7 +70,8 @@ from algos.engine.performance_plots import (
     plot_portfolio_allocation,
 )
 from models.utils import freq2pdoffset, yaml_safe, freq2barspec, freq2bartype
-from algos.engine.databento_loader import DatabentoTickLoader
+from engine.databento_loader import DatabentoTickLoader
+from engine.ModelGenerator import ModelGenerator
 
 
 
@@ -85,35 +85,44 @@ class OptunaHparamsTuner:
     
     def __init__(
         self,
-        cfg: Dict[str, Any],
         catalog: ParquetDataCatalog,
+        sapiens_config: Dict[str, Any],
+        strategy_config: Dict[str, Any],
+        model_config: Optional[Dict[str, Any]] = None,
         run_dir: Path = Path("logs/backtests/"),
-        seed: int = 2025,
     ):
         """
         Initialize the backtest hyperparameter tuner.
         
         Args:
-            cfg: Configuration dictionary
-            catalog: NautilusParquetDataCatalog with data already loaded
-            run_dir: Root directory for logs
-            seed: Seed for reproducibility of hp tuning runs
+            sapiens_config: Main Sapiens configuration
+            catalog: Data catalog
+            strategy_config: Stratey configuration .yaml with PARAMS and HPARAMS
+            strategy_config: Stratey configuration .yaml with PARAMS and HPARAMS
+            run_dir: Logging directory
         """
         # Load configuration
-        self.config = cfg
+        self.sapiens_config = sapiens_config
 
         # Log Path
         self.run_dir = run_dir
+
+        # Generate model if needed
+        if not model_config:
+            model_config = self.generate_model()
+
+
+        # Combine configs
+        self.config = {
+            'MODEL': model_config,
+            'STRATEGY': strategy_config
+        }
         
-        # Parse configuration sections
-        self.model_config = self.config.get('MODEL', {})
-        self.strategy_config = self.config.get('STRATEGY', {})
-        
-        # Extract params and hparams for each component
-        self.model_params = self.model_config.get('PARAMS', {})
-        self.model_hparams = self.model_config.get('HPARAMS', {})
-        self.strategy_params = self.strategy_config.get('PARAMS', {})
-        self.strategy_hparams = self.strategy_config.get('HPARAMS', {})
+        # Extract sections
+        self.model_params = self.config['MODEL']['PARAMS']
+        self.model_hparams = self.config['MODEL'].get('HPARAMS', {})
+        self.strategy_params = self.config['STRATEGY']['PARAMS']
+        self.strategy_hparams = self.config['STRATEGY'].get('HPARAMS', {})
         
         # Sync shared params
         self.model_params["freq"] = self.strategy_params["freq"]
@@ -125,22 +134,16 @@ class OptunaHparamsTuner:
         # Split hparams into defaults and search spaces
         self.model_defaults, self.model_search = self._split_hparam_cfg(self.model_hparams)
         self.strategy_defaults, self.strategy_search = self._split_hparam_cfg(self.strategy_hparams)
-        self.seed = seed
+        self.seed = self.sapiens_config["seed"]
 
         # --- ParquetDataCatalog and Data Augmentation setup -------------------------------------------
         self.catalog = catalog
-
-        # TODO: temporary and will be removed. ideally just query catalog.instruments()
         self.instrument_ids = list(set(inst.id for inst in self.catalog.instruments()))
     
-    
-        # Setup MLflow
+        # Setup MLflow and Generate unique optimization ID
         self.mlflow_client = MlflowClient(tracking_uri="file:logs/mlflow")
-
-        # Generate unique optimization ID
         self.optimization_id = f"opt_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-        # TODO: ensure that when no optim is run, then this still works
 
     def _split_hparam_cfg(self, hp_cfg: dict) -> Tuple[dict, dict]:
         """
@@ -186,6 +189,41 @@ class OptunaHparamsTuner:
         
         return params
     
+    def generate_model(self) -> Dict[str, Any]:
+        """
+        Generate model via DeepCode if configured.
+        
+        Returns:
+            model_config dictionary 
+        """
+        model_name = self.sapiens_config["SAPIENS_MODEL"]['model_name']
+        
+        logger.info(f"Generating new model: {model_name}")
+        
+        gen_cfg = self.sapiens_config["SAPIENS_MODEL"]['generation']
+        gen_cfg['claude_model'] = gen_cfg['claude_model']
+        
+        generator = ModelGenerator(gen_cfg)
+        
+        model_dir = generator.generate_model(
+            source_type=gen_cfg['source_type'],
+            source_path=gen_cfg['source_path'],
+            model_name=model_name
+        )
+
+        # Load model config from model folder
+        model_config_path = Path(f"models/{model_name}/model_config.yaml")
+        if not model_config_path.exists():
+            raise FileNotFoundError(f"Model config not found: {model_config_path}")
+        with open(model_config_path, 'r') as f:
+            model_config = yaml.safe_load(model_config_path.read_text(encoding="utf-8"))["MODEL"]
+        
+        logger.info(f"✅ Generated model at: {model_dir}")
+
+        return model_config
+        
+
+
     def optimize_model(self, ) -> Dict[str, Any]:
         """
         Phase 1: Optimize model hyperparameters.
@@ -309,11 +347,11 @@ class OptunaHparamsTuner:
         
         # Run optimization
         # TODO: define case when no hp tuning is needed
-        logger.info(f"Running {self.model_params["n_trials"]} model trials...")
+        logger.info(f"Running {self.sapiens_config["SAPIENS_MODEL"]["optimization"]["n_trials"]} model trials...")
 
         # Handle case without optimization
-        n_trials = self.model_params.get("n_trials",1)
-        if self.model_params["tune_hparams"] is True and n_trials >= 1:
+        n_trials = self.sapiens_config["SAPIENS_MODEL"]["optimization"]["n_trials"]
+        if self.sapiens_config["SAPIENS_MODEL"]["optimization"]["tune_hparams"] is True and n_trials >= 1:
             study.optimize(model_objective, n_trials=n_trials)
         
         # Remove best model tag from old best trial
@@ -365,8 +403,8 @@ class OptunaHparamsTuner:
         storage = RDBStorage(f"sqlite:///{study_path / "strategy_hpo.db" }")
 
         # Parse Objectives and directions. Structure: obj:direction
-        objectives, directions = zip(*self.strategy_params['objectives'].items())
-        primary_obj_index = objectives.index(self.strategy_params.get("primary_objective", "total_pnl_pct"))
+        objectives, directions = zip(*self.sapiens_config["SAPIENS_STRATEGY"]["optimization"]['objectives'].items())
+        primary_obj_index = objectives.index(self.sapiens_config["SAPIENS_STRATEGY"]["optimization"]["primary_objective"])
         
         study = optuna.create_study(
             study_name= f"{strategy_name}_{best_model_name}",
@@ -466,8 +504,8 @@ class OptunaHparamsTuner:
                 return scores
         
         # Run optimization
-        n_trials = self.strategy_params.get("n_trials", 1)
-        if self.strategy_params.get("tune_hparams", True) and n_trials > 0:
+        n_trials = self.sapiens_config["SAPIENS_STRATEGY"]["n_trials"]
+        if self.sapiens_config["SAPIENS_STRATEGY"]["tune_hparams"] and n_trials > 0:
             logger.info(f"Running {n_trials} strategy trials...")
             study.optimize(strategy_objective, n_trials=n_trials)
         else:
@@ -815,8 +853,8 @@ class OptunaHparamsTuner:
         
         # trial HPARAMS -> model PARAMS 
         # Calculate proper date ranges
-        backtest_start = pd.Timestamp(self.strategy_params["backtest_start"], tz="UTC").normalize()
-        backtest_end = pd.Timestamp(self.strategy_params["backtest_end"], tz="UTC").normalize()
+        backtest_start = pd.Timestamp(self.sapiens_config["backtest_start"], tz="UTC").normalize()
+        backtest_end = pd.Timestamp(self.sapiens_config["backtest_end"], tz="UTC").normalize()
         train_offset = freq2pdoffset(train_ofst)
         retrain_offset = freq2pdoffset(retrain_ofst)
         n_retrains_on_valid = int(retrains_on_valid)
@@ -902,8 +940,8 @@ class OptunaHparamsTuner:
 
                 ),
                 fee_model=ImportableFeeModelConfig(
-                    fee_model_path = f"algos.fees.{fee_model}:{fee_model}",
-                    config_path = f"algos.fees.{fee_model}:{fee_model}Config",
+                    fee_model_path = f"engine.fees.{fee_model}:{fee_model}",
+                    config_path = f"engine.fees.{fee_model}:{fee_model}Config",
                     config = { "config" : {
                                     "commission_per_unit": Money(float(backtest_cfg["STRATEGY"]["fee_model"]["commission_per_unit"]) , backtest_cfg["STRATEGY"]["currency"]),  
                                     "min_commission": Money( backtest_cfg["STRATEGY"]["fee_model"]["min_commission"] , backtest_cfg["STRATEGY"]["currency"]),
@@ -935,8 +973,8 @@ class OptunaHparamsTuner:
                 engine=BacktestEngineConfig(
                     trader_id=f"Backtest-{model_name}-{strategy_name}",
                     strategies=[ImportableStrategyConfig(
-                        strategy_path=f"algos.{strategy_name}:{strategy_name}",
-                        config_path = f"algos.{strategy_name}:{strategy_name}Config",
+                        strategy_path=f"strategies.{strategy_name}.{strategy_name}:{strategy_name}",
+                        config_path = f"strategies.SapiensStrategy:SapiensStrategyConfig",
                         config = {"config":yaml_safe(backtest_cfg)},
                     )],
                     exec_algorithms=[ ImportableExecAlgorithmConfig(

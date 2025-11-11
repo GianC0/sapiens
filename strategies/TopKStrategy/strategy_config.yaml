@@ -1,0 +1,140 @@
+
+
+# ===============================================================================
+#  STRATEGY CONFIGURATION
+# ===============================================================================
+
+STRATEGY:
+  # Fixed parameters (not optimized)
+  PARAMS:
+    strategy_name: "TopKStrategy"
+    # Strategy Description: Computes buys top n stocks with n=portfolio size 
+
+    # Backtest and Train
+    # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
+    freq: 1h                     # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
+    #train_offset:               # Optimized during model hp tuning
+    #backtest_start: "2024-06-01" # Start of walk-forward evaluation.
+    #backtest_end:   "2024-12-01" # End of walk-forward evaluation.
+    calendar: NYSE               # Pandas Market calendar for the Equities market. Ref: https://pandas-market-calendars.readthedocs.io/en/latest/calendars.html#equity-market-calendars 
+    initial_cash: 20000          # portfolio initial cash                    (portfolio)
+    cash_buffer: 50              # cash buffer to always keep in portfolio to cover rounding errors
+    currency: USD                 
+    rebalance_only: false        # false = all universe instruments are considered for top_k. true = portoflio instruments stay the same, with dynamic reallocation 
+    account_type: CASH           # "CASH" = spot trading. "MARGIN" can trade derivatives and options as welll. TODO: "MARGIN" not implememted
+    oms_type: NETTING            # Order Management System type. NETTING = only long positions. HEDGING = long and short
+    venue_name: XNAS             # name of the venue to use for trading
+    risk_free_ticker: SGOV.XNAS  # Risk-free ETF to include in portfolio
+    benchmark_ticker: SPY.XNAS   # Benchmark for M2 optimization
+
+    # Paths
+    data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
+
+    # Engine settings
+    engine:
+      cache:
+        bar_capacity: 4096       # ≥ L + pred_len + some safety margin
+        tick_capacity: 50000     # used for TradeTicks Data
+
+
+    # Data and training windows
+    # holdout: 1B              # holdout period in days. NOTE: ensure pred_len < holdout
+    # allocation:
+    #   gross_leverage: 2.0    # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
+    #   net_exposure:   0.0    # Σwᵢ ≈ 0 (market-neutral)
+    
+
+    # Trading friction costs
+    costs:
+      prob_slippage: 0.0       # Simulates the probability of experiencing price slippage when executing market orders. If triggered, the order fill price has prob_slippage chances to be filled at next tick (for all market levels data L1/L2/L3) 
+      prob_fill_on_limit: 0.2  # Simulates the probability of a limit order getting filled when its price level is reached in the market.New random probability check occurs each time market price touches your order price (but does not move through it)
+
+    # Trading Commissions Model for fees
+    fee_model:                                       # Fee model defined in engine.fees. Modify only name and add respective params for other fee models
+      name: QuantityBasedMinMaxCommissionFeeModel    # Interactive Brokers
+      commission_per_unit: 0.005                     # One-way commission 0.005% / share
+      min_commission: 1.0                            # $1 minimum per order
+      max_commission_pct: 0.01                       # max commission is 1% of trade value for that asset 
+
+    # Order execution algorithm
+    execution:
+      timing_force: "GTC"      # Specifies how long the order will remain open or active before any remaining quantity is canceled.
+      #exec_algo: twap         # Specifies to use TWAP execution algorithm, Default: whole
+      twap:                    # Split parent order into 4 TWAP child orders, each after 2.5 seconds 
+        slices: 1              # number of separate orders
+        interval_secs: 5       # seconds between orders
+      use_limit_orders: false  # whether to use LIMIT orders or MARKET-only
+      limit_offset_bps: 0.005  # +-5% LIMIT order placed
+      max_retries: 3           # n of retries if order is unsuccessfull before cancelling the remaining portion
+
+    # Liquidity constraints   
+    liquidity:
+      adv_lookback: 20D     # Look-back window to compute Average Daily Volume (ADV)
+      max_adv_pct:  0.20    # Max trade size = 20% of average daily traded volume for that instrument to use for weights 
+
+    # Risk Management
+    risk:
+      max_weight_abs:     0.5                # Max x% NAV per single position        (concentration limit)
+      drawdown_max:       0.15               # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
+      trailing_stop_max:  0.05               # % trailing stop from HWM/LWM 5% for single instrument
+      target_volatility:  0.05               # 15% tarket volatility for efficient risk optimizer             
+        
+      #max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
+
+  # Hyperparameters to optimize
+  HPARAMS:
+
+    # TODO: Risk Aversion
+    
+    # Portfolio size (if MARGIN account: top_k/2 are short , top_k/2 are long)
+    top_k:
+      default: 2
+      optuna:
+        optuna_type: int_low-high
+        low: 2
+        high: 3
+
+    # Optimizer settings
+    optimizer_name:
+      default: "max_sharpe"          # maximize sharpe ratio
+      optuna:
+        optuna_type: categorical
+        choices: ["m2"] # , "min_variance", "equal_weight", "max_sharpe", "m2"
+    
+    optimizer_lookback: # Window used to estimates covariance of volatility, returns and risk related metrics
+      default: "60B"
+      optuna:
+        optuna_type: categorical
+        choices: ["10B", "20B"]
+    
+    
+    #risk_target_volatility_annual:           # Volatility target (Hull, risk parity) 15 % only for "efficient_risk" optimizer 
+    #  default: 0.15
+    #  optuna:
+    #    optuna_type: low-high
+    #    low: 0.05
+    #    high: 0.20
+    
+
+    
+    #risk_max_weight_rel:              # Max 20 % of gross exposure in one name
+    #  default: 0.20
+    #  optuna:
+    #    optuna_type: low-high
+    #    low: 0.15
+    #    high: 0.30
+
+    # Allocation constraints
+    #allocation_gross_leverage:        # Σ|wᵢ|  ≤ 2  (1949 Graham “gross leverage”)
+    #  default: 2.0
+    #  optuna:
+    #    optuna_type: low-high
+    #    low: 1.0
+    #    high: 3.0
+    
+    #allocation_net_exposure:          # Σwᵢ ≈ 0 (market-neutral)
+    #  default: 0.0
+    #  optuna:
+    #    optuna_type: low-high
+    #    low: -0.2
+    #    high: 0.2
