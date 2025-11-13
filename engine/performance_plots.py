@@ -160,6 +160,7 @@ def plot_balance_breakdown(
     
     if 'currency' not in account_df.columns:
         logger.warning("No 'currency' column found. Skipping balance breakdown plot.")
+        plt.close(fig)
         return fig
     
     currencies = account_df['currency'].unique()
@@ -192,6 +193,7 @@ def plot_balance_breakdown(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
     
     return fig
 
@@ -234,6 +236,7 @@ def plot_cumulative_returns(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
     
     return fig
 
@@ -288,7 +291,8 @@ def plot_rolling_sharpe(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    
+        plt.close(fig)
+
     return fig
 
 
@@ -323,7 +327,8 @@ def plot_risk_free_rate(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    
+        plt.close(fig)
+
     return fig
 
 
@@ -394,7 +399,8 @@ def plot_period_returns(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    
+        plt.close(fig)
+
     return fig
 
 
@@ -447,6 +453,7 @@ def plot_returns_distribution(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
     
     return fig
 
@@ -494,6 +501,7 @@ def plot_active_returns(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
     
     return fig
 
@@ -559,6 +567,7 @@ def plot_active_returns_heatmap(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
     
     return fig
 
@@ -641,6 +650,7 @@ def plot_rolling_ratios(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
     
     return fig
 
@@ -678,6 +688,7 @@ def plot_underwater(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
     
     return fig
 
@@ -727,5 +738,6 @@ def plot_portfolio_allocation(
     
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
     
     return fig
