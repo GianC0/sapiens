@@ -433,8 +433,6 @@ class TopKStrategy(SapiensStrategy):
             retrain_start_date = self._last_retrain_time,
             active_mask=self.active_mask,
             total_bars = total_bars,
-            warm_start=self.model_params["warm_start"],
-            warm_training_epochs=self.model_params["warm_training_epochs"],
         )
         
         self._last_retrain_time = now
@@ -1010,7 +1008,7 @@ class TopKStrategy(SapiensStrategy):
         
             # ADV dollar volume with EMA (with half-life 5 days)
             trading_hours = self.calendar.schedule(start_date=now, end_date=now).pipe(lambda s: (s["market_close"] - s["market_open"]).dt.total_seconds() / 3600.0).iloc[0]
-            n_ticks = int(pd.Timedelta(f'{trading_hours}h') / pd.Timedelta(self.strategy_params["freq"])) * self.adv_lookback.days
+            n_ticks = int(pd.Timedelta(f'{trading_hours}h') * self.adv_lookback.days / pd.Timedelta(self.strategy_params["freq"]))
             recent_ticks = ticks[-n_ticks:] if n_ticks < len(ticks) else ticks
             
             timestamps = np.empty(n_ticks, dtype='datetime64[ns]')

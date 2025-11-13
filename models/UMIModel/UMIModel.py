@@ -163,6 +163,36 @@ class UMIModel(SapiensModel):
         logger.info(f"[initialize] Complete. Best validation: {best_val:.6f}")
         return best_val
     
+    @override
+    def _train_with_rolling_validation(self, data: Dict[str, DataFrame], 
+                                    n_epochs: int, total_bars: int) -> float:
+        """Rolling validation using UMI's custom training."""
+        
+        full_tensor, _ = build_tensor(data, total_bars, self.F, self._device)
+        
+        n_folds = 1 + self.n_retrains_on_valid
+        train_bars = int(total_bars * (1 - self.valid_split))
+        fold_size = (total_bars - train_bars) // n_folds
+        
+        if fold_size < self.L + self.pred_len:
+            logger.warning("Validation fold too small, using single validation")
+            train_loader, valid_loader = self._create_loaders(full_tensor, train_bars, total_bars)
+            return self._train(train_loader, valid_loader, n_epochs)[0]
+        
+        best_overall = float('inf')
+        
+        for fold_idx in range(n_folds):
+            train_end = train_bars + fold_idx * fold_size
+            valid_end = train_end + fold_size if fold_idx < n_folds - 1 else total_bars
+            fold_epochs = n_epochs if fold_idx == 0 else self.warm_training_epochs
+            
+            logger.info(f"Rolling fold {fold_idx+1}/{n_folds}: train[:{train_end}] valid[{train_end}:{valid_end}]")
+            
+            train_loader, valid_loader = self._create_loaders(full_tensor, train_end, valid_end)
+            fold_best, self._global_epoch = self._train(train_loader, valid_loader, fold_epochs)
+            best_overall = min(best_overall, fold_best)
+        
+        return best_overall
     def _train(self, train_loader, valid_loader, n_epochs: int) -> Tuple[float, int]:
         """UMI-specific multi-stage training."""
         
@@ -634,4 +664,3 @@ class UMIModel(SapiensModel):
             header=not log_file.exists(), 
             index=False
         )
-        self._global_epoch += 1

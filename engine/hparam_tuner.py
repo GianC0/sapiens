@@ -478,6 +478,8 @@ class OptunaHparamsTuner:
                 # Generate and log charts
                 logger.info(f"Generating performance charts trial {trial.number}...")
                 self._generate_performance_charts(
+                    start = strategy_params_flat["valid_start"],
+                    end = strategy_params_flat["valid_end"],
                     time_series=time_series,
                     strategy_params_flat=strategy_params_flat,
                     run_id=trial_run.info.run_id,
@@ -504,8 +506,8 @@ class OptunaHparamsTuner:
                 return scores
         
         # Run optimization
-        n_trials = self.sapiens_config["SAPIENS_STRATEGY"]["n_trials"]
-        if self.sapiens_config["SAPIENS_STRATEGY"]["tune_hparams"] and n_trials > 0:
+        n_trials = self.sapiens_config["SAPIENS_STRATEGY"]["optimization"]["n_trials"]
+        if self.sapiens_config["SAPIENS_STRATEGY"]["optimization"]["tune_hparams"] and n_trials > 0:
             logger.info(f"Running {n_trials} strategy trials...")
             study.optimize(strategy_objective, n_trials=n_trials)
         else:
@@ -607,6 +609,8 @@ class OptunaHparamsTuner:
         
         # Generate charts
         self._generate_performance_charts(
+            start=pd.Timestamp(backtest_start),
+            end=pd.Timestamp(backtest_end),
             time_series=final_time_series,
             strategy_params_flat=strategy_params_flat,
             run_id=run_id,
@@ -1001,7 +1005,7 @@ class OptunaHparamsTuner:
 
         return config
     
-    def _generate_performance_charts(self, time_series: Dict, strategy_params_flat: Dict, 
+    def _generate_performance_charts(self, start: pd.Timestamp, end: pd.Timestamp, time_series: Dict, strategy_params_flat: Dict, 
                                     run_id: str, output_dir: Path):
         """
         Generate comprehensive performance charts using modular plotting functions.
@@ -1061,7 +1065,14 @@ class OptunaHparamsTuner:
             strategy_ret = pd.to_numeric(portfolio_values).pct_change().fillna(0)
             
             # Get benchmark and risk-free data
-            data_dict = self.get_ohlcv_data_from_catalog(strategy_params_flat.get('freq', '1D'))
+            data_dict = self.get_ohlcv_data_from_catalog(
+                frequency=strategy_params_flat.get('freq', '1D'),
+                start=start,
+                end=end,
+                instrument_ids=[InstrumentId.from_str(strategy_params_flat["benchmark_ticker"]),
+                                InstrumentId.from_str(strategy_params_flat["risk_free_ticker"])],
+
+                )
             benchmark_returns = data_dict[strategy_params_flat["benchmark_ticker"]].pct_change()["close"]
             risk_free_returns = data_dict[strategy_params_flat["risk_free_ticker"]].pct_change()["close"]
             
@@ -1181,6 +1192,7 @@ class OptunaHparamsTuner:
             # ═══════════════════════════════════════════════════════════════
             # 11. Portfolio Allocation (if position data available)
             # ═══════════════════════════════════════════════════════════════
+            
             fig11 = plot_portfolio_allocation(
                 positions_df=time_series['positions'],
                 resample_freq=resample_freq,
