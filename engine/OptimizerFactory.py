@@ -67,7 +67,7 @@ class PortfolioOptimizer:
         """Convert PyPortfolioOpt weights dict to numpy array."""
         if isinstance(weights_dict, dict):
             return np.array(list(weights_dict.values()))
-        return weights_dict
+        return {}
 
     def _apply_constraints(
         self, 
@@ -355,13 +355,15 @@ class M2Optimizer(PortfolioOptimizer):
         """
         super().__init__(max_adv_pct, weight_bounds, solver)
     
-    def optimize(self, er: pd.Series, cov: pd.DataFrame, rf: float, benchmark_vol: float, 
+    def optimize(self, er: pd.Series, cov: pd.DataFrame, rf: float, 
                 allowed_weight_ranges: np.ndarray,
                 current_weights: np.ndarray,
                 prices: np.ndarray,
                 nav: float,
                 cash_available: float,
+                benchmark_vol: float,
                 **kwargs) -> np.ndarray:
+        
         """
         Find weights that maximize M² measure.
         

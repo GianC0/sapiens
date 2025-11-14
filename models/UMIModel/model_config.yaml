@@ -49,7 +49,7 @@ MODEL:
       optuna:
         optuna_type: int_low-high
         low: 1
-        high: 10
+        high: 5
 
     # Retrain - fine-tuning window: used to compute validation set 
     # and by Strategy to retrain the model after a while 
@@ -65,7 +65,7 @@ MODEL:
       default: 0
       optuna:
         optuna_type: "categorical"
-        choices: [0, 1, 2, 3] 
+        choices: [0, 1, 2] 
 
     # λ_IC   : independence loss weight
     lambda_ic:        

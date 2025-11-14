@@ -12,7 +12,7 @@ STRATEGY:
 
     # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
-    freq: 12h                    # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
+    freq: 3h                     # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
     #train_offset:               # Optimized during model hp tuning
     #backtest_start: "2024-06-01" # Start of walk-forward evaluation.
     #backtest_end:   "2024-12-01" # End of walk-forward evaluation.
@@ -74,10 +74,10 @@ STRATEGY:
 
     # Risk Management
     risk:
-      max_weight_abs:     0.5                # Max x% NAV per single position        (concentration limit)
+      max_weight_abs:     0.4                # Max x% NAV per single position        (concentration limit)
       drawdown_max:       0.15               # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
       trailing_stop_max:  0.05               # % trailing stop from HWM/LWM 5% for single instrument
-      target_volatility:  0.05               # 15% tarket volatility for efficient risk optimizer             
+      target_volatility:  0.05               # 5% tarket volatility for efficient risk optimizer             
         
       #max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
 
@@ -92,7 +92,7 @@ STRATEGY:
       optuna:
         optuna_type: int_low-high
         low: 2
-        high: 3
+        high: 4
 
     # Optimizer settings
     optimizer_name:

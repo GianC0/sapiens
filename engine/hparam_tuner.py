@@ -23,8 +23,9 @@ from nautilus_trader.model.enums import OmsType
 from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm, TWAPExecAlgorithmConfig
 from nautilus_trader.backtest.node import BacktestNode
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
-from nautilus_trader.model.objects import Price, Quantity, Money
+from nautilus_trader.model.objects import Price, Quantity, Money, Currency
 from nautilus_trader.model.data import TradeTick
+from nautilus_trader.core.nautilus_pyo3 import CurrencyType
 
 
 import seaborn as sns
@@ -347,12 +348,15 @@ class OptunaHparamsTuner:
         
         # Run optimization
         # TODO: define case when no hp tuning is needed
-        logger.info(f"Running {self.sapiens_config["SAPIENS_MODEL"]["optimization"]["n_trials"]} model trials...")
+        
 
         # Handle case without optimization
         n_trials = self.sapiens_config["SAPIENS_MODEL"]["optimization"]["n_trials"]
         if self.sapiens_config["SAPIENS_MODEL"]["optimization"]["tune_hparams"] is True and n_trials >= 1:
+            logger.info(f"Running {self.sapiens_config["SAPIENS_MODEL"]["optimization"]["n_trials"]} model trials...")
             study.optimize(model_objective, n_trials=n_trials)
+        else:
+            logger.info(f"Hyper-parameter tuning disabled. Taking best trial for {self.sapiens_config["SAPIENS_MODEL"]["model_name"]} from database...")
         
         # Remove best model tag from old best trial
         if old_best_trial:
@@ -366,7 +370,7 @@ class OptunaHparamsTuner:
         self.mlflow_client.set_tag(best_trial.user_attrs["mlflow_run_id"], "is_best_model", "true")
 
         
-        logger.info(f"\nBest model trial: {best_trial.number}")
+        logger.info(f"Best model trial: {best_trial.number}")
         logger.info(f"Best model loss: {best_trial.value:.6f}")
         
         return {
@@ -508,13 +512,12 @@ class OptunaHparamsTuner:
         # Run optimization
         n_trials = self.sapiens_config["SAPIENS_STRATEGY"]["optimization"]["n_trials"]
         if self.sapiens_config["SAPIENS_STRATEGY"]["optimization"]["tune_hparams"] and n_trials > 0:
-            logger.info(f"Running {n_trials} strategy trials...")
+            logger.info(f"Running hyper-parameter tuning with {n_trials} strategy trials...")
             study.optimize(strategy_objective, n_trials=n_trials)
         else:
-            logger.info("Strategy hyperparameter tuning disabled, using defaults")
-            # Run single trial with defaults
-            study.optimize(strategy_objective, n_trials=1)
+            logger.info(f"Hyper-parameter tuning for strategy disabled. Taking best trial for {self.sapiens_config["SAPIENS_STRATEGY"]["strategy_name"]} from database...")
 
+        
         # Remove best model tag from old best trial
         if old_best_trial:
             self.mlflow_client.delete_tag(run_id = old_best_trial.user_attrs["mlflow_run_id"], key = "is_best_strategy_for_model")
@@ -534,7 +537,7 @@ class OptunaHparamsTuner:
         self.mlflow_client.set_tag(best_strategy_model_run_id, "is_best_strategy_for_model", "true")
         self.mlflow_client.set_tag(best_strategy_model_run_id, "primary_objective", objectives[primary_obj_index])
         
-        logger.info(f"\nBest strategy trial: {best_trial.number}")
+        logger.info(f"Best strategy trial: {best_trial.number}")
         logger.info(f"Best strategy {objectives[primary_obj_index]}: {best_trial.values[primary_obj_index]:.4f}")
         logger.info(f"Best strategy hparams: {best_trial.params}")
         
@@ -562,8 +565,8 @@ class OptunaHparamsTuner:
             exp_id = exp.experiment_id
         
         # Retrieve strategy and model flat params
-        model_name = self.mlflow_client.get_run(run_id = strategy_hpo_run_id).data.params.get("model_name")
-        strategy_name = self.mlflow_client.get_run(run_id = strategy_hpo_run_id).data.params.get("strategy_name")
+        model_name = self.mlflow_client.get_run(run_id = strategy_hpo_run_id).data.tags.get("model_name")
+        strategy_name = self.mlflow_client.get_run(run_id = strategy_hpo_run_id).data.tags.get("strategy_name")
         full_flat = self.get_best_full_params_flat(model_name=model_name, strategy_name = strategy_name)
         model_params_flat = full_flat["MODEL"]
         strategy_params_flat = full_flat["STRATEGY"]
@@ -593,6 +596,7 @@ class OptunaHparamsTuner:
             
         # Save and log optimized config
         backtest_path = self.run_dir / "Backtests" / f"{strategy_name}_{model_name}"
+        backtest_path.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         optimized_config_flat_path = backtest_path / f"{timestamp}_config.yaml"
         with open(optimized_config_flat_path, 'w') as f:
@@ -617,11 +621,12 @@ class OptunaHparamsTuner:
             output_dir=backtest_path / "charts"
         )
         
+
         # Log all metrics
         for metric_name, metric_value in final_metrics.items():
             self.mlflow_client.log_metric(run_id=run_id, key=metric_name, value=metric_value)
-        for key, ts in final_time_series.items():
-            self.mlflow_client.log_metric(run_id = run_id, key = key, value = ts)
+        for _, ts in final_time_series.items():
+            self.mlflow_client.log_table(run_id = run_id, data = ts, artifact_file=f"key.json")
         return final_metrics, final_time_series
 
 
@@ -874,8 +879,10 @@ class OptunaHparamsTuner:
         train_end = valid_start - pd.Timedelta("1ns")
         
         # Calculate number of bars in inference window
-        window_len = int(pd.Timedelta(inference_window) / pd.Timedelta(self.model_params["freq"]) ) 
-        
+        logger.warning(f"Inference window {inference_window} < sampling frequency {self.model_params["freq"]}. Defaulting to inference_window = frequency")
+        window_len = max(1, int(pd.Timedelta(inference_window) / pd.Timedelta(self.model_params["freq"]) ))
+        # assert window_len > 1, f"Inference window {inference_window} < sampling frequency {self.model_params["freq"]}. Consider a bigger inference_window"
+
 
         # This should always be true even if validation is not run
         assert backtest_end > backtest_start, f"Backtest start {backtest_start} must come before backtest end {backtest_end}"
@@ -923,6 +930,19 @@ class OptunaHparamsTuner:
 
         fee_model = backtest_cfg["STRATEGY"]["fee_model"]["name"]
         
+        # Setup full strategy config        
+        currency_code = backtest_cfg["STRATEGY"]["currency"]
+        if currency_code == "USD":
+            currency = Currency(
+                code='USD', precision=3, iso4217=840,
+                name='United States dollar', currency_type=CurrencyType.FIAT
+            )
+        elif currency_code == "EUR":
+            currency = Currency(
+                code='EUR', precision=3, iso4217=978,
+                name='Euro', currency_type=CurrencyType.FIAT
+            )
+        
         # Initialize Venue configs
         venue_configs = [
             BacktestVenueConfig(
@@ -930,8 +950,8 @@ class OptunaHparamsTuner:
                 book_type="L1_MBP",         # bars are inluded in L1 market-by-price
                 oms_type = backtest_cfg["STRATEGY"]["oms_type"],
                 account_type=backtest_cfg["STRATEGY"]["account_type"],
-                base_currency=backtest_cfg["STRATEGY"]["currency"],
-                starting_balances=[str(backtest_cfg["STRATEGY"]["initial_cash"])+" "+str(backtest_cfg["STRATEGY"]["currency"])],
+                base_currency=currency.code,
+                starting_balances=[str(backtest_cfg["STRATEGY"]["initial_cash"])+" "+currency.code],
                 bar_adaptive_high_low_ordering=False,  # Enable adaptive ordering of High/Low bar prices,
                 fill_model=ImportableFillModelConfig(
                         fill_model_path = "nautilus_trader.backtest.models:FillModel",
@@ -947,8 +967,8 @@ class OptunaHparamsTuner:
                     fee_model_path = f"engine.fees.{fee_model}:{fee_model}",
                     config_path = f"engine.fees.{fee_model}:{fee_model}Config",
                     config = { "config" : {
-                                    "commission_per_unit": Money(float(backtest_cfg["STRATEGY"]["fee_model"]["commission_per_unit"]) , backtest_cfg["STRATEGY"]["currency"]),  
-                                    "min_commission": Money( backtest_cfg["STRATEGY"]["fee_model"]["min_commission"] , backtest_cfg["STRATEGY"]["currency"]),
+                                    "commission_per_unit": Money(float(backtest_cfg["STRATEGY"]["fee_model"]["commission_per_unit"]) , currency),  
+                                    "min_commission": Money( backtest_cfg["STRATEGY"]["fee_model"]["min_commission"] , currency),
                                     "max_commission_pct": Decimal(backtest_cfg["STRATEGY"]["fee_model"]["max_commission_pct"])
                                 }
                     },
@@ -961,8 +981,8 @@ class OptunaHparamsTuner:
             BacktestDataConfig(
                 catalog_path=backtest_cfg["STRATEGY"]["catalog_path"],
                 data_cls=TradeTick,
-                start_time=pd.Timestamp.isoformat(start),
-                end_time=pd.Timestamp.isoformat(end),
+                start_time=pd.Timestamp(start),
+                end_time=pd.Timestamp(end),
                 instrument_ids=[iid.value for iid in self.instrument_ids],
                 #bar_spec=bar_spec,
                 #bar_types = [freq2bartype(instrument_id=iid, frequency= backtest_cfg["STRATEGY"]["freq"]) for iid in self.instrument_ids],
@@ -1051,7 +1071,7 @@ class OptunaHparamsTuner:
             # Extract portfolio values for returns calculation
             portfolio_values = None
             # TODO: Handle Multi-currency portfolio values from strategy params
-            currency_data = acc_df[acc_df['currency'] == strategy_params_flat["currency"].code]
+            currency_data = acc_df[acc_df['currency'] == strategy_params_flat["currency"]]
             portfolio_values = currency_data['total'].resample(resample_freq).last().ffill()
 
             
@@ -1199,7 +1219,7 @@ class OptunaHparamsTuner:
                 save_path=output_dir / 'portfolio_allocation.png'
             )
             """
-            
+
             self.mlflow_client.log_artifacts(run_id = run_id , local_dir = str(output_dir))
 
             plt.close('all')
@@ -1582,9 +1602,9 @@ class OptunaHparamsTuner:
         model_params_flat = {}
         with open(model_config_path, "r", encoding="utf-8") as f:
             model_params_flat = yaml.safe_load(f.read())
-        
+
         # Load strategy params flat for the best strategy
-        strategy_config_path = self.mlflow_client.download_artifacts(best_relative_model_run.info.run_id, "strategy_config.yaml")
+        strategy_config_path = self.mlflow_client.download_artifacts(best_strategy_run.info.run_id, "strategy_config.yaml")
         strategy_params_flat = {}
         with open(strategy_config_path, "r", encoding="utf-8") as f:
             strategy_params_flat = yaml.safe_load(f.read())

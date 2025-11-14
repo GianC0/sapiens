@@ -34,6 +34,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+client = MlflowClient(tracking_uri="file:logs/mlflow")
 
 
 
@@ -48,19 +49,6 @@ strategy_name = sapiens_config["SAPIENS_STRATEGY"]['strategy_name']
 strategy_config_path = Path(f"strategies/{strategy_name}/strategy_config.yaml")
 strategy_config = yaml.safe_load(strategy_config_path.read_text(encoding="utf-8"))["STRATEGY"]
 
-
-# Setup full strategy config
-currency_code = strategy_config["PARAMS"]["currency"]
-if currency_code == "USD":
-    strategy_config["PARAMS"]["currency"] = Currency(
-        code='USD', precision=3, iso4217=840,
-        name='United States dollar', currency_type=CurrencyType.FIAT
-    )
-elif currency_code == "EUR":
-    strategy_config["PARAMS"]["currency"] = Currency(
-        code='EUR', precision=3, iso4217=978,
-        name='Euro', currency_type=CurrencyType.FIAT
-    )
 
 
 # Model generation or Setup
@@ -177,3 +165,34 @@ for metric, value in strategy_results['metrics'].items():
     print(f"  {metric}: {value:.4f}")
 print(f"\nMLflow run ID: {strategy_results['mlflow_run_id']}")
 
+
+
+
+# Get optimization context
+run = client.get_run(strategy_results["mlflow_run_id"])
+optimization_id = run.data.tags.get("optimization_id", "")
+
+# Define backtest period
+backtest_start = sapiens_config["backtest_start"]
+backtest_end = sapiens_config["backtest_end"]
+
+print(f"Running final backtest: {backtest_start} to {backtest_end}")
+
+
+# Execute final backtest
+logger.info("\n" + "="*70)
+logger.info("🚀 STAGE 4: FINAL BACKTEST")
+logger.info("="*70 + "\n")
+
+final_metrics, final_time_series = tuner.run_final_backtest(
+    backtest_start=backtest_start,
+    backtest_end=backtest_end,
+    strategy_hpo_run_id=strategy_results["mlflow_run_id"],
+    optimization_id=optimization_id
+)
+
+print("\n✅ Final backtest complete!")
+print("\nFinal Performance Metrics:")
+print("="*50)
+for metric, value in sorted(final_metrics.items()):
+    print(f"{metric:.<40} {value:>10.4f}")

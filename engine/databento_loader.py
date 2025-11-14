@@ -206,7 +206,16 @@ class DatabentoTickLoader:
             venue=self.venue
         )
         
-        currency = self.cfg["currency"]
+        if self.cfg["currency"] == "USD":
+            currency = Currency(
+                code='USD', precision=3, iso4217=840,
+                name='United States dollar', currency_type=CurrencyType.FIAT
+            )
+        elif self.cfg["currency"] == "EUR":
+            currency = Currency(
+                code='EUR', precision=3, iso4217=978,
+                name='Euro', currency_type=CurrencyType.FIAT
+            )
         
         return Equity(
             instrument_id=instrument_id,

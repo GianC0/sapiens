@@ -1159,6 +1159,12 @@ class TopKStrategy(SapiensStrategy):
             target_volatility = self.target_volatility
         )
 
+        if w_opt.any():
+            # No losing positions to evaluate - keep everything
+            w_series = pd.Series(0.0, index=self.universe)
+            logger.warning("Probably a bug. Fix this")
+            return w_series.to_dict()
+
         # Clipping (if optimizer constraints failed) and log if clipping occurred
         w_clipped = np.clip(w_opt, allowed_weight_ranges[:, 0], allowed_weight_ranges[:, 1])  # max bounds
 
