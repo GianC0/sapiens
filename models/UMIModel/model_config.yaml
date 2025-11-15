@@ -41,7 +41,7 @@ MODEL:
       default: "6h"
       optuna:
         optuna_type: "categorical"
-        choices: ["1h","3h", "6h"]
+        choices: ["6h", "12h", "18h"]
 
     # Light fine-tune epochs
     warm_training_epochs:      

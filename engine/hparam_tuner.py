@@ -42,6 +42,8 @@ from typing import Callable, Dict, Any, Optional, Tuple, List
 from unittest import loader
 import optuna
 from optuna.storages import RDBStorage
+import optuna.visualization as optuna_viz
+from optuna.importance import get_param_importances
 import pandas as pd
 from sqlalchemy import Engine
 from torch import mode
@@ -350,7 +352,7 @@ class OptunaHparamsTuner:
         # TODO: define case when no hp tuning is needed
         
 
-        # Handle case without optimization
+        # Handle case with and without optimization
         n_trials = self.sapiens_config["SAPIENS_MODEL"]["optimization"]["n_trials"]
         if self.sapiens_config["SAPIENS_MODEL"]["optimization"]["tune_hparams"] is True and n_trials >= 1:
             logger.info(f"Running {self.sapiens_config["SAPIENS_MODEL"]["optimization"]["n_trials"]} model trials...")
@@ -360,23 +362,44 @@ class OptunaHparamsTuner:
         
         # Remove best model tag from old best trial
         if old_best_trial:
-            self.mlflow_client.delete_tag(run_id = old_best_trial.user_attrs["mlflow_run_id"], key = "is_best_model")
-
+            try:
+                self.mlflow_client.delete_tag(run_id = old_best_trial.user_attrs["mlflow_run_id"], key = "is_best_model")
+            except:
+                logger.warning("Last best Trial was interrupted and not updated in mlflow")
         # Add the best model tag to the new best trial
         try:
             best_trial = study.best_trial
+
+            if len(study.trials) > 1:
+                fig_importance = optuna_viz.plot_param_importances(study)
+                importances = get_param_importances(study)
+
+                for param_name, importance in importances.items():
+                    self.mlflow_client.log_metric(
+                        parent_run_id, 
+                        f"importance_{param_name}", 
+                        importance
+                    )
+            else:
+                fig_importance = None
+                logger.warning("Insufficient trials for parameter importance")
+
         except ValueError:
             raise Exception(f"Model {model_name} has never been been through hyper-parameters tuning")
+        
         self.mlflow_client.set_tag(best_trial.user_attrs["mlflow_run_id"], "is_best_model", "true")
 
         
         logger.info(f"Best model trial: {best_trial.number}")
+        logger.info(f"Best trial hparams: {best_trial.params}")
         logger.info(f"Best model loss: {best_trial.value:.6f}")
+        
         
         return {
             "model_path": best_trial.user_attrs["model_path"],
             "models_params_flat": best_trial.user_attrs["model_params_flat"],
             "mlflow_run_id": best_trial.user_attrs["mlflow_run_id"], 
+            "param_importance_fig": fig_importance,
         }
 
     def optimize_strategy(self, model_name: Optional[str] = None) -> Dict[str, Any]:
@@ -439,8 +462,7 @@ class OptunaHparamsTuner:
                 best_model_params_flat["retrain_offset"],
                 best_model_params_flat["n_retrains_on_valid"],
                 best_model_params_flat["inference_window"],
-                to_strategy=True, 
-                model_name = best_model_params_flat["model_name"] ) | trial_hparams
+                to_strategy=True, ) | trial_hparams
             
             # Start MLflow run for this trial
             mlflow.set_tracking_uri("file:logs/mlflow")
@@ -520,26 +542,49 @@ class OptunaHparamsTuner:
         
         # Remove best model tag from old best trial
         if old_best_trial:
-            self.mlflow_client.delete_tag(run_id = old_best_trial.user_attrs["mlflow_run_id"], key = "is_best_strategy_for_model")
+            try:
+                self.mlflow_client.delete_tag(run_id = old_best_trial.user_attrs["mlflow_run_id"], key = "is_best_strategy_for_model")
+            except:
+                logger.warning("Last best Trial was interrupted and not updated in mlflow")
+
 
         # Get best trial based on primary metric
         best_trials = study.best_trials
-        logger.info(f"Considering best trial for {objectives[primary_obj_index]} as the overall multi-objective best trial")
-        if study.directions[primary_obj_index] == optuna.study.StudyDirection.MINIMIZE:
-            best_trial = min(best_trials, key=lambda t: t.values[primary_obj_index])
-        else:
-            best_trial = max(best_trials, key=lambda t: t.values[primary_obj_index])
-        if best_trial is None:
-            raise Exception("Could not compute hp optimization of model")
+        try:
+            logger.info(f"Considering best trial for {objectives[primary_obj_index]} as the overall multi-objective best trial")
+            if study.directions[primary_obj_index] == optuna.study.StudyDirection.MINIMIZE:
+                best_trial = min(best_trials, key=lambda t: t.values[primary_obj_index])
+            else:
+                best_trial = max(best_trials, key=lambda t: t.values[primary_obj_index])
+            if best_trial is None:
+                raise ValueError("Could not compute hp optimization of strategy")
+            
+            if len(study.trials) > 1:
+                # Get importance scores for primary objective
+                importances = get_param_importances(study,target=lambda t: t.values[primary_obj_index])
+                # Log as metrics to parent run (overwrites on re-run)
+                for param_name, importance in importances.items():
+                    self.mlflow_client.log_metric(parent_run_id,f"importance_{param_name}", importance)
+                # Generate plot for visualization
+                fig_importance = optuna_viz.plot_param_importances(study,target=lambda t: t.values[primary_obj_index])
+                logger.info(f"Parameter importances: {importances}")
+            else:
+                fig_importance = None
+                logger.warning("Insufficient trials for parameter importance")
+        except Error:
+            raise Exception(f"Straegy {strategy_name} has never been been through hyper-parameters tuning")
         
+        
+
+
         # Set best trial tag in MLflow for plotting
         best_strategy_model_run_id = best_trial.user_attrs["mlflow_run_id"]
         self.mlflow_client.set_tag(best_strategy_model_run_id, "is_best_strategy_for_model", "true")
         self.mlflow_client.set_tag(best_strategy_model_run_id, "primary_objective", objectives[primary_obj_index])
         
         logger.info(f"Best strategy trial: {best_trial.number}")
-        logger.info(f"Best strategy {objectives[primary_obj_index]}: {best_trial.values[primary_obj_index]:.4f}")
         logger.info(f"Best strategy hparams: {best_trial.params}")
+        logger.info(f"Best strategy {objectives[primary_obj_index]}: {best_trial.values[primary_obj_index]:.4f}")
         
 
         
@@ -548,6 +593,7 @@ class OptunaHparamsTuner:
             "hparams": best_trial.params,
             "metrics": best_trial.user_attrs.get("metrics", {}),
             "mlflow_run_id": best_strategy_model_run_id,
+            "param_importance_fig": fig_importance,
         }
     
     def run_final_backtest(self, 
@@ -858,7 +904,7 @@ class OptunaHparamsTuner:
         return metrics, time_series
 
     
-    def _add_dates(self, cfg, train_ofst, retrain_ofst, retrains_on_valid, inference_window, to_strategy = False, model_name: Optional[str] = None) -> Dict:
+    def _add_dates(self, cfg, train_ofst, retrain_ofst, retrains_on_valid, inference_window, to_strategy = False) -> Dict:
         
         # trial HPARAMS -> model PARAMS 
         # Calculate proper date ranges
@@ -879,10 +925,9 @@ class OptunaHparamsTuner:
         train_end = valid_start - pd.Timedelta("1ns")
         
         # Calculate number of bars in inference window
-        logger.warning(f"Inference window {inference_window} < sampling frequency {self.model_params["freq"]}. Defaulting to inference_window = frequency")
-        window_len = max(1, int(pd.Timedelta(inference_window) / pd.Timedelta(self.model_params["freq"]) ))
-        # assert window_len > 1, f"Inference window {inference_window} < sampling frequency {self.model_params["freq"]}. Consider a bigger inference_window"
-
+        
+        window_len = int(pd.Timedelta(inference_window) / pd.Timedelta(self.model_params["freq"]) )
+        assert window_len > 1, f"Inference window {inference_window} < sampling frequency {self.model_params["freq"]}"
 
         # This should always be true even if validation is not run
         assert backtest_end > backtest_start, f"Backtest start {backtest_start} must come before backtest end {backtest_end}"

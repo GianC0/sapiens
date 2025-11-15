@@ -24,8 +24,8 @@ SAPIENS_MODEL:
     claude_model: "claude-sonnet-4-20250514"
 
   optimization:
-    tune_hparams: true      # Use Optuna Bayesian search.   
-    n_trials: 10             # Optuna trials of hyper-parameters optimization
+    tune_hparams: false      # Use Optuna Bayesian search.   
+    n_trials: 3             # Optuna trials of hyper-parameters optimization
 
 # Strategy Configuration  
 SAPIENS_STRATEGY:
@@ -34,7 +34,7 @@ SAPIENS_STRATEGY:
   # Hyperparameter Optimization
   optimization:
     tune_hparams: true
-    n_trials: 10
+    n_trials: 3
     primary_objective:  "total_pnl_pct"     # used to determine the overall single best hp tuning trial in multi-objective optimization       
     objectives:                             # use only nautilus_trader portfolio_analyzer statistics
       ## Performance / Returns ##
