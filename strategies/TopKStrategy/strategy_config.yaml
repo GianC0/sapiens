@@ -91,8 +91,8 @@ STRATEGY:
       default: 2
       optuna:
         optuna_type: int_low-high
-        low: 2
-        high: 4
+        low: 3
+        high: 5
 
     # Optimizer settings
     optimizer_name:

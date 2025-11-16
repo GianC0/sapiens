@@ -1116,7 +1116,8 @@ class OptunaHparamsTuner:
             # Extract portfolio values for returns calculation
             portfolio_values = None
             # TODO: Handle Multi-currency portfolio values from strategy params
-            currency_data = acc_df[acc_df['currency'] == strategy_params_flat["currency"]]
+            currency_code = strategy_params_flat["currency"].code if hasattr(strategy_params_flat["currency"], 'code') else str(strategy_params_flat["currency"])
+            currency_data = acc_df[acc_df['currency'] == currency_code]
             portfolio_values = currency_data['total'].resample(resample_freq).last().ffill()
 
             

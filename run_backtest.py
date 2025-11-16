@@ -144,7 +144,7 @@ logger.info("🔬 STAGE 2: MODEL HYPERPARAMETER OPTIMIZATION")
 logger.info("="*70 + "\n")
 
 model_results = tuner.optimize_model()
-model_results['param_importance_fig'].show()
+#model_results['param_importance_fig'].show()
 
 print("\n✅ Model optimization complete!")
 print(f"Best model path: {model_results['model_path']}")

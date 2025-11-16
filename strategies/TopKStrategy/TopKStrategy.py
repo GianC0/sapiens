@@ -171,8 +171,19 @@ class TopKStrategy(SapiensStrategy):
         optimizer_name = self.strategy_params.get("optimizer_name", "max_sharpe")
         self.optimizer = create_optimizer(name = optimizer_name, max_adv_pct = self.max_adv_pct, weight_bounds = self.weight_bounds)
         self.rebalance_only = self.strategy_params.get("rebalance_only", False)  # Rebalance mode
-        self.top_k = self.strategy_params.get("top_k", 50)  # Portfolio size
+        self.top_k = self.strategy_params["top_k"]  # Portfolio size
         
+        
+        # Validate top_k feasibility: top_k assets need to cover full portfolio
+        max_theoretical_coverage = self.top_k * self.max_w_abs
+        assert max_theoretical_coverage >= 1.0, (
+            f"❌ Configuration error: top_k ({self.top_k}) × max_weight_abs ({self.max_w_abs}) "
+            f"= {max_theoretical_coverage:.2f} < 1.0. "
+            f"Portfolio cannot be fully allocated with these constraints.\n"
+            f"Solutions:\n"
+            f"  • Increase top_k to ≥ {int(np.ceil(1.0 / self.max_w_abs))}, OR\n"
+            f"  • Increase max_weight_abs to ≥ {1.0 / self.top_k:.3f}"
+        )
 
         # Order Manager for any strategy
         self.order_manager = OrderManager(self, self.strategy_params)
@@ -322,11 +333,16 @@ class TopKStrategy(SapiensStrategy):
         freq = self.strategy_params["freq"]
         #d_r = self.calendar.schedule(start_date=str(now - freq2pdoffset(freq)), end_date=str(now + freq2pdoffset(freq)))
         
-        # check if "now" falls outside market trading hours
+        # do not update if "now" falls outside market trading hours
         schedule = self.calendar.schedule(start_date=str(now), end_date=str(now))
         if schedule.empty:
             logger.debug(f"Non-trading day at {now}")
             return
+        assert schedule.size == 2
+        if now < pd.Timestamp(schedule.market_open.iloc[0]) or now > pd.Timestamp(schedule.market_close.iloc[0]):
+            logger.debug(f"Non-trading hour at {now}")
+            return
+
 
         # Skip if no update needed
         if self._last_update_time and now < (self._last_update_time + freq2pdoffset(freq)):
@@ -396,6 +412,13 @@ class TopKStrategy(SapiensStrategy):
         if self._last_retrain_time and now < self._last_retrain_time - self.retrain_offset:
             return
         
+        # do not retrain if "now" falls within market trading hours
+        schedule = self.calendar.schedule(start_date=str(now), end_date=str(now))
+        if not schedule.empty:
+            if pd.Timestamp(schedule.market_open.iloc[0]) <= now <= pd.Timestamp(schedule.market_close.iloc[0]):
+                logger.debug(f"Market still open at {now}")
+                return
+
         logger.debug(f"Starting model retrain at {now}")
 
         # comput how much data to load
@@ -1027,18 +1050,21 @@ class TopKStrategy(SapiensStrategy):
             # Weight bounds: constrain instrument by ADV liquidity and max allocation fraction within portfolio:
             # - keep risk-free unconstrained
             # - enforce constraints on any other type of asset
-            if symbol == self.strategy_params.get("risk_free_ticker"):
-                w_min = self.weight_bounds[0]
-                w_max = self.weight_bounds[1]
-            else:
-                max_w_constrained = min((adv_in_currency * self.max_adv_pct) / nav, self.max_w_abs)
-                w_min = max(-max_w_constrained, self.weight_bounds[0])
-                w_max = min(max_w_constrained, self.weight_bounds[1])
-            
+            #if symbol == self.strategy_params.get("risk_free_ticker"):
+            #    w_min = self.weight_bounds[0]
+            #    w_max = self.weight_bounds[1]
+            #else:
+            #    max_w_constrained = min((adv_in_currency * self.max_adv_pct) / nav, self.max_w_abs)
+            #    w_min = max(-max_w_constrained, self.weight_bounds[0])
+            #    w_max = min(max_w_constrained, self.weight_bounds[1])
+            max_w_constrained = min((adv_in_currency * self.max_adv_pct) / nav, self.max_w_abs)
+            w_min = max(-max_w_constrained, self.weight_bounds[0])
+            w_max = min(max_w_constrained, self.weight_bounds[1])
+
             # Store for weight optimization
             valid_symbols.append(symbol)
             returns_list.append(returns.values)
-            valid_expected_returns[valid_symb_count] = preds.get(symbol, 0.0)
+            valid_expected_returns[valid_symb_count] = preds.get(symbol, current_price)  # TODO: ensure all models prediction is the expected returns as % change
             current_weights[valid_symb_count] = current_w
             prices[valid_symb_count] = current_price
             allowed_weight_ranges[valid_symb_count] = [w_min, w_max]
@@ -1159,7 +1185,7 @@ class TopKStrategy(SapiensStrategy):
             target_volatility = self.target_volatility
         )
 
-        if w_opt.any():
+        if not w_opt.any():
             # No losing positions to evaluate - keep everything
             w_series = pd.Series(0.0, index=self.universe)
             logger.warning("Probably a bug. Fix this")
