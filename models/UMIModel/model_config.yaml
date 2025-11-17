@@ -17,12 +17,12 @@ MODEL:
 
     # Training
     target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
-    n_epochs:        10          # Epochs on train+valid after hp tuning and rolling initialization
+    n_epochs:        20          # Epochs on train+valid after hp tuning and rolling initialization
     batch_size:      32          # Mini-batch size for AdamW                 
     training_mode: "sequential"  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) -> Stage-1 + Stage-2
     warm_start:      true        # Enable warm-start  
     pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
-    patience:        3           # Early-stop patience 
+    patience:        5           # Early-stop patience 
     save_backups: false          # whether to save backups during walk-forward
 
 
@@ -57,7 +57,7 @@ MODEL:
       default: "48h"
       optuna:
         optuna_type: "categorical"
-        choices: ["10B","20B"] 
+        choices: ["5D","10D","20D"] 
 
     # How many Rolling Retrains on Validation. 0 if no rolling validation
     # 

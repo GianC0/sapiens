@@ -112,42 +112,6 @@ class PortfolioOptimizer:
             ef.add_constraint(cash_constraint)
         """
         
-    
-    def _apply_constraints_with_top_k(
-        self,
-        ef: EfficientFrontier,
-        stage1_weights: np.ndarray,
-        selector_k: int,
-        allowed_weight_ranges: np.ndarray,
-        current_weights: np.ndarray,
-        prices: np.ndarray,
-        nav: float,
-        cash_available: float,
-    ) -> None:
-        """
-        Force non-top-k weights to zero and reapply constraints.
-        
-        Args:
-            ef: Fresh EfficientFrontier object
-            stage1_weights: Weights from first optimization pass
-            selector_k: Number of assets to select
-            allowed_weight_ranges: Per-asset weight bounds
-            current_weights: current weights of instruments relative to nav
-            prices: np.array of current prices (float) for each instrument
-            nav: net asset valuatione i.e., current portfolio value ( - cash buffer )
-            cash_available: cash_available i.e., portfolio balance_free
-        """
-        # Pick top-k indices by absolute weight
-        idx_sorted = np.argsort(-np.abs(stage1_weights))
-        top_idx = set(idx_sorted[:selector_k])
-        
-        # Force w[i] == 0 for assets not in top-k
-        for i in range(len(stage1_weights)):
-            if i not in top_idx:
-                ef.add_constraint(lambda w, idx=i: w[idx] == 0.0)
-        
-        # Reapply other constraints
-        self._apply_constraints(ef, allowed_weight_ranges, current_weights, prices, nav, cash_available)
 
     def _get_safe_fallback_weights(
         self, 
@@ -232,16 +196,22 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
             selector_k = kwargs.get("selector_k", None)
             if selector_k is not None and selector_k < len(er):
 
+                # set non-topk to have 0 as max allocation factor
+                idx_sorted = np.argsort(-np.abs(sharpe_array))
+                top_idx = set(idx_sorted[:selector_k])
+                modified_ranges = allowed_weight_ranges.copy()
+                for i in range(len(sharpe_array)):
+                    if i not in top_idx:
+                        modified_ranges[i] = [0.0, 0.0]
+
                 # build a fresh EfficientFrontier to enforce zeros
                 ef2 = EfficientFrontier(
                     expected_returns=er,
                     cov_matrix=cov,
-                    weight_bounds=allowed_weight_ranges,
+                    weight_bounds=modified_ranges,
                 )
-
-                # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
-                # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_with_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available )
+                
+                self._apply_constraints(ef2, modified_ranges, current_weights, prices, nav, cash_available)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_sharpe(risk_free_rate=rf)
@@ -307,16 +277,22 @@ class MinVarianceOptimizer(PortfolioOptimizer):
             selector_k = kwargs.get("selector_k", None)
             if selector_k is not None and selector_k < len(er):
 
+                # set non-topk to have 0 as max allocation factor
+                idx_sorted = np.argsort(-np.abs(sharpe_array))
+                top_idx = set(idx_sorted[:selector_k])
+                modified_ranges = allowed_weight_ranges.copy()
+                for i in range(len(sharpe_array)):
+                    if i not in top_idx:
+                        modified_ranges[i] = [0.0, 0.0]
+
                 # build a fresh EfficientFrontier to enforce zeros
                 ef2 = EfficientFrontier(
                     expected_returns=er,
                     cov_matrix=cov,
-                    weight_bounds=allowed_weight_ranges,
+                    weight_bounds=modified_ranges,
                 )
-
-                # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
-                # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_with_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
+                
+                self._apply_constraints(ef2, modified_ranges, current_weights, prices, nav, cash_available)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_sharpe(risk_free_rate=rf)
@@ -393,17 +369,23 @@ class M2Optimizer(PortfolioOptimizer):
             # If selector_k is requested, run a second pass that forces non-top-k weights to zero.
             selector_k = kwargs.get("selector_k", None)
             if selector_k is not None and selector_k < len(er):
+                
+                # set non-topk to have 0 as max allocation factor
+                idx_sorted = np.argsort(-np.abs(sharpe_array))
+                top_idx = set(idx_sorted[:selector_k])
+                modified_ranges = allowed_weight_ranges.copy()
+                for i in range(len(sharpe_array)):
+                    if i not in top_idx:
+                        modified_ranges[i] = [0.0, 0.0]
 
                 # build a fresh EfficientFrontier to enforce zeros
                 ef2 = EfficientFrontier(
                     expected_returns=er,
                     cov_matrix=cov,
-                    weight_bounds=allowed_weight_ranges,
+                    weight_bounds=modified_ranges,
                 )
 
-                # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
-                # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_with_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
+                self._apply_constraints(ef2, modified_ranges, current_weights, prices, nav, cash_available)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_sharpe(risk_free_rate=rf)
@@ -498,16 +480,22 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
             selector_k = kwargs.get("selector_k", None)
             if selector_k is not None and selector_k < len(er):
 
+                # set non-topk to have 0 as max allocation factor
+                idx_sorted = np.argsort(-np.abs(sharpe_array))
+                top_idx = set(idx_sorted[:selector_k])
+                modified_ranges = allowed_weight_ranges.copy()
+                for i in range(len(sharpe_array)):
+                    if i not in top_idx:
+                        modified_ranges[i] = [0.0, 0.0]
+
                 # build a fresh EfficientFrontier to enforce zeros
                 ef2 = EfficientFrontier(
                     expected_returns=er,
                     cov_matrix=cov,
-                    weight_bounds=allowed_weight_ranges,
+                    weight_bounds=modified_ranges,
                 )
-
-                # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
-                # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_with_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
+                
+                self._apply_constraints(ef2, modified_ranges, current_weights, prices, nav, cash_available)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.max_quadratic_utility(risk_aversion=self.risk_aversion)
@@ -578,16 +566,22 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
             selector_k = kwargs.get("selector_k", None)
             if selector_k is not None and selector_k < len(er):
 
+                # set non-topk to have 0 as max allocation factor
+                idx_sorted = np.argsort(-np.abs(sharpe_array))
+                top_idx = set(idx_sorted[:selector_k])
+                modified_ranges = allowed_weight_ranges.copy()
+                for i in range(len(sharpe_array)):
+                    if i not in top_idx:
+                        modified_ranges[i] = [0.0, 0.0]
+
                 # build a fresh EfficientFrontier to enforce zeros
                 ef2 = EfficientFrontier(
                     expected_returns=er,
                     cov_matrix=cov,
-                    weight_bounds=allowed_weight_ranges,
+                    weight_bounds=modified_ranges,
                 )
-
-                # Force w[i] == 0 for assets not in top-k AND enforce all other constraints
-                # Use equality by adding both <=0 and >=0 (robust)
-                self._apply_constraints_with_top_k(ef2, sharpe_array, selector_k, allowed_weight_ranges, current_weights, prices, nav, cash_available)
+                
+                self._apply_constraints(ef2, modified_ranges, current_weights, prices, nav, cash_available)
 
                 # Solve constrained max-sharpe on the top-k subset
                 ef2.efficient_risk(target_volatility=target_volatility)

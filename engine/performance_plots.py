@@ -552,7 +552,7 @@ def plot_active_returns_heatmap(
     # Annotate cells
     threshold = vmax * 0.5
     for i in range(len(heatmap_data.T.index)):
-        for j in range(len(heatmap_data.columns)):
+        for j in range(len(heatmap_data.T.columns)):
             val = heatmap_data.T.iloc[i, j]
             if not np.isnan(val):
                 text_color = "white" if abs(val) > threshold else "black"

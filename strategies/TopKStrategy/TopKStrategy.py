@@ -191,6 +191,9 @@ class TopKStrategy(SapiensStrategy):
 
         # Final liquidation flag
         self.final_liquidation_happend = False
+
+        # On-retrain is postponed flag (when retrain falls within market hours)
+        self._postponed_retrain_scheduled = False
         
 
 
@@ -257,6 +260,7 @@ class TopKStrategy(SapiensStrategy):
             callback=self.on_update,
         )
         
+        # TODO: improve it to generalize
         self.clock.set_timer(
             name="retrain_timer",
             interval=pd.Timedelta(days=self.retrain_offset.n),
@@ -401,22 +405,34 @@ class TopKStrategy(SapiensStrategy):
         """Periodic model retraining."""
         if event.name != "retrain_timer":
             return
-        
+
         if self.clock.utc_now() <= self.valid_start:
             logger.debug("No retrain before all initial data is loaded.")
             return
         
+        # Update the postponed_retrain flag for next retrain
+        if event.name == "postponed_retrain":
+            self._postponed_retrain_scheduled = False
+
         now = pd.Timestamp(self.clock.utc_now(),)
         
         # Skip if too soon since last retrain
-        if self._last_retrain_time and now < self._last_retrain_time - self.retrain_offset:
-            return
+        #if self._last_retrain_time and now < self._last_retrain_time + self.retrain_offset:
+        #    return
         
         # do not retrain if "now" falls within market trading hours
         schedule = self.calendar.schedule(start_date=str(now), end_date=str(now))
         if not schedule.empty:
-            if pd.Timestamp(schedule.market_open.iloc[0]) <= now <= pd.Timestamp(schedule.market_close.iloc[0]):
-                logger.debug(f"Market still open at {now}")
+            market_close = pd.Timestamp(schedule.market_close.iloc[0])
+            if now <= market_close:
+                if not self._postponed_retrain_scheduled:
+                    logger.debug(f"Market still open at {now}, postponing retrain to {market_close}")
+                    self.clock.set_time_alert(
+                        name="postponed_retrain",
+                        alert_time=market_close,
+                        callback=self.on_retrain
+                    )
+                    self._postponed_retrain_scheduled = True
                 return
 
         logger.debug(f"Starting model retrain at {now}")
@@ -1083,8 +1099,10 @@ class TopKStrategy(SapiensStrategy):
         returns_df = pd.DataFrame(returns_list).T
         cov_horizon = returns_df.cov().values * float(self.pred_len) # scaled to pred_len horizon
 
-        # Just Keep cash and sell only if expected loss > commissions
-        if np.all(valid_expected_returns <= current_rf):
+        # Keep cash and do sell-only if either case:
+        # - if expected loss > commissions
+        # - if all the assets with positive returns have sufficient max allocation constraints to cover for the whole portfolio nav
+        if np.all(valid_expected_returns <= current_rf) or np.sum(allowed_weight_ranges[valid_expected_returns > current_rf, 1]) < 1 :
             logger.debug("All expected returns <= risk-free rate. Minimizing losses..")
             
             # Start with current weights (default: keep everything)

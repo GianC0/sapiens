@@ -12,7 +12,7 @@ STRATEGY:
 
     # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
-    freq: 1h                     # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
+    freq: 15min                  # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
     #train_offset:               # Optimized during model hp tuning
     #backtest_start: "2024-06-01" # Start of walk-forward evaluation.
     #backtest_end:   "2024-12-01" # End of walk-forward evaluation.
@@ -69,17 +69,20 @@ STRATEGY:
 
     # Liquidity constraints   
     liquidity:
-      adv_lookback: 20D     # Look-back window to compute Average Daily Volume (ADV)
+      adv_lookback: "20D"     # Look-back window to compute Average Daily Volume (ADV)
       max_adv_pct:  0.20    # Max trade size = 20% of average daily traded volume for that instrument to use for weights 
 
     # Risk Management
     risk:
-      max_weight_abs:     0.4                # Max x% NAV per single position        (concentration limit)
-      drawdown_max:       0.15               # Kill-switch at 15 % peak-to-trough     (Kelly criterion risk control)
+      max_weight_abs:     0.5                # Max x% NAV per single position        
+      drawdown_max:       0.15               # Kill-switch at 15 % peak-to-trough   
       trailing_stop_max:  0.05               # % trailing stop from HWM/LWM 5% for single instrument
       target_volatility:  0.05               # 5% tarket volatility for efficient risk optimizer             
         
       #max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
+
+    # Window used to estimates covariance of volatility, returns and risk related metrics
+    optimizer_lookback: "20D"
 
   # Hyperparameters to optimize
   HPARAMS:
@@ -101,11 +104,6 @@ STRATEGY:
         optuna_type: categorical
         choices: ["m2"] # , "min_variance", "equal_weight", "max_sharpe", "m2"
     
-    optimizer_lookback: # Window used to estimates covariance of volatility, returns and risk related metrics
-      default: "60B"
-      optuna:
-        optuna_type: categorical
-        choices: ["10B", "20B"]
     
     
     #risk_target_volatility_annual:           # Volatility target (Hull, risk parity) 15 % only for "efficient_risk" optimizer 

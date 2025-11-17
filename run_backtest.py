@@ -157,7 +157,7 @@ logger.info("📊 STAGE 3: STRATEGY HYPERPARAMETER OPTIMIZATION")
 logger.info("="*70 + "\n")
 
 strategy_results = tuner.optimize_strategy(model_name=model_name)
-strategy_results['param_importance_fig'].show()
+#strategy_results['param_importance_fig'].show()
 
 print("\n✅ Strategy optimization complete!")
 print(f"Best hyperparameters: {strategy_results['hparams']}")
@@ -167,7 +167,7 @@ for metric, value in strategy_results['metrics'].items():
 print(f"\nMLflow run ID: {strategy_results['mlflow_run_id']}")
 
 
-
+"""
 # Get optimization context
 run = client.get_run(strategy_results["mlflow_run_id"])
 optimization_id = run.data.tags.get("optimization_id", "")
@@ -196,3 +196,5 @@ print("\nFinal Performance Metrics:")
 print("="*50)
 for metric, value in sorted(final_metrics.items()):
     print(f"{metric:.<40} {value:>10.4f}")
+
+"""

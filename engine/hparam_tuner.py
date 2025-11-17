@@ -1258,13 +1258,13 @@ class OptunaHparamsTuner:
             # ═══════════════════════════════════════════════════════════════
             # 11. Portfolio Allocation (if position data available)
             # ═══════════════════════════════════════════════════════════════
-            """
+            
             fig11 = plot_portfolio_allocation(
                 positions_df=time_series['positions'],
                 resample_freq=resample_freq,
                 save_path=output_dir / 'portfolio_allocation.png'
             )
-            """
+            
 
             self.mlflow_client.log_artifacts(run_id = run_id , local_dir = str(output_dir))
 
