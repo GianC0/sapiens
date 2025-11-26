@@ -20,7 +20,7 @@ MODEL:
     n_epochs:        20          # Epochs on train+valid after hp tuning and rolling initialization
     batch_size:      32          # Mini-batch size for AdamW                 
     training_mode: "sequential"  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) -> Stage-1 + Stage-2
-    warm_start:      true        # Enable warm-start  
+    warm_start:      false       # Enable warm-start  
     pretrain_epochs: 5           # Stage-1 warm-up epochs in hybrid mode
     patience:        5           # Early-stop patience 
     save_backups: false          # whether to save backups during walk-forward

@@ -9,6 +9,7 @@ This module contains implementations for:
 """
 
 
+from ast import Dict
 import math
 from typing import Tuple, Optional
 
@@ -20,25 +21,6 @@ from torch.nn import TransformerEncoder, TransformerEncoderLayer, LayerNorm
 ###############################################################################
 # Utility losses & metrics                                                    #
 ###############################################################################
-
-
-class SupervisedInfoNCE(nn.Module):
-    """Supervised InfoNCE (user‑provided)."""
-
-    def __init__(self, temperature: float = 0.07):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, features: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        features = F.normalize(features, dim=-1)
-        sim = features @ features.t() / self.temperature
-        mask = (target.unsqueeze(1) == target.t().unsqueeze(0)).float()
-        pos_mask = mask - torch.diag(torch.ones(mask.size(0), device=mask.device))
-        neg_mask = 1.0 - mask
-        pos_add = neg_mask * -1000.0
-        neg_add = pos_mask * -1000.0
-        per_ex = (sim * pos_mask + pos_add).logsumexp(-1) - (sim * neg_mask + neg_add).logsumexp(-1)
-        return -per_ex.mean()
 
 
 def rank_ic(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -85,21 +67,33 @@ class StockLevelFactorLearning(nn.Module):
         # For each stock i: weighted sum of other stocks j
         virt = torch.einsum('btj,ij->bti', prices_seq, beta_masked)  # (B,L+1,I)
 
-        attn = self.attn_weights.masked_fill(im , -1e9)
-        attn = F.softmax(attn, dim=1)
 
-        u_seq = torch.einsum('bti,ij->btj', virt, attn)  # (B,L+1,I)
+        attn = self.attn_weights.masked_fill(~im, -1e9)
+        attn = F.softmax(attn, dim=1)  # (Eq. 9)
+
+
+        p_tilde_sigma = torch.einsum('btj,ji->bti', virt, attn)  # (B,L+1,I)
+        u_seq = p_tilde_sigma - prices_seq  # Eq. 10: u_t = p̃_t(Σ) - p_t
 
 
         # ─── Masked-out Losses ─────────────────────────────────────────────────────────────────
         active_mask = active_mask.unsqueeze(1)           # (B,1,I)
-        m_beta = active_mask.expand(-1, L1, -1)          # (B,T,I)
-        m_stat = active_mask.expand(-1, L1 - 1, -1)      # (B,T-1,I)
+        
+        # ─── Loss computation (only during training) ───────────────────────
+        if self.training:
+            m_beta = active_mask.expand(-1, L1, -1)          # (B,T,I)
+            m_stat = active_mask.expand(-1, L1 - 1, -1)      # (B,T-1,I)
 
-        loss_beta = F.mse_loss(prices_seq[m_beta], virt[m_beta].detach())
-        loss_station = F.mse_loss(u_seq[:, 1:][m_stat], self.rho * u_seq[:, :-1][m_stat])
-        loss = loss_beta + self.lambda_ic * loss_station
-        return u_seq, loss, {"loss_beta": loss_beta.detach(), "loss_station": loss_station.detach()}
+            loss_beta = F.mse_loss(prices_seq[m_beta], p_tilde_sigma[m_beta])
+            loss_station = F.mse_loss(u_seq[:, 1:][m_stat], self.rho * u_seq[:, :-1][m_stat])
+            loss = loss_beta + self.lambda_ic * loss_station
+            loss_dict = {"loss_beta": loss_beta.detach(), "loss_station": loss_station.detach()}
+        else:
+            # Inference: return dummy losses
+            loss = torch.tensor(0.0, device=prices_seq.device)
+            loss_dict = {}
+
+        return u_seq, loss, loss_dict
 
 ###############################################################################
 # Market‑level factor (Eqs. 16‑24)                                            #
@@ -136,8 +130,11 @@ class MarketLevelFactorLearning(nn.Module):
         self.W_iota = nn.Linear(num_stocks, self.out_dim, bias=False)
         self.w_eta  = nn.Parameter(torch.randn(self.out_dim))
 
+        # Eq. 21: w_M and b_M for contrastive learning criterion D(·,·)
+        self.w_M = nn.Parameter(torch.randn(4 * feature_dim)* 0.01)
+        self.b_M = nn.Parameter(torch.zeros(1))
+
         # objectives
-        self.info_nce  = SupervisedInfoNCE(temperature)
         self.sync_cls  = nn.Sequential(
             nn.Linear(self.out_dim, self.out_dim),
             nn.ReLU(),
@@ -179,11 +176,18 @@ class MarketLevelFactorLearning(nn.Module):
 
             r_hist = torch.einsum("bli,blif->bif", ATT, e_window)  # (B,I,F)
             r_t    = torch.cat([e_t, r_hist], -1)                  # (B,I,2F)
-
+            
             eta_in = self.W_iota(stockID_b) + r_t                    # (B,I,2F)
             eta    = F.relu(torch.einsum("bif,f->bi", eta_in, self.w_eta)) # (B,I)
 
-            m_t    = self._weighted_mean(eta[:, active_mask[0]], r_t[:, active_mask[0]])  #(1)               # (B,2F)
+            # Mask out inactive stocks before weighted mean
+            eta_masked = eta * active_mask.float()  # (B,I)
+            r_t_masked = r_t * active_mask.unsqueeze(-1).float()  # (B,I,2F)
+            m_t    = self._weighted_mean(eta_masked, r_t_masked)  # (B,2F)
+
+            #m_tt    = self._weighted_mean(eta[:, active_mask[0]], r_t[:, active_mask[0]])  #(1)               # (B,2F)
+
+
             return r_t, m_t, eta
 
     def forward(
@@ -192,7 +196,7 @@ class MarketLevelFactorLearning(nn.Module):
         stockID: torch.Tensor,    # (I,I) identity matrix
         active_mask: Optional[torch.Tensor] = None,  # (B,I) mask for active stocks
         close_idx: int = 3,       # OHLCV index from 0 to
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
         Returns
             r_t : (B,I,2F)  – current dynamic stock embeddings
@@ -215,53 +219,79 @@ class MarketLevelFactorLearning(nn.Module):
         L_cur  = min(self.L, T)
         r_t, m_t, _ = self._compute_m_t(e_seq[:, -L_cur:], stockID_b, active_mask)  # (B,I,2F) , (B,2F)
 
-        # ---------------- contrastive InfoNCE (Eq. 20-21) ---------
-        m1_list, m2_list, period_ids = [], [], []
-        for τ in range(T):
-            # split S1 / S2  (same for the whole batch, random per τ)
-            idx = torch.randperm(I, device=e_seq.device)
-            S1, S2 = idx[: I // 2], idx[I // 2 :]
+        if self.training:
+            # ---------------- contrastive InfoNCE (Eq. 20-21) ---------
+            m1_list, m2_list, period_ids = [], [], []
+            for τ in range(T):
+                # split S1 / S2  (same for the whole batch, random per τ)
+                idx = torch.randperm(I, device=e_seq.device)
+                S1, S2 = idx[: I // 2], idx[I // 2 :]
 
-            Lτ = min(self.L, τ + 1)
-            r_τ, m_τ, eta_τ= self._compute_m_t(e_seq[:, τ - Lτ + 1 : τ + 1], stockID_b, active_mask)  # (B,I,2F), (B,2F), (B,I,2F)
-            m1 = self._weighted_mean(eta_τ[:, active_mask[0]][:, S1], r_τ[:, active_mask[0], :][:, S1])  # (B,2F)
-            m2 = self._weighted_mean(eta_τ[:, active_mask[0]][:, S2], r_τ[:, active_mask[0], :][:, S2])  # (B,2F)
-            m1_list.append(m1) ; m2_list.append(m2)
-            period_ids.append(torch.full((B,), τ, device=e_seq.device, dtype=torch.long))
+                Lτ = min(self.L, τ + 1)
+                r_τ, m_τ, eta_τ= self._compute_m_t(e_seq[:, τ - Lτ + 1 : τ + 1], stockID_b, active_mask)  # (B,I,2F), (B,2F), (B,I,2F)
+                m1 = self._weighted_mean(eta_τ[:, active_mask[0]][:, S1], r_τ[:, active_mask[0], :][:, S1])  # (B,2F)
+                m2 = self._weighted_mean(eta_τ[:, active_mask[0]][:, S2], r_τ[:, active_mask[0], :][:, S2])  # (B,2F)
+                m1_list.append(m1) ; m2_list.append(m2)
+                period_ids.append(torch.full((B,), τ, device=e_seq.device, dtype=torch.long))
 
-        feats   = torch.cat(m1_list + m2_list, 0)                         # (2B*T,2F)
-        labels  = torch.cat(period_ids * 2,      0)                       # (2B*T)
-        loss_contrast = self.info_nce(feats, labels)
+            # Stack market representations
+            m1_all = F.normalize(torch.stack(m1_list, dim=0), dim=-1)  # (T, B, 2F)
+            m2_all = F.normalize(torch.stack(m2_list, dim=0),dim=-1)   # (T, B, 2F)
+            # Compute all time pairs
+            m1_exp = m1_all.unsqueeze(1).expand(-1, T, -1, -1)  # (T, T, B, 2F)
+            m2_exp = m2_all.unsqueeze(0).expand(T, -1, -1, -1)  # (T, T, B, 2F)
+            concat = torch.cat([m1_exp, m2_exp], dim=-1)        # (T, T, B, 4F)
 
-        # ---------------- synchronism labels (Eq. 15) ----------------
-        close = e_seq[..., close_idx]                      # (B,T,I)
-        ret   = torch.log(close[:, 1:] / (close[:, :-1] + 1e-8))  # (B,T-1,I)
-        pos_ratio = (ret > 0).float().mean(-1)             # (B,T-1)
-        neg_ratio = (ret < 0).float().mean(-1)              # (B,T-1)
-        sync_lbls = torch.where(
-            pos_ratio >= self.sync_threshold, 0,
-            torch.where(neg_ratio >= self.sync_threshold, 1, 2)
-        )                                                  # (B,T-1)
+            # Time-weighted scores (Eq. 21)
+            # D(m_t^(1), m_t^(2)) = exp(1/(|t-t'|+1) * (w_M^T * concat + b_M))
+            scores = torch.einsum("tsbf,f->tsb", concat, self.w_M) + self.b_M   # (T, T, B)
+            scores = torch.clamp(scores, min=-10, max=10)
+            times = torch.arange(T, device=scores.device)
+            time_weights = 1.0 / (torch.abs(times.unsqueeze(0) - times.unsqueeze(1)).float() + 1.0)
+            
 
-        # compute m_{t-1} for every t
-        m_prev = []
-        for t in range(1, T):
-            Lτ = min(self.L, t)
-            _, m_prev_t, _ = self._compute_m_t(e_seq[:, t - Lτ : t], stockID_b)
-            m_prev.append(m_prev_t)
-        m_prev = torch.stack(m_prev, 1)                    # (B,T-1,2F)
+            # Contrastive loss (Eq. 20)
+            weighted_scores = torch.exp(scores * time_weights.unsqueeze(-1))
+            pos = torch.diagonal(weighted_scores, dim1=0, dim2=1).t()
+            neg = weighted_scores.sum(dim=1) - pos
+            loss_contrast = -torch.log(pos / (pos + neg + 1e-8)).mean()
 
-        logits_sync = self.sync_cls(m_prev)                # (B,T-1,3)
-        loss_sync   = F.cross_entropy(
-            logits_sync.reshape(-1, 3),
-            sync_lbls.reshape(-1),
-        )
+            # ---------------- synchronism labels (Eq. 15) ----------------
+            close = e_seq[..., close_idx]                      # (B,T,I)
+            ret   = torch.log(close[:, 1:] / (close[:, :-1] + 1e-8))  # (B,T-1,I)
+            pos_ratio = (ret > 0).float().mean(-1)             # (B,T-1)
+            neg_ratio = (ret < 0).float().mean(-1)              # (B,T-1)
+            sync_lbls = torch.where(
+                pos_ratio >= self.sync_threshold, 0,
+                torch.where(neg_ratio >= self.sync_threshold, 1, 2)
+            )                                                  # (B,T-1)
 
-        loss_total = loss_contrast + self.lambda_sync * loss_sync
-        return r_t, m_t, loss_total, {
-            "loss_contrast": loss_contrast.detach(),
-            "loss_sync":     loss_sync.detach(),
-        }
+            # compute m_{t-1} for every t
+            m_prev = []
+            for t in range(1, T):
+                Lτ = min(self.L, t)
+                _, m_prev_t, _ = self._compute_m_t(e_seq[:, t - Lτ : t], stockID_b)
+                m_prev.append(m_prev_t)
+            m_prev = torch.stack(m_prev, 1)                    # (B,T-1,2F)
+
+            logits_sync = self.sync_cls(m_prev)                # (B,T-1,3)
+            loss_sync   = F.cross_entropy(
+                logits_sync.reshape(-1, 3),
+                sync_lbls.reshape(-1),
+            )
+
+            loss_total = loss_contrast + self.lambda_sync * loss_sync
+            loss_dict = {
+                "loss_contrast": loss_contrast.detach(),
+                "loss_sync": loss_sync.detach(),
+                }
+        else:
+            # Inference: skip loss computation
+            loss_total = torch.tensor(0.0, device=e_seq.device)
+            loss_dict = {}
+
+
+        return r_t, m_t, loss_total, loss_dict
 
 
 ###############################################################################

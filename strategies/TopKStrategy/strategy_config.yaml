@@ -12,7 +12,7 @@ STRATEGY:
 
     # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
-    freq: 15min                  # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
+    freq: 10min                  # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
     #train_offset:               # Optimized during model hp tuning
     #backtest_start: "2024-06-01" # Start of walk-forward evaluation.
     #backtest_end:   "2024-12-01" # End of walk-forward evaluation.

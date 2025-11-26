@@ -7,7 +7,7 @@ import pandas as pd
 import mlflow
 from mlflow import MlflowClient
 import tqdm as notebook_tqdm
-
+from engine.ModelGenerator import ModelGenerator
 
 # Nautilus Trader
 from nautilus_trader.model.objects import Currency
@@ -59,7 +59,7 @@ if sapiens_config["SAPIENS_MODEL"]['generate_model']:
     logger.info("🔬 MODEL GENERATION VIA DEEPCODE")
     logger.info("="*70)
     
-    from engine.ModelGenerator import ModelGenerator
+
     
     gen_cfg = sapiens_config["SAPIENS_MODEL"]['generation']
     generator = ModelGenerator(gen_cfg)
