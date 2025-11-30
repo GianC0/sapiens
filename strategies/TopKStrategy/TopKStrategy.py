@@ -27,6 +27,7 @@ import torch
 from decimal import Decimal
 from dataclasses import dataclass, field
 import logging
+import pickle
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.currencies import USD,EUR
 from nautilus_trader.model.objects import Price, Quantity, Money
@@ -56,6 +57,7 @@ from nautilus_trader.model.events import (
 )
 
 from models import SapiensModel
+from augmentation import SapiensAugmentor
 logger = logging.getLogger(__name__)
 # ----- project imports -----------------------------------------------------
 
@@ -368,6 +370,23 @@ class TopKStrategy(SapiensStrategy):
             logger.warning("DATA DICTIONARY EMPTY WITHIN STRATEGY UPDATE() CALL")
             return
         
+        try:
+            # Normalize column names (strategy uses Title case, augmentor expects lowercase)
+            data_dict_lower = {
+                iid: df.rename(columns=str.lower) 
+                for iid, df in data_dict.items()
+            }
+            
+            # Augmentor fetches its own history from cache internally
+            augmented_dict = self.augmentor.augment(data_dict_lower)
+            
+            # Use augmented data for prediction
+            data_dict = augmented_dict  # Replace with augmented data
+            
+        except Exception as e:
+            logger.error(f"Augmentation failed in on_update: {e}", exc_info=True)
+            return
+
         # TODO: superflous. consider removing compute active mask
         assert torch.equal(self.active_mask, self._compute_active_mask()) , "Active mask mismatch between strategy and data engine"
 
@@ -855,6 +874,48 @@ class TopKStrategy(SapiensStrategy):
 
         logger.info(f"Selected {len(selected)} from {len(self.cache.instruments(venue=self.venue))} candidates (including benchmark and risk-free) ")
         self.universe = sorted(selected)
+
+    def _initialize_augmentor(self) -> SapiensAugmentor:
+        """Build and initialize the data augmentor."""
+        # Import augmentor class dynamically 
+
+        model_dir = Path(self.model_params["model_dir"])
+        augmentor_state_path = model_dir / "augmentor_state.pkl"
+        
+        if not augmentor_state_path.exists():
+            raise FileNotFoundError(f"Augmentor state not found: {augmentor_state_path}")
+        
+        # Load state to get class info
+        with open(augmentor_state_path, 'rb') as f:
+            augmentor_state = pickle.load(f)
+        
+        # Dynamic import
+        augmentor_module_path = augmentor_state['module_path']
+        augmentor_class_name = augmentor_state['class_name']
+        
+        aug_module = importlib.import_module(augmentor_module_path)
+        AugmentorClass = getattr(aug_module, augmentor_class_name, None)
+        
+        if AugmentorClass is None:
+            raise ImportError(
+                f"Could not find augmentor class {augmentor_class_name} in {augmentor_module_path}"
+            )
+        
+        # Load using class method
+        augmentor = AugmentorClass.load_state(
+            path=augmentor_state_path,
+            stream_cache=self.cache,
+            modality="stream"
+        )
+        
+        # Set frequency for bar retrieval
+        augmentor.set_freq(self.strategy_params["freq"])
+        
+        logger.info(f"✅ Loaded {augmentor_class_name} in stream mode")
+        
+        return augmentor
+
+
     def _initialize_model(self) -> SapiensMode:
         """Build and initialize the model."""
         # Import model class dynamically

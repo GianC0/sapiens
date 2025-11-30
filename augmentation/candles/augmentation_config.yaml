@@ -1,0 +1,14 @@
+#configs specific to OHCLV augmentor
+AUGMENTATION:
+  PARAMS:
+    augmentor_name: "CandlesAugmentor"  # name of the augmentor
+    technical_indicators: true        # add technical indicators as features
+
+  HPARAMS:  # optuna_type: "categorical", low-high (assumed float), int_low-high, log_low-high
+
+    techinds_timeperiod:
+      default: 14
+      optuna:
+        optuna_type: categorical
+        choices: [14,38] 
+      

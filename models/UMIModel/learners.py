@@ -405,7 +405,7 @@ class PositionalEncoding(nn.Module):
             torch.arange(0, d_model, 2).float() * (-math.log(10_000.0) / d_model)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[: pe[:, 1::2].shape[1]]) #to handle odd d_model
         pe = pe.unsqueeze(0)          # (1, max_len, d_model)  -> broadcastable
         self.register_buffer("pe", pe)
 

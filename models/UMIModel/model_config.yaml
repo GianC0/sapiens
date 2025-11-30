@@ -17,7 +17,7 @@ MODEL:
 
     # Training
     target_idx:      3           # target column idx (from 0..N-1) in the CSV (e.g., Close Price)
-    n_epochs:        20          # Epochs on train+valid after hp tuning and rolling initialization
+    n_epochs:        2           # Epochs on train+valid after hp tuning and rolling initialization
     batch_size:      32          # Mini-batch size for AdamW                 
     training_mode: "sequential"  # “sequential”: Stage-1 → Stage-2    /   “hybrid”  : Stage-1 (pretrain_epochs) -> Stage-1 + Stage-2
     warm_start:      true        # Enable warm-start  

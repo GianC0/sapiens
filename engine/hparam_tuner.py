@@ -56,6 +56,7 @@ from datetime import datetime, time
 import importlib
 import logging
 logger = logging.getLogger(__name__)
+import pickle
 
 from engine.performance_plots import (
     get_frequency_params,
@@ -91,6 +92,7 @@ class OptunaHparamsTuner:
         catalog: ParquetDataCatalog,
         sapiens_config: Dict[str, Any],
         strategy_config: Dict[str, Any],
+        data_config: Optional[Dict[str, Any]] = None,
         model_config: Optional[Dict[str, Any]] = None,
         run_dir: Path = Path("logs/backtests/"),
     ):
@@ -117,11 +119,14 @@ class OptunaHparamsTuner:
 
         # Combine configs
         self.config = {
+            'DATA' : data_config,
             'MODEL': model_config,
             'STRATEGY': strategy_config
         }
         
         # Extract sections
+        self.data_params = self.config['DATA']['PARAMS']
+        self.data_hparams = self.config['DATA'].get('HPARAMS', {})
         self.model_params = self.config['MODEL']['PARAMS']
         self.model_hparams = self.config['MODEL'].get('HPARAMS', {})
         self.strategy_params = self.config['STRATEGY']['PARAMS']
@@ -236,6 +241,8 @@ class OptunaHparamsTuner:
         """
 
         # Setup run path
+        augmentor_folder = self.sapiens_config["SAPIENS_DATA"]['features_to_load']
+        augmentor_name = self.data_params['augmentor_name']
         model_name = self.model_params["model_name"]
         study_path = self.run_dir / "Models" / model_name
 
@@ -265,6 +272,11 @@ class OptunaHparamsTuner:
         if ModelClass is None:
             raise ImportError(f"Could not find model class in models.{model_name}")
 
+        # Inizialize Augmentor Class
+        aug = importlib.import_module(f"augmentation.{augmentor_folder}.{augmentor_name}")
+        AugmentorClass = getattr(aug, augmentor_name, None)
+        if AugmentorClass is None:
+            raise ImportError(f"Could not find augmentor class in augmentation.{augmentor_folder}")
         
         # Define objective function for model
         def model_objective(trial: optuna.Trial) -> float:
@@ -296,6 +308,12 @@ class OptunaHparamsTuner:
             end = model_params_flat["valid_end"]
             data_dict = self.get_ohlcv_data_from_catalog(frequency = self.model_params["freq"], start=start, end=end, instrument_ids=self.instrument_ids)
 
+            # Data Augmentation
+            augmentor = AugmentorClass(cfg=self.sapiens_config["SAPIENS_DATA"], augment_modality = "train")
+            data_dict = augmentor.augment(data_dict)
+            feature_dim = len(next(iter(data_dict.values())).columns)
+            model_params_flat["feature_dim"] = feature_dim #rewrite feature_dim after augmentation
+ 
             # Start MLflow run for this trial
             mlflow.set_tracking_uri("file:logs/mlflow")
             mlflow.set_experiment("Models")
@@ -343,6 +361,11 @@ class OptunaHparamsTuner:
                 trial.set_user_attr("model_path", str(model_dir / "init.pt"))
                 trial.set_user_attr("model_params_flat", yaml_safe(trial_hparams | model_params_flat) )
                 trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
+
+                # Store augmentor state
+                augmentor_path = model_dir / "augmentor_state.pkl"
+                augmentor.save_state(augmentor_path)
+                #mlflow.log_artifact(str(augmentor_path))
                 
                 logger.info(f"  Trial {trial.number}: loss = {score:.6f}")
                 
