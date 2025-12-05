@@ -369,23 +369,7 @@ class TopKStrategy(SapiensStrategy):
         if not data_dict:
             logger.warning("DATA DICTIONARY EMPTY WITHIN STRATEGY UPDATE() CALL")
             return
-        
-        try:
-            # Normalize column names (strategy uses Title case, augmentor expects lowercase)
-            data_dict_lower = {
-                iid: df.rename(columns=str.lower) 
-                for iid, df in data_dict.items()
-            }
-            
-            # Augmentor fetches its own history from cache internally
-            augmented_dict = self.augmentor.augment(data_dict_lower)
-            
-            # Use augmented data for prediction
-            data_dict = augmented_dict  # Replace with augmented data
-            
-        except Exception as e:
-            logger.error(f"Augmentation failed in on_update: {e}", exc_info=True)
-            return
+
 
         # TODO: superflous. consider removing compute active mask
         assert torch.equal(self.active_mask, self._compute_active_mask()) , "Active mask mismatch between strategy and data engine"
@@ -994,7 +978,26 @@ class TopKStrategy(SapiensStrategy):
             
             df.sort_index(inplace=True)
             data_dict[iid] = df
-        
+
+                
+            try:
+                # Normalize column names (strategy uses Title case, augmentor expects lowercase)
+                data_dict_lower = {
+                    iid: df.rename(columns=str.lower) 
+                    for iid, df in data_dict.items()
+                }
+                
+                # Augmentor fetches its own history from cache internally
+                augmented_dict = self.augmentor.augment(data_dict_lower)
+                
+                # Use augmented data for prediction
+                data_dict = augmented_dict  # Replace with augmented data
+
+                logger.debug(f"Data augmented for prediction at {pd.Timestamp(self.clock.utc_now())}")
+                
+            except Exception as e:
+                logger.error(f"Augmentation failed in on_update: {e}", exc_info=True)
+
         return data_dict
     
     def _get_risk_free_return(self) -> float:

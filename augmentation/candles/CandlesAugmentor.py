@@ -37,11 +37,14 @@ class CandlesAugmentor(SapiensAugmentor):
         # NEW: Rolling buffers per instrument (stores last N bars)
         self.max_lookback = cfg.get("techinds_timeperiod", 14)  # e.g., 50 bars
         self.buffers = {}  # {instrument_id: deque of bars}
+
+                    # Store for later use
+        self.normalization_params = {}
     
     @property
     def source(self):
         """Dynamically return talib or talib.stream based on modality."""
-        return talib if self.modality == "train" else talib.stream
+        return talib if self.modality == "train" else talib #.stream TODO: if changing to storing TAs
 
     
     def save_state(self, path: Path) -> None:
@@ -61,7 +64,7 @@ class CandlesAugmentor(SapiensAugmentor):
             'freq': self.freq,
             'max_lookback': self.max_lookback,
             # Add normalization and other state params when implemented
-            # 'normalization_params': self.normalization_params,
+            'normalization_params': self.normalization_params,
         }
         
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,8 +107,8 @@ class CandlesAugmentor(SapiensAugmentor):
         augmentor.max_lookback = state['max_lookback']
         
         # Restore normalization and other state params when implemented
-        # if 'normalization_params' in state:
-        #     augmentor.normalization_params = state['normalization_params']
+        if 'normalization_params' in state:
+             augmentor.normalization_params = state['normalization_params']
         
         logger.info(f"Loaded augmentor state from {path} in {modality} mode")
         
@@ -124,8 +127,8 @@ class CandlesAugmentor(SapiensAugmentor):
         
         # Collect all features that need normalization
         features_to_normalize = (
-            self.technical_indicators_list + 
-            self.statistical_features_list
+            self.technical_indicators_list
+            #+ self.statistical_features_list
         )
         
         if not features_to_normalize:
@@ -262,7 +265,7 @@ class CandlesAugmentor(SapiensAugmentor):
         #out = self._add_time_features(out)
         
         # Normalize (different behavior for train vs stream)
-        #out = self._normalize_features(out)
+        out = self._normalize_features(out)
         
         return out
             
@@ -351,8 +354,9 @@ class CandlesAugmentor(SapiensAugmentor):
             if self.modality == "train":
                 out[indicator_name] = values
             elif self.modality == "stream":
-                out.iloc[-1, out.columns.get_loc(indicator_name)] = values
-
+                #out.iloc[-1, out.columns.get_loc(indicator_name)] = values
+                out[indicator_name] = values #TODO: if eventually previous TAs are stored, add only last value instead of recomputing
+                
         # Store the list after all indicators are added
         self.technical_indicators_list = list(dict_indicators.keys())
 
