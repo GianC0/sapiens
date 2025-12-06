@@ -133,13 +133,14 @@ class OptunaHparamsTuner:
         self.strategy_hparams = self.config['STRATEGY'].get('HPARAMS', {})
         
         # Sync shared params
-        self.model_params["freq"] = self.strategy_params["freq"]
+        self.model_params["freq"] = self.strategy_params["freq"] = self.data_params["freq"]
         self.model_params["calendar"] = self.strategy_params["calendar"]
 
         # TODO: Centralized Setup correct types (Dates and offsets). Now done in specific model/strategy
         
 
         # Split hparams into defaults and search spaces
+        self.data_defaults, self.data_search = self._split_hparam_cfg(self.data_hparams)
         self.model_defaults, self.model_search = self._split_hparam_cfg(self.model_hparams)
         self.strategy_defaults, self.strategy_search = self._split_hparam_cfg(self.strategy_hparams)
         self.seed = self.sapiens_config["seed"]
@@ -280,14 +281,16 @@ class OptunaHparamsTuner:
         
         # Define objective function for model
         def model_objective(trial: optuna.Trial) -> float:
-            trial_hparams = self._suggest_params(trial, self.model_defaults, self.model_search)
+            model_trial_hparams = self._suggest_params(trial, self.model_defaults, self.model_search)
+            data_trial_hparams = self._suggest_params(trial, self.data_defaults, self.data_search)
+    
             
             # setting train_offset and model_dir to model flatten config dictionary
             # adding train_offset here to avoid type overwite later  (pandas.offset -> str)
-            train_offset = trial_hparams["train_offset"]
-            retrain_offset = trial_hparams["retrain_offset"]
-            n_retrains_on_valid = trial_hparams["n_retrains_on_valid"]
-            inference_window = trial_hparams["inference_window"]
+            train_offset = model_trial_hparams["train_offset"]
+            retrain_offset = model_trial_hparams["retrain_offset"]
+            n_retrains_on_valid = model_trial_hparams["n_retrains_on_valid"]
+            inference_window = model_trial_hparams["inference_window"]
             model_dir = study_path /  f"trial_{trial.number}"
             model_dir.mkdir(parents=True, exist_ok=True)
             model_params_flat  = self._add_dates(
@@ -298,7 +301,7 @@ class OptunaHparamsTuner:
                                         inference_window, 
                                         to_strategy=False) 
             model_params_flat["model_dir"] = model_dir
-            model_params_flat = trial_hparams | model_params_flat
+            model_params_flat = model_trial_hparams | model_params_flat
 
             # init data timestamps for data loader
             # Initialize calendar. NOTE: calendar and freq already added un OptunaHparamTuner __init__
@@ -308,8 +311,14 @@ class OptunaHparamsTuner:
             end = model_params_flat["valid_end"]
             data_dict = self.get_ohlcv_data_from_catalog(frequency = self.model_params["freq"], start=start, end=end, instrument_ids=self.instrument_ids)
 
+            augmentor_cfg = {
+                **self.sapiens_config["SAPIENS_DATA"],  # freq, adjust, etc.
+                **self.data_params,                 # techinds_timeperiod, etc.
+                **data_trial_hparams                # use_momentum_indicators, etc.
+            }
+
             # Data Augmentation
-            augmentor = AugmentorClass(cfg=self.sapiens_config["SAPIENS_DATA"], augment_modality = "train")
+            augmentor = AugmentorClass(cfg=augmentor_cfg, augment_modality = "train")
             data_dict = augmentor.augment(data_dict)
             feature_dim = len(next(iter(data_dict.values())).columns)
             model_params_flat["feature_dim"] = feature_dim #rewrite feature_dim after augmentation
@@ -324,7 +333,9 @@ class OptunaHparamsTuner:
             ) as trial_run:
                 
                 # Log trial parameters and tags
-                mlflow.log_params(trial_hparams)
+                mlflow.log_params(model_trial_hparams)
+                for key, value in data_trial_hparams.items():
+                    mlflow.log_param(f"data_{key}", value)  # Prefix to distinguish
                 mlflow.log_param("trial_number", trial.number)
                 mlflow.set_tags({
                     "optimization_id": self.optimization_id,
@@ -359,7 +370,7 @@ class OptunaHparamsTuner:
                 
                 # Store model directory in trial
                 trial.set_user_attr("model_path", str(model_dir / "init.pt"))
-                trial.set_user_attr("model_params_flat", yaml_safe(trial_hparams | model_params_flat) )
+                trial.set_user_attr("model_params_flat", yaml_safe(model_trial_hparams | model_params_flat) )
                 trial.set_user_attr("mlflow_run_id", trial_run.info.run_id)
 
                 # Store augmentor state
