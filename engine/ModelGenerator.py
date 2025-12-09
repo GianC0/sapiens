@@ -81,7 +81,7 @@ class ModelGenerator:
         init_file = output_dir / "__init__.py"
         init_file.write_text(f"from .{model_name} import {model_name}\n\n__all__ = ['{model_name}']\n")
         
-        logger.info(f"✅ Model generation complete: {output_dir}")
+        logger.info(f"Model generation complete: {output_dir}")
         return output_dir
     
     def _extract_architecture(self, source_type: str, source_path: str) -> Dict[str, Any]:

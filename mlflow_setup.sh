@@ -7,8 +7,8 @@ echo "   Access at: http://localhost:5000"
 echo "   Press Ctrl+C to stop"
 echo ""
 
-mlflow ui --backend-store-uri file:./logs/mlflow --host 0.0.0.0 --port 5000
+mlflow ui --backend-store-uri sqlite:///.runs/mlflow/mlflow.db --host 0.0.0.0 --port 5000
 
 
 ## Update nautilus_trader
-pip install --upgrade nautilus_trader==1.222.0.dev20251118+11996 --index-url=https://packages.nautechsystems.io/simple
+pip install --upgrade nautilus_trader==1.222.0.dev20251207+12377 --index-url=https://packages.nautechsystems.io/simple

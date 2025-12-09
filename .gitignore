@@ -4,8 +4,8 @@ __pycache__/
 *$py.class
 
 # Added by Gian
-logs/
-mlruns/
+.logs/
+.runs/
 data/
 .env
 .vscode

@@ -30,14 +30,15 @@ class DatabentoTickLoader:
         cfg: Dict,
         venue_name: str = "XNAS",
         tz: str = "UTC",
-        universe: Optional[List[str]] = None,
+        universe_subset: Optional[List[str]] = None,
+        data_dir: str = "data/"
     ):
         self.cfg = cfg
         self.venue = Venue(venue_name)
         self.tz = tz
         
         # Data paths
-        self._root = Path(cfg["data_dir"]).expanduser().resolve()
+        self._root = Path(data_dir).expanduser().resolve()
         self.stock_trades_dir = self._root / "stocks" / "trades"
         self.etf_trades_dir = self._root / "etf" / "trades"
         self.benchmark_trades_dir = self._root / "benchmarks" / "trades"
@@ -53,7 +54,7 @@ class DatabentoTickLoader:
         self._dbn_files += list(self.definitions_dir.glob("*.definition.*.dbn.zst"))
         
         # Extract symbols from filenames
-        self._universe = universe if universe else self._extract_symbols()
+        self._universe = universe_subset if universe_subset else self._extract_symbols()
         
         # Create instruments
         self._instruments: Dict[str, Instrument] = {}

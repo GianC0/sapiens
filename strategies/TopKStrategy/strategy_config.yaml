@@ -12,7 +12,7 @@ STRATEGY:
 
     # Backtest and Train
     # NOTE on timeline:          train_start < train_end = valid_start = strategy_valid_start < valid_end = strategy_valid_end = backtest_start < backtest_end
-    freq: 10min                  # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
+    freq: 1h                     # used for offset, data frequency and used by pandas_market_calendars (1D = 1B)
     #train_offset:               # Optimized during model hp tuning
     #backtest_start: "2024-06-01" # Start of walk-forward evaluation.
     #backtest_end:   "2024-12-01" # End of walk-forward evaluation.
@@ -20,15 +20,11 @@ STRATEGY:
     initial_cash: 20000          # portfolio initial cash                    (portfolio)
     cash_buffer: 50              # cash buffer to always keep in portfolio to cover rounding errors
     currency: USD                 
-    rebalance_only: false        # false = all universe instruments are considered for top_k. true = portoflio instruments stay the same, with dynamic reallocation 
     account_type: CASH           # "CASH" = spot trading. "MARGIN" can trade derivatives and options as welll. TODO: "MARGIN" not implememted
     oms_type: NETTING            # Order Management System type. NETTING = only long positions. HEDGING = long and short
     venue_name: XNAS             # name of the venue to use for trading
     risk_free_ticker: SGOV.XNAS  # Risk-free ETF to include in portfolio
     benchmark_ticker: SPY.XNAS   # Benchmark for M2 optimization
-
-    # Paths
-    data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
 
     # Engine settings
     engine:
@@ -63,23 +59,19 @@ STRATEGY:
       twap:                    # Split parent order into 4 TWAP child orders, each after 2.5 seconds 
         slices: 1              # number of separate orders
         interval_secs: 5       # seconds between orders
-      use_limit_orders: false  # whether to use LIMIT orders or MARKET-only
-      limit_offset_bps: 0.005  # +-5% LIMIT order placed
       max_retries: 3           # n of retries if order is unsuccessfull before cancelling the remaining portion
 
     # Liquidity constraints   
     liquidity:
-      adv_lookback: "20D"     # Look-back window to compute Average Daily Volume (ADV)
-      max_adv_pct:  0.20    # Max trade size = 20% of average daily traded volume for that instrument to use for weights 
+      adv_lookback: "20D"     # Look-back window to compute Average Daily Volume (ADV). Should be in multiple of Days
+      max_adv_pct:  0.20      # Max trade size = 20% of average daily traded volume for that instrument to use for weights 
 
     # Risk Management
     risk:
-      max_weight_abs:     0.5                # Max x% NAV per single position        
+      max_weight_abs:     0.95               # Max x% NAV per single position        
       drawdown_max:       0.15               # Kill-switch at 15 % peak-to-trough   
       trailing_stop_max:  0.05               # % trailing stop from HWM/LWM 5% for single instrument
-      target_volatility:  0.05               # 5% tarket volatility for efficient risk optimizer             
-        
-      #max_weight_changes = np.ones(len(valid_symbols))  # Default: no constraint 
+      #target_volatility:  0.05               # 5% tarket volatility for efficient risk optimizer (NOTE: unused atm)             
 
     # Window used to estimates covariance of volatility, returns and risk related metrics
     optimizer_lookback: "20D"
@@ -95,7 +87,7 @@ STRATEGY:
       optuna:
         optuna_type: int_low-high
         low: 3
-        high: 5
+        high: 4
 
     # Optimizer settings
     optimizer_name:

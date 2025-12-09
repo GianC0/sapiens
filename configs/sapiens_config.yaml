@@ -2,8 +2,12 @@
 ## SAPIENS FRAMEWORK CONFIGURATION ##
 #####################################
 
-# Logs
-logs_dir: "logs/"
+# Logs and Runs
+runs_dir: ".runs/"
+logs_dir: ".logs/"
+logs_level: "INFO"
+# Data directory with nautilus catalog and databento
+data_dir: "data/"            # Root Data folder containing subfolders with CSVs        (general)
 # Backtest Period
 backtest_start: "2024-06-01"
 backtest_end: "2024-12-01"
@@ -25,7 +29,7 @@ SAPIENS_MODEL:
 
   optimization:
     tune_hparams: true       # Use Optuna Bayesian search.   
-    n_trials: 40              # Optuna trials of hyper-parameters optimization
+    n_trials: 2              # Optuna trials of hyper-parameters optimization
 
 # Strategy Configuration  
 SAPIENS_STRATEGY:
@@ -34,7 +38,7 @@ SAPIENS_STRATEGY:
   # Hyperparameter Optimization
   optimization:
     tune_hparams: true
-    n_trials: 40
+    n_trials: 2
     primary_objective:  "total_pnl_pct"     # used to determine the overall single best hp tuning trial in multi-objective optimization       
     objectives:                             # use only nautilus_trader portfolio_analyzer statistics
       ## Performance / Returns ##

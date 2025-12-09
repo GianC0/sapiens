@@ -29,7 +29,7 @@ def create_optimizer(name: str, **kwargs):
 class PortfolioOptimizer:
     """Base class for portfolio optimizers using PyPortfolioOpt."""
     
-    def __init__(self, max_adv_pct: float, weight_bounds: tuple, solver = None, ):
+    def __init__(self, max_adv_pct: float, weight_bounds: tuple, solver = None, **kwargs ):
         """
         Args:
             weight_bounds: tuple of (min, max) weights, default allows short selling
@@ -89,16 +89,6 @@ class PortfolioOptimizer:
             nav: net asset valuatione i.e., current portfolio value ( - cash buffer )
             cash_available: cash_available i.e., portfolio balance_free
         """
-        """
-        # 1. ADV/Liquidity constraints
-        if allowed_weight_ranges is not None:
-            for i, (w_min, w_max) in enumerate(allowed_weight_ranges):
-                # Only add constraints if they're tighter than global bounds
-                if bool(w_min >= self.weight_bounds[0]):
-                    ef.add_constraint(lambda w, idx=i, wmin=w_min: w[idx] >= wmin)
-                if bool(w_max <= self.weight_bounds[1]):
-                    ef.add_constraint(lambda w, idx=i, wmax=w_max: w[idx] <= wmax)
-        """
         # Buy notional <= Sell notional + available cash - buffer
         # Only add cash constraint if we have existing positions
         """
@@ -143,12 +133,12 @@ class PortfolioOptimizer:
         
         # Option 2: Return zero weights (hold cash outside of portfolio)
         logger.warning("Optimization failed: no feasible allocation, holding cash or all to risk free")
-        return np.zeros(n_assets)
+        return current_weights
     
 class MaxSharpeOptimizer(PortfolioOptimizer):
     """Maximum Sharpe ratio optimizer using PyPortfolioOpt."""
     
-    def __init__(self, max_adv_pct: float, weight_bounds=(-1, 1), solver=None, risk_free_rate=None,):
+    def __init__(self, max_adv_pct: float, weight_bounds=(-1, 1), solver=None, risk_free_rate=None, **kwargs):
         super().__init__(max_adv_pct, weight_bounds, solver)
         self.risk_free_rate = risk_free_rate
     
@@ -194,7 +184,7 @@ class MaxSharpeOptimizer(PortfolioOptimizer):
 
             # If selector_k is requested, run a second pass that forces non-top-k weights to zero.
             selector_k = kwargs.get("selector_k", None)
-            if selector_k is not None and selector_k < len(er):
+            if selector_k is not None and selector_k <= (er > rf).sum():
 
                 # set non-topk to have 0 as max allocation factor
                 idx_sorted = np.argsort(-np.abs(sharpe_array))
@@ -275,7 +265,7 @@ class MinVarianceOptimizer(PortfolioOptimizer):
 
             # If selector_k is requested, run a second pass that forces non-top-k weights to zero.
             selector_k = kwargs.get("selector_k", None)
-            if selector_k is not None and selector_k < len(er):
+            if selector_k is not None and selector_k <= (er > rf).sum():
 
                 # set non-topk to have 0 as max allocation factor
                 idx_sorted = np.argsort(-np.abs(sharpe_array))
@@ -322,7 +312,7 @@ class M2Optimizer(PortfolioOptimizer):
     M² adjusts portfolio returns to match benchmark volatility for comparison.
     """
     
-    def __init__(self, max_adv_pct: float, weight_bounds=(-1, 1), solver=None):
+    def __init__(self, max_adv_pct: float, weight_bounds=(-1, 1), solver=None, **kwargs):
         """
         Args:
             benchmark_vol: Annualized benchmark volatility (default 15%)
@@ -368,7 +358,7 @@ class M2Optimizer(PortfolioOptimizer):
             
             # If selector_k is requested, run a second pass that forces non-top-k weights to zero.
             selector_k = kwargs.get("selector_k", None)
-            if selector_k is not None and selector_k < len(er):
+            if selector_k is not None and selector_k <= (er > rf).sum():
                 
                 # set non-topk to have 0 as max allocation factor
                 idx_sorted = np.argsort(-np.abs(sharpe_array))
@@ -436,7 +426,7 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
     Good for risk-averse investors.
     """
     
-    def __init__(self, max_adv_pct: float, risk_aversion: int = 1, weight_bounds=(-1, 1), solver=None):
+    def __init__(self, max_adv_pct: float, risk_aversion: int = 1, weight_bounds=(-1, 1), solver=None, **kwargs):
         """
         Args:
             risk_aversion: Risk aversion parameter (higher = more risk averse)
@@ -478,7 +468,7 @@ class MaxQuadraticUtilityOptimizer(PortfolioOptimizer):
 
             # If selector_k is requested, run a second pass that forces non-top-k weights to zero.
             selector_k = kwargs.get("selector_k", None)
-            if selector_k is not None and selector_k < len(er):
+            if selector_k is not None and selector_k <= (er > rf).sum():
 
                 # set non-topk to have 0 as max allocation factor
                 idx_sorted = np.argsort(-np.abs(sharpe_array))
@@ -525,7 +515,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
     Useful for risk-targeted strategies.
     """
     
-    def __init__(self, max_adv_pct: float, weight_bounds=(-1, 1), solver=None):
+    def __init__(self, max_adv_pct: float, weight_bounds=(-1, 1), solver=None, target_volatility: float = 0.05, **kwargs ):
         """
         Args:
             target_volatility: Target portfolio volatility
@@ -533,6 +523,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
             solver: cvxpy solver
         """
         super().__init__( max_adv_pct, weight_bounds, solver)
+        self.target_volatility = target_volatility
     
     def optimize(self, er: pd.Series, cov: pd.DataFrame,
                 allowed_weight_ranges: np.ndarray,
@@ -540,7 +531,6 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
                 prices: np.ndarray,
                 nav: float,
                 cash_available: float,
-                target_volatility: float,
                 **kwargs) -> np.ndarray:
         """
         Find weights that maximize return for given risk level.
@@ -556,7 +546,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
             self._apply_constraints(ef, allowed_weight_ranges, current_weights, prices, nav, cash_available)
             
             # Maximize return for target volatility
-            ef.efficient_risk(target_volatility=target_volatility)
+            ef.efficient_risk(target_volatility=self.target_volatility)
             
             # Clean and return weights
             cleaned_weights = ef.clean_weights()
@@ -564,7 +554,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
 
             # If selector_k is requested, run a second pass that forces non-top-k weights to zero.
             selector_k = kwargs.get("selector_k", None)
-            if selector_k is not None and selector_k < len(er):
+            if selector_k is not None and selector_k <= (er > rf).sum():
 
                 # set non-topk to have 0 as max allocation factor
                 idx_sorted = np.argsort(-np.abs(sharpe_array))
@@ -584,7 +574,7 @@ class EfficientRiskOptimizer(PortfolioOptimizer):
                 self._apply_constraints(ef2, modified_ranges, current_weights, prices, nav, cash_available)
 
                 # Solve constrained max-sharpe on the top-k subset
-                ef2.efficient_risk(target_volatility=target_volatility)
+                ef2.efficient_risk(target_volatility=self.target_volatility)
                 sharpe_weights2 = ef2.clean_weights()
                 sharpe_array = self._to_array(sharpe_weights2)
                 
